@@ -3,6 +3,7 @@
 pub mod crawl;
 pub mod embed;
 pub mod extract;
+pub mod grep;
 pub mod index;
 pub mod paths;
 pub mod search;

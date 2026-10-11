@@ -11,6 +11,9 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
+grep-matcher = "0.1.9"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
 half = "2.7.1"
 html2text = "=0.17.1"
 ignore = "0.4.33"

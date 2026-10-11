@@ -60,13 +60,26 @@ impl Preview {
                 Err(e) => Preview::Message(format!("can't read the PDF: {e:#}")),
             };
         }
+        // A grep hit may sit deep in a file too big to read whole (it's why grep found it): stream to its line.
+        if let (Some(line), false) = (hit.line, is_converted(path, hit.kind)) {
+            return match read_lines_around(path, line) {
+                Ok((window, focus)) => match hit.kind {
+                    Kind::Code => Preview::Code(shown(code_lines(&window, path, terms), focus)),
+                    _ => Preview::Text(shown(text_lines(&window, terms), focus)),
+                },
+                Err(e) => Preview::Message(format!("can't read file: {e:#}")),
+            };
+        }
         let text = match read_document(path, hit.kind) {
             Ok(Some(text)) => text,
             Ok(None) => return Preview::Message("binary file".into()),
             Err(_) if !hit.excerpt.is_empty() => hit.excerpt.clone(),
             Err(e) => return Preview::Message(format!("can't read file: {e:#}")),
         };
-        let (window, focus) = window(&text, loc);
+        let (window, focus) = match hit.line {
+            Some(line) => window_at_line(&text, line),
+            None => window(&text, loc),
+        };
         match hit.kind {
             Kind::Code => Preview::Code(shown(code_lines(&window, path, terms), focus)),
             _ => Preview::Text(shown(text_lines(&window, terms), focus)),
@@ -146,10 +159,7 @@ pub fn reflow(text: &str) -> String {
 /// A file's text as indexing read it: documents converted (docx, odt, html), anything else as text. `None` for
 /// binary files.
 fn read_document(path: &Path, kind: Kind) -> anyhow::Result<Option<String>> {
-    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let converted =
-        ext == "ipynb" || (kind == Kind::Doc && ["docx", "odt", "html", "htm", "xhtml"].contains(&ext.as_str()));
-    if converted {
+    if is_converted(path, kind) {
         return Ok(Some(extract::document_text(path)?));
     }
     Ok(read_text(path)?)
@@ -183,6 +193,39 @@ pub fn window(text: &str, loc: usize) -> (String, usize) {
     let first = start_line.saturating_sub(LINES_BEFORE);
     let lines: Vec<&str> = text.lines().skip(first).take(start_line - first + LINES_AFTER).collect();
     (lines.join("\n"), start_line - first)
+}
+
+/// The lines of `text` around line `line` (from 1, as grep counts), and the index among them of that line (the last
+/// line when the text is shorter).
+pub fn window_at_line(text: &str, line: usize) -> (String, usize) {
+    let at = line.saturating_sub(1);
+    let first = at.saturating_sub(LINES_BEFORE);
+    let lines: Vec<&str> = text.lines().skip(first).take(at - first + LINES_AFTER).collect();
+    let focus = (at - first).min(lines.len().saturating_sub(1));
+    (lines.join("\n"), focus)
+}
+
+/// The lines around line `line` of a file of any size, read a line at a time (only the window is kept).
+fn read_lines_around(path: &Path, line: usize) -> std::io::Result<(String, usize)> {
+    use std::io::BufRead;
+    let at = line.saturating_sub(1);
+    let first = at.saturating_sub(LINES_BEFORE);
+    let mut kept: Vec<String> = Vec::new();
+    let reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    for (i, bytes) in reader.split(b'\n').enumerate().take(at + LINES_AFTER) {
+        let bytes = bytes?;
+        if i >= first {
+            kept.push(String::from_utf8_lossy(&bytes).trim_end_matches('\r').to_string());
+        }
+    }
+    let focus = (at - first).min(kept.len().saturating_sub(1));
+    Ok((kept.join("\n"), focus))
+}
+
+/// Read through a converter (docx, odt, html, notebooks) rather than as text.
+fn is_converted(path: &Path, kind: Kind) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    ext == "ipynb" || (kind == Kind::Doc && ["docx", "odt", "html", "htm", "xhtml"].contains(&ext.as_str()))
 }
 
 /// Byte ranges of `line` where any of `terms` (lower-case) occurs as a whole word, ignoring case; overlapping ranges
@@ -294,6 +337,11 @@ pub fn why(hit: &Hit) -> String {
     if let Some(rank) = hit.keyword_rank {
         parts.push(format!("words #{rank}"));
     }
+    match (hit.grep, hit.line) {
+        (true, Some(line)) => parts.push(format!("grep, line {line}")),
+        (true, None) => parts.push("grep".into()),
+        _ => {}
+    }
     parts.join(" · ")
 }
 
@@ -323,6 +371,24 @@ mod tests {
         assert_eq!(focus, LINES_BEFORE);
         assert_eq!(shown.lines().count(), LINES_BEFORE + LINES_AFTER);
         assert_eq!(window("tiny", 1), ("tiny".to_string(), 0));
+    }
+
+    #[test]
+    fn grep_hits_open_at_their_line() {
+        let text: String = (1..=1000).map(|i| format!("line {i}\n")).collect();
+        let (shown, focus) = window_at_line(&text, 500);
+        assert_eq!(shown.lines().nth(focus), Some("line 500"));
+        let (shown, focus) = window_at_line(&text, 3);
+        assert_eq!((focus, shown.lines().next()), (2, Some("line 1")));
+        // A line past the end: the window holds the end, and the focus stays inside it.
+        let (shown, focus) = window_at_line(&text, 5000);
+        assert!(shown.is_empty() && focus == 0);
+        // Streamed from a file of any size.
+        let path = std::env::temp_dir().join(format!("rummage-lines-{}.log", std::process::id()));
+        std::fs::write(&path, &text).unwrap();
+        let (shown, focus) = read_lines_around(&path, 700).unwrap();
+        assert_eq!(shown.lines().nth(focus), Some("line 700"));
+        assert_eq!(shown.lines().count(), LINES_BEFORE + 301, "300 before, the line, then to the end of the file");
     }
 
     #[test]
@@ -375,6 +441,8 @@ mod tests {
             cosine: None,
             keyword_rank: Some(2),
             loc: None,
+            line: None,
+            grep: false,
             excerpt: String::new(),
         };
         assert_eq!(why(&hit), "meaning z 3.1 · words #2");

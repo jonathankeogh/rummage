@@ -110,38 +110,7 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
     let mut found = Vec::new();
     let mut pdfs_without_tools = 0;
     for root in roots {
-        let excluded = options.excluded.clone();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let walker = WalkBuilder::new(root)
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(false)
-            .git_exclude(true)
-            .parents(true)
-            .follow_links(false)
-            .filter_entry(move |entry| {
-                let path = entry.path();
-                if !entry.file_type().is_some_and(|t| t.is_dir()) || entry.depth() == 0 {
-                    return true;
-                }
-                let name = entry.file_name().to_string_lossy();
-                if SKIPPED_FOLDERS.contains(&name.as_ref()) || name.ends_with(".noindex") {
-                    return false;
-                }
-                if home.as_ref().is_some_and(|h| path == h.join("Library")) {
-                    return false;
-                }
-                if excluded.iter().any(|e| path.starts_with(e)) {
-                    return false;
-                }
-                // A submodule or worktree (.git is a file there): someone else's code, or a copy of this repo's.
-                if path.join(".git").is_file() {
-                    return false;
-                }
-                !(CODE_SKIPPED_FOLDERS.contains(&name.as_ref()) && in_project(path))
-            })
-            .build();
-        for entry in walker.filter_map(|e| e.ok()) {
+        for entry in walker(root, &options.excluded).filter_map(|e| e.ok()) {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -160,18 +129,97 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
             if meta.len() == 0 || meta.len() > limit {
                 continue;
             }
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            found.push(Found { path: path.to_path_buf(), kind, size: meta.len(), mtime });
+            found.push(Found { path: path.to_path_buf(), kind, size: meta.len(), mtime: mtime(&meta) });
         }
     }
     found.sort_by(|a, b| a.path.cmp(&b.path));
     found.dedup_by(|a, b| a.path == b.path);
     Walk { found, pdfs_without_tools }
+}
+
+/// Seconds since 1970 that a file last changed (0 if unknown).
+fn mtime(meta: &std::fs::Metadata) -> i64 {
+    meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Files grep reads under `roots`, with their kind and when they last changed: text documents (outside code
+/// projects, as for indexing), or with `code` source files anywhere (in projects even when the index has no code).
+/// Same skip rules as indexing, but no size limits: grep costs no embedding.
+pub fn grep_files(roots: &[PathBuf], code: bool) -> Vec<(PathBuf, Kind, i64)> {
+    let mut files = Vec::new();
+    for root in roots {
+        for entry in walker(root, &[]).filter_map(|e| e.ok()) {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            let Some(kind) = grep_kind(path, code) else { continue };
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.len() > 0 {
+                files.push((path.to_path_buf(), kind, mtime(&meta)));
+            }
+        }
+    }
+    files
+}
+
+/// Plain-text documents grep reads (rich formats need converting, and their text is in the index).
+const GREP_DOC_EXTENSIONS: &[&str] = &["txt", "text", "md", "markdown", "rst", "org", "adoc", "log", "csv", "tsv"];
+
+fn grep_kind(path: &Path, code: bool) -> Option<Kind> {
+    let name = path.file_name()?.to_string_lossy();
+    if is_secret(&name) {
+        return None;
+    }
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if code {
+        let lower = name.to_lowercase();
+        if lower.ends_with(".min.js") || lower.ends_with(".min.css") || lower.ends_with(".min.mjs") {
+            return None;
+        }
+        let source = SOURCE_EXTENSIONS.contains(&ext.as_str())
+            || CODE_TEXT_EXTENSIONS.contains(&ext.as_str())
+            || CODE_FILE_NAMES.contains(&name.as_ref())
+            || name.starts_with("Dockerfile");
+        return source.then_some(Kind::Code);
+    }
+    (GREP_DOC_EXTENSIONS.contains(&ext.as_str()) && !in_project(path.parent()?)).then_some(Kind::Doc)
+}
+
+/// Walks `root` with the skip rules: hidden and dependency folders, ~/Library, `excluded`, submodules, and inside code
+/// projects what git ignores plus vendored or built folders.
+fn walker(root: &Path, excluded: &[PathBuf]) -> ignore::Walk {
+    let excluded = excluded.to_vec();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .parents(true)
+        .follow_links(false)
+        .filter_entry(move |entry| {
+            let path = entry.path();
+            if !entry.file_type().is_some_and(|t| t.is_dir()) || entry.depth() == 0 {
+                return true;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if SKIPPED_FOLDERS.contains(&name.as_ref()) || name.ends_with(".noindex") {
+                return false;
+            }
+            if home.as_ref().is_some_and(|h| path == h.join("Library")) {
+                return false;
+            }
+            if excluded.iter().any(|e| path.starts_with(e)) {
+                return false;
+            }
+            // A submodule or worktree (.git is a file there): someone else's code, or a copy of this repo's.
+            if path.join(".git").is_file() {
+                return false;
+            }
+            !(CODE_SKIPPED_FOLDERS.contains(&name.as_ref()) && in_project(path))
+        })
+        .build()
 }
 
 /// What a walk found.

@@ -5,6 +5,7 @@
 //! hold exactly: codes, IDs and names. The scoring is DigUp's (MIT), tuned there on its evals.
 
 use crate::embed::DIM;
+use crate::grep::GrepHit;
 use crate::store::{Kind, Store};
 use anyhow::Result;
 use half::f16;
@@ -22,8 +23,14 @@ pub struct Hit {
     pub cosine: Option<f64>,
     /// 1-based rank among keyword matches.
     pub keyword_rank: Option<usize>,
-    /// Passage number from 1.
+    /// Passage or page number from 1.
     pub loc: Option<f64>,
+    /// The line grep matched, from 1, when that's where the hit points (no passage stood out).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    /// Grep found the query's text in the file.
+    #[serde(default)]
+    pub grep: bool,
     pub excerpt: String,
 }
 
@@ -139,6 +146,9 @@ pub struct Vectors {
     row_segment: Vec<i64>,
     row_file: Vec<i64>,
     file_kind: HashMap<i64, Kind>,
+    /// When each file last changed, and each indexed file's id by path (to join grep's hits).
+    file_mtime: HashMap<i64, i64>,
+    file_ids: HashMap<String, i64>,
     /// Where typical queries sit, once known (see `set_query_centre`).
     query_centre: Option<QueryCentre>,
     /// Each row's closeness to where typical queries sit: its average similarity to typical queries. A passage with
@@ -154,10 +164,19 @@ impl Vectors {
             row_segment: Vec::new(),
             row_file: Vec::new(),
             file_kind: HashMap::new(),
+            file_mtime: HashMap::new(),
+            file_ids: HashMap::new(),
             query_centre: None,
             centrality: Vec::new(),
         };
-        let mut statement = store.db.prepare("SELECT id, kind FROM files")?;
+        let mut statement = store.db.prepare("SELECT id, kind, mtime, path FROM files")?;
+        for row in
+            statement.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?)))?
+        {
+            let (id, mtime, path) = row?;
+            vectors.file_mtime.insert(id, mtime);
+            vectors.file_ids.insert(path, id);
+        }
         for row in statement.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
             let (id, kind) = row?;
             if let Some(kind) = Kind::parse(&kind) {
@@ -270,6 +289,25 @@ pub fn split_code_prefix(text: &str) -> (&str, bool) {
     }
 }
 
+/// The meaning and word evidence for one query, worked out once: ranked now (`rank` with no grep hits), and again
+/// when grep's hits come in.
+pub struct Prepared {
+    /// file → (z, cosine, row) of its best passage.
+    best: HashMap<i64, (f64, f64, usize)>,
+    /// (file, segment) of the best keyword matches, best first, one per file.
+    keyword: Vec<(i64, i64)>,
+    /// file → share of the query's words found in it.
+    coverage: HashMap<i64, f64>,
+    z_gate: f64,
+    meaning_weight: f64,
+    literal_weight: f64,
+    /// The query's words as one FTS query (empty: none).
+    any_word: String,
+    kinds: Option<HashSet<Kind>>,
+    limit: usize,
+}
+
+/// Scores and ranks in one go, without grep.
 pub fn search(
     store: &Store,
     vectors: &Vectors,
@@ -277,6 +315,23 @@ pub fn search(
     query: Option<&[f32]>,
     options: &Options,
 ) -> Result<Vec<Hit>> {
+    let prepared = prepare(store, vectors, text, query, options)?;
+    rank(store, vectors, &prepared, &[], now())
+}
+
+/// Seconds since 1970.
+pub fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Meaning (every vector scored, hubs penalised, each file's best passage) and words (the keyword index).
+pub fn prepare(
+    store: &Store,
+    vectors: &Vectors,
+    text: &str,
+    query: Option<&[f32]>,
+    options: &Options,
+) -> Result<Prepared> {
     let allowed = |file: i64| match (&options.kinds, vectors.file_kind.get(&file)) {
         (None, _) => true,
         (Some(kinds), Some(kind)) => kinds.contains(kind),
@@ -293,7 +348,7 @@ pub fn search(
     let z_gate = options.z_gate + vagueness;
 
     // Meaning: every passage on this query's scale; each file keeps its best.
-    let mut best: HashMap<i64, (f64, f64, usize)> = HashMap::new(); // file → (z, cosine, row)
+    let mut best: HashMap<i64, (f64, f64, usize)> = HashMap::new();
     if let Some(query) = query.filter(|q| q.len() == DIM && !vectors.is_empty()) {
         let cosines = vectors.cosines(query);
         // Hubs lose the head start they get from being a little similar to everything.
@@ -314,7 +369,7 @@ pub fn search(
     // Words: which files hold which of the query's words, best keyword match first.
     let terms = terms(text);
     let patterns: Vec<String> = terms.iter().map(|t| format!("\"{}\"", t.replace('"', ""))).collect();
-    let mut keyword: Vec<(i64, i64)> = Vec::new(); // (file, segment), best first, one per file
+    let mut keyword: Vec<(i64, i64)> = Vec::new();
     let mut coverage: HashMap<i64, f64> = HashMap::new();
     if !patterns.is_empty() {
         let mut seen = HashSet::new();
@@ -342,63 +397,135 @@ pub fn search(
             }
         }
     }
-
-    // A file qualifies by standing out in meaning, or by holding at least half of the query's words. Score: meaning z
-    // plus a bonus that grows with word coverage; an exact lookup leans on words.
-    let (meaning_weight, words_weight) =
+    // An exact lookup (codes, numbers) leans on literal matches.
+    let (meaning_weight, literal_weight) =
         if is_lookup(&terms) { (0.5, options.word_weight * 2.0) } else { (1.0, options.word_weight) };
-    let meaning_weight = meaning_weight / (1.0 + vagueness);
-    let mut candidates: HashSet<i64> = best.iter().filter(|(_, b)| b.0 >= z_gate).map(|(f, _)| *f).collect();
-    candidates.extend(coverage.iter().filter(|(_, share)| **share >= 0.5).map(|(f, _)| *f));
+    Ok(Prepared {
+        best,
+        keyword,
+        coverage,
+        z_gate,
+        meaning_weight: meaning_weight / (1.0 + vagueness),
+        literal_weight,
+        any_word: patterns.join(" OR "),
+        kinds: options.kinds.clone(),
+        limit: options.limit,
+    })
+}
+
+/// How much being recent counts, at most (see `rank`).
+const RECENCY_WEIGHT: f64 = 0.5;
+/// Recency halves every this many days.
+const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
+
+/// Ranks files on one score:
+///
+/// ```text
+/// score = meaning + literal + recency
+/// meaning = z if z stands out (≥ the gate), else max(z, 0) / 2       × 1 (0.5 for exact lookups, less when vague)
+/// literal = max(word coverage^1.5, 1 if grep matched)                 × 2 (4 for exact lookups)
+/// recency = 0.5^(days since it changed / 30)                          × 0.5
+/// ```
+///
+/// Literal takes the larger of the keyword index and grep, not their sum: they usually find the same words. A file
+/// makes the list when its meaning stands out, it holds half the query's words, or grep matched it.
+pub fn rank(store: &Store, vectors: &Vectors, prepared: &Prepared, grep: &[GrepHit], now: i64) -> Result<Vec<Hit>> {
+    let p = prepared;
+    // Grep hits on indexed files join their file; the rest stand alone (keyed by a negative number).
+    let grep: Vec<&GrepHit> =
+        grep.iter().filter(|g| p.kinds.as_ref().is_none_or(|kinds| kinds.contains(&g.kind))).collect();
+    let mut grep_of: HashMap<i64, &GrepHit> = HashMap::new();
+    for (i, hit) in grep.iter().enumerate() {
+        let file = vectors.file_ids.get(hit.path.to_string_lossy().as_ref()).copied().unwrap_or(-1 - i as i64);
+        grep_of.entry(file).or_insert(hit);
+    }
+    let mut candidates: HashSet<i64> = p.best.iter().filter(|(_, b)| b.0 >= p.z_gate).map(|(f, _)| *f).collect();
+    candidates.extend(p.coverage.iter().filter(|(_, share)| **share >= 0.5).map(|(f, _)| *f));
+    candidates.extend(grep_of.keys());
+
+    let recency = |mtime: i64| {
+        let days = (now - mtime).max(0) as f64 / 86_400.0;
+        RECENCY_WEIGHT * 0.5f64.powf(days / RECENCY_HALF_LIFE_DAYS)
+    };
     let mut scored: Vec<(i64, f64)> = candidates
         .into_iter()
         .map(|file| {
-            let z = best.get(&file).map_or(0.0, |b| b.0.max(0.0));
-            let words = coverage.get(&file).copied().unwrap_or(0.0).powf(1.5);
-            (file, meaning_weight * z + words_weight * words)
+            let z = p.best.get(&file).map_or(0.0, |b| b.0);
+            let meaning = if z >= p.z_gate { z } else { z.max(0.0) * 0.5 };
+            let words = p.coverage.get(&file).copied().unwrap_or(0.0).powf(1.5);
+            let literal = if grep_of.contains_key(&file) { 1.0f64.max(words) } else { words };
+            let mtime = vectors.file_mtime.get(&file).copied().or(grep_of.get(&file).map(|g| g.mtime)).unwrap_or(0);
+            (file, p.meaning_weight * meaning + p.literal_weight * literal + recency(mtime))
         })
         .collect();
     let keyword_rank: HashMap<i64, (usize, i64)> =
-        keyword.iter().enumerate().map(|(i, (file, segment))| (*file, (i + 1, *segment))).collect();
-    // Ties (common with word-only matches, which all score the same) go to the better keyword match.
+        p.keyword.iter().enumerate().map(|(i, (file, segment))| (*file, (i + 1, *segment))).collect();
+    // Ties (common with word-only matches) go to the better keyword match.
     let rank_of = |file: &i64| keyword_rank.get(file).map_or(usize::MAX, |r| r.0);
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(rank_of(&a.0).cmp(&rank_of(&b.0))).then(a.0.cmp(&b.0)));
+
     let mut hits = Vec::new();
-    let any_word = patterns.join(" OR ");
     let mut word_check = store.db.prepare("SELECT 1 FROM words WHERE words MATCH ? AND rowid = ?")?;
-    let mut has_words =
-        |segment: i64| -> Result<bool> { Ok(!any_word.is_empty() && word_check.exists(params![any_word, segment])?) };
+    let mut has_words = |segment: i64| -> Result<bool> {
+        Ok(!p.any_word.is_empty() && word_check.exists(params![p.any_word, segment])?)
+    };
     let mut statement = store.db.prepare(
         "SELECT f.path, f.kind, s.loc, s.excerpt FROM segments s JOIN files f ON f.id = s.file_id WHERE s.id = ?",
     )?;
-    for (file, score) in scored.into_iter().take(options.limit) {
-        let meaning = best.get(&file);
+    for (file, score) in scored.into_iter().take(p.limit) {
+        let meaning = p.best.get(&file);
         let words = keyword_rank.get(&file);
+        let grepped = grep_of.get(&file);
         // Point at the best meaning passage if it stands out, else at the one the words matched. When the file also
         // has the words but the meaning passage holds none of them, the words' passage is the better place to land:
-        // the reader sees what they typed, marked.
+        // the reader sees what they typed, marked. With neither, at the line grep found.
         let segment = match (meaning, words) {
-            (Some(m), Some(w)) if m.0 >= z_gate => {
+            (Some(m), Some(w)) if m.0 >= p.z_gate => {
                 let meaning_segment = vectors.row_segment[m.2];
-                if meaning_segment == w.1 || has_words(meaning_segment)? { meaning_segment } else { w.1 }
+                Some(if meaning_segment == w.1 || has_words(meaning_segment)? { meaning_segment } else { w.1 })
             }
-            (Some(m), None) => vectors.row_segment[m.2],
-            (_, Some(w)) => w.1,
-            _ => continue,
+            (Some(m), None) if m.0 >= p.z_gate || grepped.is_none() => Some(vectors.row_segment[m.2]),
+            (_, Some(w)) => Some(w.1),
+            _ => None,
         };
-        let row = statement.query_row(params![segment], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<f64>>(2)?, r.get::<_, String>(3)?))
-        })?;
-        hits.push(Hit {
-            path: row.0,
-            kind: Kind::parse(&row.1).unwrap_or(Kind::Doc),
-            score,
-            z: meaning.map(|m| m.0),
-            cosine: meaning.map(|m| m.1),
-            keyword_rank: words.map(|w| w.0),
-            loc: row.2,
-            excerpt: row.3,
-        });
+        let hit = match (segment, grepped) {
+            (Some(segment), _) => {
+                let row = statement.query_row(params![segment], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<f64>>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })?;
+                Hit {
+                    path: row.0,
+                    kind: Kind::parse(&row.1).unwrap_or(Kind::Doc),
+                    score,
+                    z: meaning.map(|m| m.0),
+                    cosine: meaning.map(|m| m.1),
+                    keyword_rank: words.map(|w| w.0),
+                    loc: row.2,
+                    line: None,
+                    grep: grepped.is_some(),
+                    excerpt: row.3,
+                }
+            }
+            (None, Some(g)) => Hit {
+                path: g.path.to_string_lossy().into_owned(),
+                kind: g.kind,
+                score,
+                z: meaning.map(|m| m.0),
+                cosine: meaning.map(|m| m.1),
+                keyword_rank: None,
+                loc: None,
+                line: Some(g.line),
+                grep: true,
+                excerpt: g.text.clone(),
+            },
+            (None, None) => continue,
+        };
+        hits.push(hit);
     }
     Ok(hits)
 }
@@ -460,6 +587,8 @@ mod tests {
             row_segment: vec![0; rows],
             row_file: vec![0; rows],
             file_kind: HashMap::new(),
+            file_mtime: HashMap::new(),
+            file_ids: HashMap::new(),
             query_centre: None,
             centrality: Vec::new(),
         };
@@ -486,6 +615,8 @@ mod tests {
             row_segment: Vec::new(),
             row_file: Vec::new(),
             file_kind: HashMap::new(),
+            file_mtime: HashMap::new(),
+            file_ids: HashMap::new(),
             query_centre: None,
             centrality: Vec::new(),
         };

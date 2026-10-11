@@ -167,7 +167,8 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
                 Some(m) if m.width == preview_area.width => m,
                 _ => {
                     let landing = shown.anchor.unwrap_or(shown.focus);
-                    let before = Paragraph::new(shown.lines[..landing].to_vec()).wrap(Wrap { trim: false });
+                    let before = Paragraph::new(shown.lines[..landing.min(shown.lines.len())].to_vec())
+                        .wrap(Wrap { trim: false });
                     let m = Metrics {
                         width: preview_area.width,
                         landing: before.line_count(preview_area.width),

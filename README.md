@@ -4,10 +4,10 @@ Instant multimodal semantic file search for the Unix terminal. Describe what you
 by meaning and by exact words, locally, on any GPU or CPU. Type `rummage` for a yazi-style interface, or use it inside
 yazi with the plugin.
 
-**Status: milestones 1–3 and 5 of 10.** Search works end to end over text, Markdown, PDFs (page by page), Word
+**Status: milestones 1–3, 5 and 6 of 10.** Search works end to end over text, Markdown, PDFs (page by page), Word
 (docx), OpenDocument (odt) and HTML files, and, with `--code`, source code, through a background service that keeps
-searches instant, with a search-as-you-type interface. Images and screenshots, live grep, audio, video and the yazi
-plugin are coming.
+searches instant, with a search-as-you-type interface and live grep beside meaning search. Images and screenshots,
+audio, video and the yazi plugin are coming.
 
 ## Build
 
@@ -37,6 +37,7 @@ rummage                                  # the interface: type to search, ↑↓
 rummage index ~/Documents ~/notes        # add folders and index them (later: `rummage index` alone re-syncs)
 rummage search "the clause about pets in the lease"
 rummage search INV20931                  # exact words count too
+rummage search "/INV\d{5}/"              # a regex: grep runs over text and code files beside meaning search
 rummage index --code ~/code              # also read code in code projects...
 rummage search "code: retry a failed call with backoff"   # ...and search it with "code:"
 rummage status
@@ -62,6 +63,12 @@ Only the folders you add. It never reads hidden folders, keys, certificates or p
 …) it reads nothing unless you pass `--code`, and then skips what git ignores and vendored or built folders.
 
 ## How it works
+
+Every search does two things at once. Meaning search: the query is embedded and compared with every passage
+(passages that are a little similar to everything, like menus and boilerplate, are held back). Live grep: the query's
+exact text (or a `/regex/`) in the text and code files themselves, newest first, up to 20 files or 3 seconds, so it
+also finds files too big to index. One score orders both: meaning, plus a bonus for the query's words or a grep match,
+plus a little for being recent. The interface shows meaning results at once and merges grep's as they arrive.
 
 Text is cut into ~1,800-character passages, each embedded by EmbeddingGemma 2 through llama.cpp (pinned in
 `vendor/llama.cpp`, built by `crates/llama-sys`). One SQLite file holds a vector per passage plus an FTS5 keyword

@@ -12,6 +12,7 @@ use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -30,19 +31,29 @@ pub struct Request {
     pub query: String,
 }
 
-/// A finished search, tagged with the request it answers.
+/// Search results, tagged with the request they answer: early ones (meaning and words) and then the final ones
+/// (grep's matches merged in).
 pub struct Response {
     pub id: u64,
     pub result: Result<Vec<Hit>, String>,
+    pub done: bool,
 }
 
 /// Start the search thread. It waits for the query to settle, then searches; of several queued requests only the
-/// newest runs.
+/// newest runs, and a newer query drops the search in flight (its grep is cancelled).
 pub fn spawn_worker<B: Backend>(mut backend: B) -> (Sender<Request>, Receiver<Response>) {
     let (request_tx, request_rx) = mpsc::channel::<Request>();
     let (response_tx, response_rx) = mpsc::channel::<Response>();
     std::thread::spawn(move || {
-        while let Ok(mut request) = request_rx.recv() {
+        let mut queued: Option<Request> = None;
+        loop {
+            let mut request = match queued.take() {
+                Some(request) => request,
+                None => match request_rx.recv() {
+                    Ok(request) => request,
+                    Err(_) => return,
+                },
+            };
             loop {
                 match request_rx.recv_timeout(DEBOUNCE) {
                     Ok(newer) => request = newer,
@@ -50,8 +61,25 @@ pub fn spawn_worker<B: Backend>(mut backend: B) -> (Sender<Request>, Receiver<Re
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             }
-            let result = backend.search(&request.query, LIMIT).map_err(|e| format!("{e:#}"));
-            if response_tx.send(Response { id: request.id, result }).is_err() {
+            let id = request.id;
+            let mut first = |hits: Vec<Hit>| {
+                let _ = response_tx.send(Response { id, result: Ok(hits), done: false });
+                // A newer query waiting: drop this search.
+                match request_rx.try_recv() {
+                    Ok(newer) => {
+                        queued = Some(newer);
+                        false
+                    }
+                    Err(_) => true,
+                }
+            };
+            let result = backend.search_stream(&request.query, LIMIT, &mut first).map_err(|e| format!("{e:#}"));
+            let response = match result {
+                Ok(Some(hits)) => Response { id, result: Ok(hits), done: true },
+                Ok(None) => continue,
+                Err(e) => Response { id, result: Err(e), done: true },
+            };
+            if response_tx.send(response).is_err() {
                 return;
             }
         }
@@ -110,8 +138,10 @@ pub struct App {
     requests: Sender<Request>,
     /// The newest request sent; answers to older ones are stale.
     latest: u64,
-    /// The newest request answered.
+    /// The newest request answered finally (grep included).
     answered: u64,
+    /// The selection moved since the current results came in: grep's later hits then go below, not re-sorted.
+    moved: bool,
     /// The selected hit's preview and what it was made for.
     preview: Option<(PreviewKey, Preview)>,
     /// The preview's first shown row (after wrapping); `None` until drawn, which opens it at the passage.
@@ -189,6 +219,7 @@ impl App {
             requests,
             latest: 0,
             answered: 0,
+            moved: false,
             preview: None,
             scroll: Cell::new(None),
             metrics: Cell::new(None),
@@ -231,13 +262,22 @@ impl App {
         }
     }
 
-    /// Take a search answer. Returns false (and changes nothing) if it is for an old query.
+    /// Take a search answer. Returns false (and changes nothing) if it is for an old query. The final answer
+    /// re-sorts the list, unless the selection has moved since the early one: then its new hits go below.
     pub fn apply_response(&mut self, response: Response) -> bool {
         if response.id != self.latest {
             return false;
         }
-        self.answered = response.id;
+        if response.done {
+            self.answered = response.id;
+        }
         match response.result {
+            Ok(hits) if response.done && self.moved => {
+                let shown: HashSet<String> = self.hits.iter().map(|h| h.path.clone()).collect();
+                self.hits.extend(hits.into_iter().filter(|h| !shown.contains(&h.path)));
+                self.error = None;
+                return true;
+            }
             Ok(hits) => {
                 self.hits = hits;
                 self.error = None;
@@ -248,12 +288,14 @@ impl App {
             }
         }
         self.selected = 0;
+        self.moved = false;
         *self.list.borrow_mut() = ListState::default();
         true
     }
 
     fn move_selection(&mut self, delta: isize) {
         let len = self.visible().len();
+        self.moved = true;
         if len > 0 {
             self.selected = (self.selected as isize + delta).clamp(0, len as isize - 1) as usize;
         }
@@ -343,6 +385,7 @@ impl App {
                 let now = Instant::now();
                 let double = self.last_click.is_some_and(|(t, r)| r == row && now.duration_since(t) < DOUBLE_CLICK);
                 self.selected = row;
+                self.moved = true;
                 if double {
                     self.last_click = None;
                     return Action::Open(hit);
@@ -434,6 +477,8 @@ pub(crate) mod tests {
             cosine: None,
             keyword_rank: Some(2),
             loc: Some(1.0),
+            line: None,
+            grep: false,
             excerpt: String::new(),
         }
     }
@@ -457,9 +502,9 @@ pub(crate) mod tests {
         assert_eq!(ids, vec![1, 2]);
         assert!(app.searching());
         // the answer to "d" arrives after "do" was typed: ignored
-        assert!(!app.apply_response(Response { id: 1, result: Ok(vec![hit("/a", Kind::Doc)]) }));
+        assert!(!app.apply_response(Response { id: 1, result: Ok(vec![hit("/a", Kind::Doc)]), done: true }));
         assert!(app.hits.is_empty() && app.searching());
-        assert!(app.apply_response(Response { id: 2, result: Ok(vec![hit("/b", Kind::Doc)]) }));
+        assert!(app.apply_response(Response { id: 2, result: Ok(vec![hit("/b", Kind::Doc)]), done: true }));
         assert_eq!(app.hits[0].path, "/b");
         assert!(!app.searching());
     }
@@ -470,7 +515,7 @@ pub(crate) mod tests {
         type_str(&mut app, "a");
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert!(!app.searching());
-        assert!(!app.apply_response(Response { id: 1, result: Ok(vec![hit("/a", Kind::Doc)]) }));
+        assert!(!app.apply_response(Response { id: 1, result: Ok(vec![hit("/a", Kind::Doc)]), done: true }));
         assert!(app.hits.is_empty());
     }
 

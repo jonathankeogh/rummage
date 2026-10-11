@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,9 +29,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub enum Request {
     Ping,
     Search {
+        /// Echoed in the responses, so a client can drop answers to a query it has moved on from.
+        #[serde(default)]
+        id: u64,
         query: String,
         #[serde(default = "default_limit")]
         limit: usize,
+        /// Also grep the files: a second, final response follows with grep's matches merged in.
+        #[serde(default = "yes", skip_serializing_if = "is_true")]
+        grep: bool,
         /// Only these kinds; none = documents and PDFs (or code for a "code: …" query).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kinds: Option<Vec<Kind>>,
@@ -41,13 +47,27 @@ pub enum Request {
     Quit,
 }
 
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 fn default_limit() -> usize {
     10
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct Response {
     pub ok: bool,
+    /// The search this answers.
+    #[serde(default)]
+    pub id: u64,
+    /// The last response to its search: a search with grep gets a first one (meaning and words) and a final one.
+    #[serde(rename = "final", default = "yes")]
+    pub done: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -59,6 +79,13 @@ pub struct Response {
     pub millis: f64,
 }
 
+impl Default for Response {
+    /// Not ok, and final: every response but a search's first is its last.
+    fn default() -> Response {
+        Response { ok: false, id: 0, done: true, error: None, hits: Vec::new(), vectors: 0, millis: 0.0 }
+    }
+}
+
 /// What a search needs, loaded once: the index, its vectors and the query model.
 pub struct Engine {
     store: Store,
@@ -67,6 +94,18 @@ pub struct Engine {
     data_version: i64,
     /// Where typical queries sit, worked out once (about 50 ms) for the hub penalty.
     query_centre: search::QueryCentre,
+    /// Moves on every reload of the vectors: a search's second phase only runs on the vectors of its first.
+    generation: u64,
+}
+
+/// What a search's second phase needs: the first phase's evidence, and what to grep.
+pub struct Pending {
+    prepared: search::Prepared,
+    generation: u64,
+    /// The query as grep takes it (no "code:"), where, and for which kind of file.
+    pub query: String,
+    pub roots: Vec<PathBuf>,
+    pub code: bool,
 }
 
 impl Engine {
@@ -78,7 +117,7 @@ impl Engine {
         let query_centre = search::QueryCentre::from_vectors(&embedder.embed_texts(&typical)?);
         vectors.set_query_centre(query_centre.clone());
         let data_version = data_version(&store)?;
-        Ok(Engine { store, vectors, embedder, data_version, query_centre })
+        Ok(Engine { store, vectors, embedder, data_version, query_centre, generation: 0 })
     }
 
     pub fn vector_count(&self) -> usize {
@@ -91,13 +130,32 @@ impl Engine {
         if version != self.data_version {
             self.vectors = Vectors::load(&self.store)?;
             self.vectors.set_query_centre(self.query_centre.clone());
+            self.generation += 1;
             self.data_version = version;
         }
         Ok(())
     }
 
     /// A search as typed: "code: …" searches code; otherwise `kinds`, or documents and PDFs when none are given.
+    /// A whole search, grep included (it waits for grep, up to `GREP_DEADLINE`).
     pub fn search(&mut self, text: &str, kinds: Option<&[Kind]>, limit: usize, z_gate: f64) -> Result<Vec<Hit>> {
+        let (hits, pending) = self.search_start(text, kinds, limit, z_gate)?;
+        let Some(pending) = pending else { return Ok(hits) };
+        let deadline = Instant::now() + GREP_DEADLINE;
+        let files = crate::crawl::grep_files(&pending.roots, pending.code);
+        let grepped = crate::grep::grep(&files, &pending.query, crate::grep::LIMIT, deadline, &AtomicBool::new(false))?;
+        Ok(self.search_finish(&pending, &grepped)?.unwrap_or(hits))
+    }
+
+    /// A search's first phase, meaning and words: its hits now, and what grep needs for the second (none when there's
+    /// nothing to grep for). "code: …" searches code; otherwise `kinds`, or documents and PDFs when none are given.
+    pub fn search_start(
+        &mut self,
+        text: &str,
+        kinds: Option<&[Kind]>,
+        limit: usize,
+        z_gate: f64,
+    ) -> Result<(Vec<Hit>, Option<Pending>)> {
         self.refresh()?;
         let (query, code) = search::split_code_prefix(text);
         let kinds: HashSet<Kind> = match (code, kinds) {
@@ -106,11 +164,31 @@ impl Engine {
             _ => [Kind::Doc, Kind::Pdf].into(),
         };
         if query.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let vector = self.embedder.embed_texts(&[prompts::query(query)])?.pop();
-        let options = search::Options { kinds: Some(kinds), limit, z_gate, ..Default::default() };
-        search::search(&self.store, &self.vectors, query, vector.as_deref(), &options)
+        let options = search::Options { kinds: Some(kinds.clone()), limit, z_gate, ..Default::default() };
+        let prepared = search::prepare(&self.store, &self.vectors, query, vector.as_deref(), &options)?;
+        let hits = search::rank(&self.store, &self.vectors, &prepared, &[], search::now())?;
+        // Grep reads text and code files; PDFs alone have nothing for it.
+        let greppable = kinds.contains(&Kind::Doc) || kinds.contains(&Kind::Code);
+        let pending = (greppable && crate::grep::pattern(query).is_some()).then(|| Pending {
+            prepared,
+            generation: self.generation,
+            query: query.to_string(),
+            roots: self.store.roots().unwrap_or_default(),
+            code,
+        });
+        Ok((hits, pending))
+    }
+
+    /// A search's second phase: everything ranked again with grep's matches. None if the vectors were reloaded in
+    /// between (the first phase's hits stand then).
+    pub fn search_finish(&self, pending: &Pending, grepped: &[crate::grep::GrepHit]) -> Result<Option<Vec<Hit>>> {
+        if pending.generation != self.generation {
+            return Ok(None);
+        }
+        Ok(Some(search::rank(&self.store, &self.vectors, &pending.prepared, grepped, search::now())?))
     }
 }
 
@@ -154,6 +232,7 @@ pub fn serve(dir: &Path, linger: Option<Duration>) -> Result<()> {
     );
 
     let engine = Arc::new(Mutex::new(engine));
+    let files = Arc::new(GrepFiles::default());
     let last_request = Arc::new(AtomicU64::new(now_seconds()));
     if let Some(linger) = linger {
         let (last_request, socket) = (last_request.clone(), socket.clone());
@@ -169,9 +248,10 @@ pub fn serve(dir: &Path, linger: Option<Duration>) -> Result<()> {
     }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let (engine, last_request, socket) = (engine.clone(), last_request.clone(), socket.clone());
+        let (engine, files, last_request, socket) =
+            (engine.clone(), files.clone(), last_request.clone(), socket.clone());
         std::thread::spawn(move || {
-            if let Err(error) = handle(stream, &engine, &last_request, &socket) {
+            if let Err(error) = handle(stream, &engine, &files, &last_request, &socket) {
                 eprintln!("rummage serve: {error:#}");
             }
         });
@@ -179,37 +259,145 @@ pub fn serve(dir: &Path, linger: Option<Duration>) -> Result<()> {
     Ok(())
 }
 
-fn handle(stream: UnixStream, engine: &Mutex<Engine>, last_request: &AtomicU64, socket: &Path) -> Result<()> {
+/// How long grep may take before the final response goes out with what it has.
+pub const GREP_DEADLINE: Duration = Duration::from_secs(3);
+/// How long a listing of the files grep reads is reused before walking the folders again.
+const FILE_LIST_FRESH: Duration = Duration::from_secs(60);
+
+/// The files grep reads, listed per folder set and kind, kept for a minute: walking a big folder takes a while, and
+/// searches come a keystroke apart.
+#[derive(Default)]
+pub struct GrepFiles {
+    lists: Mutex<std::collections::HashMap<(Vec<PathBuf>, bool), (Instant, Arc<Vec<(PathBuf, Kind, i64)>>)>>,
+}
+
+impl GrepFiles {
+    fn get(&self, roots: &[PathBuf], code: bool) -> Arc<Vec<(PathBuf, Kind, i64)>> {
+        let key = (roots.to_vec(), code);
+        if let Some((at, list)) = self.lists.lock().unwrap().get(&key) {
+            if at.elapsed() < FILE_LIST_FRESH {
+                return list.clone();
+            }
+        }
+        let list = Arc::new(crate::crawl::grep_files(roots, code));
+        self.lists.lock().unwrap().insert(key, (Instant::now(), list.clone()));
+        list
+    }
+}
+
+fn handle(
+    stream: UnixStream,
+    engine: &Mutex<Engine>,
+    files: &Arc<GrepFiles>,
+    last_request: &AtomicU64,
+    socket: &Path,
+) -> Result<()> {
     let mut writer = stream.try_clone()?;
-    for line in BufReader::new(stream).lines() {
-        let line = line?;
+    // Requests are read on their own thread, so a newer one can cancel a grep still running.
+    let (lines_tx, lines) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { break };
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut send =
+        |response: &Response| -> Result<()> { Ok(writeln!(writer, "{}", serde_json::to_string(response)?)?) };
+    let mut next: Option<String> = None;
+    loop {
+        let line = match next.take() {
+            Some(line) => line,
+            None => match lines.recv() {
+                Ok(line) => line,
+                Err(_) => return Ok(()),
+            },
+        };
         if line.trim().is_empty() {
             continue;
         }
         last_request.store(now_seconds(), Ordering::Relaxed);
         let started = Instant::now();
-        let mut response = match serde_json::from_str::<Request>(&line) {
-            Err(error) => Response { error: Some(format!("bad request: {error}")), ..Default::default() },
-            Ok(Request::Quit) => {
-                writeln!(writer, "{}", serde_json::to_string(&Response { ok: true, ..Default::default() })?)?;
-                quit(socket);
-            }
-            Ok(Request::Ping) => {
-                let engine = engine.lock().unwrap();
-                Response { ok: true, vectors: engine.vector_count(), ..Default::default() }
-            }
-            Ok(Request::Search { query, limit, kinds, zgate }) => {
-                let mut engine = engine.lock().unwrap();
-                match engine.search(&query, kinds.as_deref(), limit, zgate.unwrap_or(2.0)) {
-                    Ok(hits) => Response { ok: true, hits, vectors: engine.vector_count(), ..Default::default() },
-                    Err(error) => Response { error: Some(format!("{error:#}")), ..Default::default() },
-                }
+        let millis = || started.elapsed().as_secs_f64() * 1000.0;
+        let request = match serde_json::from_str::<Request>(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                send(&Response { error: Some(format!("bad request: {error}")), ..Default::default() })?;
+                continue;
             }
         };
-        response.millis = started.elapsed().as_secs_f64() * 1000.0;
-        writeln!(writer, "{}", serde_json::to_string(&response)?)?;
+        match request {
+            Request::Quit => {
+                send(&Response { ok: true, ..Default::default() })?;
+                quit(socket);
+            }
+            Request::Ping => {
+                let vectors = engine.lock().unwrap().vector_count();
+                send(&Response { ok: true, vectors, ..Default::default() })?;
+            }
+            Request::Search { id, query, limit, grep, kinds, zgate } => {
+                let started_search =
+                    engine.lock().unwrap().search_start(&query, kinds.as_deref(), limit, zgate.unwrap_or(2.0));
+                let vectors = engine.lock().unwrap().vector_count();
+                let (hits, pending) = match started_search {
+                    Ok(result) => result,
+                    Err(error) => {
+                        send(&Response { id, error: Some(format!("{error:#}")), ..Default::default() })?;
+                        continue;
+                    }
+                };
+                let pending = pending.filter(|_| grep);
+                send(&Response {
+                    ok: true,
+                    id,
+                    done: pending.is_none(),
+                    hits,
+                    vectors,
+                    millis: millis(),
+                    ..Default::default()
+                })?;
+                let Some(pending) = pending else { continue };
+
+                // Second phase: grep on its own thread; a newer request cancels it (and gets no final for this one).
+                let cancel = Arc::new(AtomicBool::new(false));
+                let (done_tx, done) = std::sync::mpsc::channel();
+                {
+                    let (files, cancel) = (files.clone(), cancel.clone());
+                    let (roots, code, query) = (pending.roots.clone(), pending.code, pending.query.clone());
+                    std::thread::spawn(move || {
+                        let deadline = Instant::now() + GREP_DEADLINE;
+                        let list = files.get(&roots, code);
+                        let _ = done_tx.send(crate::grep::grep(&list, &query, crate::grep::LIMIT, deadline, &cancel));
+                    });
+                }
+                loop {
+                    match done.recv_timeout(Duration::from_millis(10)) {
+                        Ok(grepped) => {
+                            let ranked = grepped.and_then(|g| engine.lock().unwrap().search_finish(&pending, &g));
+                            let response = match ranked {
+                                Ok(Some(hits)) => {
+                                    Response { ok: true, id, hits, vectors, millis: millis(), ..Default::default() }
+                                }
+                                Ok(None) => Response { ok: true, id, vectors, millis: millis(), ..Default::default() },
+                                Err(error) => Response { id, error: Some(format!("{error:#}")), ..Default::default() },
+                            };
+                            send(&response)?;
+                            break;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if let Ok(line) = lines.try_recv() {
+                                cancel.store(true, Ordering::Relaxed);
+                                next = Some(line);
+                                break;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            }
+        }
     }
-    Ok(())
 }
 
 /// Removes the socket and exits at once. Not `std::process::exit`: that runs C++ static destructors, and llama.cpp's
@@ -231,6 +419,8 @@ fn now_seconds() -> u64 {
 pub struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    /// The id of the last search sent.
+    last_id: u64,
 }
 
 /// How long a client waits for a service it started: loading the model takes under a second, but the first run on a
@@ -265,11 +455,21 @@ impl Client {
     /// Connects to this index's service if it's running.
     pub fn connect(dir: &Path) -> Result<Client> {
         let stream = UnixStream::connect(socket_path(dir))?;
-        Ok(Client { reader: BufReader::new(stream.try_clone()?), writer: stream })
+        Ok(Client { reader: BufReader::new(stream.try_clone()?), writer: stream, last_id: 0 })
     }
 
+    /// Sends a ping or quit and reads its answer (answers left over from an abandoned search are skipped).
     pub fn request(&mut self, request: &Request) -> Result<Response> {
         writeln!(self.writer, "{}", serde_json::to_string(request)?)?;
+        loop {
+            let response = self.read()?;
+            if response.id == 0 {
+                return Ok(response);
+            }
+        }
+    }
+
+    fn read(&mut self) -> Result<Response> {
         let mut line = String::new();
         if self.reader.read_line(&mut line)? == 0 {
             bail!("the search service closed the connection");
@@ -281,8 +481,45 @@ impl Client {
         Ok(response)
     }
 
-    pub fn search(&mut self, query: &str, kinds: Option<Vec<Kind>>, limit: usize, zgate: f64) -> Result<Response> {
-        self.request(&Request::Search { query: query.to_string(), limit, kinds, zgate: Some(zgate) })
+    /// A whole search: waits for the final response (grep included unless `grep` is false).
+    pub fn search(
+        &mut self,
+        query: &str,
+        kinds: Option<Vec<Kind>>,
+        limit: usize,
+        zgate: f64,
+        grep: bool,
+    ) -> Result<Response> {
+        Ok(self.search_stream(query, kinds, limit, zgate, grep, &mut |_| true)?.expect("never abandoned"))
+    }
+
+    /// A search whose first response goes to `first` before the final one arrives. If `first` returns false the
+    /// search is abandoned (None): its final response is skipped by the next search, being for an older id.
+    pub fn search_stream(
+        &mut self,
+        query: &str,
+        kinds: Option<Vec<Kind>>,
+        limit: usize,
+        zgate: f64,
+        grep: bool,
+        first: &mut dyn FnMut(&Response) -> bool,
+    ) -> Result<Option<Response>> {
+        self.last_id += 1;
+        let id = self.last_id;
+        let request = Request::Search { id, query: query.to_string(), limit, grep, kinds, zgate: Some(zgate) };
+        writeln!(self.writer, "{}", serde_json::to_string(&request)?)?;
+        loop {
+            let response = self.read()?;
+            if response.id != id {
+                continue;
+            }
+            if response.done {
+                return Ok(Some(response));
+            }
+            if !first(&response) {
+                return Ok(None);
+            }
+        }
     }
 }
 
@@ -299,21 +536,40 @@ impl ServiceBackend {
         Ok(ServiceBackend { dir: dir.to_path_buf(), client: Some(Client::connect_or_start(dir)?) })
     }
 
-    fn search_once(&mut self, query: &str, limit: usize) -> Result<Vec<Hit>> {
+    fn search_once(
+        &mut self,
+        query: &str,
+        limit: usize,
+        first: &mut dyn FnMut(Vec<Hit>) -> bool,
+    ) -> Result<Option<Vec<Hit>>> {
         let client = match &mut self.client {
             Some(client) => client,
             None => self.client.insert(Client::connect_or_start(&self.dir)?),
         };
-        Ok(client.search(query, None, limit, 2.0)?.hits)
+        let done = client.search_stream(query, None, limit, 2.0, true, &mut |r| first(r.hits.clone()))?;
+        Ok(done.map(|r| r.hits))
     }
 }
 
 impl crate::tui::backend::Backend for ServiceBackend {
     fn search(&mut self, query: &str, limit: usize) -> Result<Vec<Hit>> {
-        self.search_once(query, limit).or_else(|_| {
-            self.client = None;
-            self.search_once(query, limit)
-        })
+        Ok(self.search_stream(query, limit, &mut |_| true)?.unwrap_or_default())
+    }
+
+    fn search_stream(
+        &mut self,
+        query: &str,
+        limit: usize,
+        first: &mut dyn FnMut(Vec<Hit>) -> bool,
+    ) -> Result<Option<Vec<Hit>>> {
+        match self.search_once(query, limit, first) {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                // The service may have quit (idle) while the interface stayed open: start it again and retry once.
+                self.client = None;
+                self.search_once(query, limit, first)
+            }
+        }
     }
 }
 
@@ -347,11 +603,20 @@ mod tests {
 
     #[test]
     fn requests_are_one_json_line() {
-        let request = Request::Search { query: "dog".into(), limit: 5, kinds: Some(vec![Kind::Doc]), zgate: None };
+        let request = Request::Search {
+            id: 7,
+            query: "dog".into(),
+            limit: 5,
+            grep: true,
+            kinds: Some(vec![Kind::Doc]),
+            zgate: None,
+        };
         let line = serde_json::to_string(&request).unwrap();
-        assert_eq!(line, r#"{"op":"search","query":"dog","limit":5,"kinds":["doc"]}"#);
+        assert_eq!(line, r#"{"op":"search","id":7,"query":"dog","limit":5,"kinds":["doc"]}"#);
         let back: Request = serde_json::from_str(r#"{"op":"search","query":"dog"}"#).unwrap();
-        assert!(matches!(back, Request::Search { limit: 10, kinds: None, zgate: None, .. }));
+        assert!(matches!(back, Request::Search { id: 0, limit: 10, grep: true, kinds: None, zgate: None, .. }));
+        let response: Response = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(response.done, "an answer without \"final\" is final");
         assert!(matches!(serde_json::from_str::<Request>(r#"{"op":"ping"}"#).unwrap(), Request::Ping));
     }
 

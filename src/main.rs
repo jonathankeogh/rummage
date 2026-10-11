@@ -54,6 +54,9 @@ enum Command {
         /// Search in this process instead of through the background service
         #[arg(long)]
         no_serve: bool,
+        /// Meaning and indexed words only: don't grep the files
+        #[arg(long)]
+        no_grep: bool,
     },
     /// What's in the index
     Status,
@@ -81,8 +84,8 @@ fn run() -> Result<()> {
         Some(Command::Index { folders, code, exclude, reindex }) => {
             index_command(&dir, folders, code, exclude, reindex)
         }
-        Some(Command::Search { words, limit, kind, zgate, json, no_serve }) => {
-            search_command(&dir, words, limit, kind, zgate, json, no_serve)
+        Some(Command::Search { words, limit, kind, zgate, json, no_serve, no_grep }) => {
+            search_command(&dir, words, limit, kind, zgate, json, no_serve, no_grep)
         }
         Some(Command::Status) => status(&dir),
         Some(Command::Serve { linger }) => {
@@ -177,6 +180,7 @@ fn search_command(
     zgate: f64,
     json: bool,
     no_serve: bool,
+    no_grep: bool,
 ) -> Result<()> {
     let query = words.join(" ");
     let kinds: Vec<Kind> =
@@ -186,7 +190,11 @@ fn search_command(
     let (hits, timing) = if no_serve {
         let mut engine = serve::Engine::open(dir)?;
         let loaded = started.elapsed();
-        let hits = engine.search(&query, kinds.as_deref(), limit, zgate)?;
+        let hits = if no_grep {
+            engine.search_start(&query, kinds.as_deref(), limit, zgate)?.0
+        } else {
+            engine.search(&query, kinds.as_deref(), limit, zgate)?
+        };
         let timing = format!(
             "{} vectors · start {:.2} s · search {:.0} ms, in this process",
             engine.vector_count(),
@@ -197,7 +205,7 @@ fn search_command(
     } else {
         let mut client = serve::Client::connect_or_start(dir)?;
         let connected = started.elapsed();
-        let response = client.search(&query, kinds, limit, zgate)?;
+        let response = client.search(&query, kinds, limit, zgate, !no_grep)?;
         let mut timing = format!(
             "{} vectors · search {:.0} ms in the service, {:.0} ms here",
             response.vectors,
@@ -220,6 +228,7 @@ fn search_command(
         let path = PathBuf::from(&hit.path);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let place = match (hit.kind, hit.loc) {
+            _ if hit.line.is_some() => format!("  [line {}]", hit.line.unwrap_or(0)),
             (Kind::Pdf, Some(loc)) => format!("  [page {loc:.0}]"),
             (_, Some(loc)) if loc > 1.0 => format!("  [passage {loc:.0}]"),
             _ => String::new(),
@@ -227,6 +236,7 @@ fn search_command(
         let why = [
             hit.z.filter(|z| *z >= zgate).map(|z| format!("z {z:.1}")),
             hit.keyword_rank.map(|r| format!("words #{r}")),
+            hit.grep.then(|| "grep".to_string()),
         ]
         .into_iter()
         .flatten()
