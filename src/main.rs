@@ -98,12 +98,7 @@ fn run() -> Result<()> {
                 Ok(())
             }
         },
-        None => {
-            // The interface comes in milestone 3.
-            use clap::CommandFactory;
-            Cli::command().print_help()?;
-            Ok(())
-        }
+        None => interface(&dir),
     }
 }
 
@@ -220,6 +215,19 @@ fn search_command(
     }
     eprintln!("({timing})");
     Ok(())
+}
+
+/// `rummage` alone: the search interface, on this index's background service.
+fn interface(dir: &PathBuf) -> Result<()> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        bail!("the interface needs a terminal; for scripts use `rummage search … --json`");
+    }
+    let store = Store::open(dir)?;
+    if store.roots()?.is_empty() {
+        bail!("nothing indexed yet: rummage index <folder>... (rummage --help for more)");
+    }
+    drop(store);
+    rummage::tui::run(serve::ServiceBackend::connect(dir)?)
 }
 
 fn status(dir: &PathBuf) -> Result<()> {

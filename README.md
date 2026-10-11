@@ -4,9 +4,9 @@ Instant multimodal semantic file search for the Unix terminal. Describe what you
 by meaning and by exact words, locally, on any GPU or CPU. Type `rummage` for a yazi-style interface, or use it inside
 yazi with the plugin.
 
-**Status: milestone 2 of 9.** Text search works end to end (plain text, Markdown and, with `--code`, source code),
-through a background service that keeps searches instant. Images, PDFs, audio, video, the interface and the yazi
-plugin are coming.
+**Status: milestones 1–3 of 9.** Text search works end to end (plain text, Markdown and, with `--code`, source code),
+through a background service that keeps searches instant, with a search-as-you-type interface. Images, PDFs, audio,
+video and the yazi plugin are coming.
 
 ## Build
 
@@ -29,6 +29,7 @@ uvx --from huggingface_hub hf download ggml-org/embeddinggemma-2-GGUF embeddingg
 ## Use
 
 ```sh
+rummage                                  # the interface: type to search, ↑↓ to move, ⏎ to open, F1 for help
 rummage index ~/Documents ~/notes        # add folders and index them (later: `rummage index` alone re-syncs)
 rummage search "the clause about pets in the lease"
 rummage search INV20931                  # exact words count too

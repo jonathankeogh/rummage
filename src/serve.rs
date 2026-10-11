@@ -280,6 +280,37 @@ impl Client {
     }
 }
 
+/// The interface's search backend: this index's service. It reconnects (restarting the service if needed) when a
+/// request fails, since an interface left open longer than the service's linger outlives it.
+pub struct ServiceBackend {
+    dir: PathBuf,
+    client: Option<Client>,
+}
+
+impl ServiceBackend {
+    /// Connects now (starting the service if needed), so problems show before the interface takes the screen.
+    pub fn connect(dir: &Path) -> Result<ServiceBackend> {
+        Ok(ServiceBackend { dir: dir.to_path_buf(), client: Some(Client::connect_or_start(dir)?) })
+    }
+
+    fn search_once(&mut self, query: &str, limit: usize) -> Result<Vec<Hit>> {
+        let client = match &mut self.client {
+            Some(client) => client,
+            None => self.client.insert(Client::connect_or_start(&self.dir)?),
+        };
+        Ok(client.search(query, None, limit, 2.0)?.hits)
+    }
+}
+
+impl crate::tui::backend::Backend for ServiceBackend {
+    fn search(&mut self, query: &str, limit: usize) -> Result<Vec<Hit>> {
+        self.search_once(query, limit).or_else(|_| {
+            self.client = None;
+            self.search_once(query, limit)
+        })
+    }
+}
+
 /// The service's log, next to the index.
 pub fn log_path(dir: &Path) -> PathBuf {
     dir.join("serve.log")
