@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use rummage::crawl;
+use rummage::extract;
 use rummage::index;
 use rummage::paths::{self, ModelFiles, tilde};
 use rummage::serve;
@@ -42,7 +43,7 @@ enum Command {
         words: Vec<String>,
         #[arg(short = 'n', default_value_t = 10)]
         limit: usize,
-        /// Only these kinds: doc, code (comma-separated)
+        /// Only these kinds: doc, pdf, code (comma-separated) [default: doc,pdf]
         #[arg(long, value_delimiter = ',')]
         kind: Vec<String>,
         /// How far a meaning match must stand out
@@ -134,15 +135,36 @@ fn index_command(dir: &PathBuf, folders: Vec<PathBuf>, code: bool, exclude: Vec<
         index::duration(started)
     );
     let started = Instant::now();
-    let done = index::embed_pending(&store, |done, total, path| {
+    if sync.pdfs_without_tools > 0 {
+        eprintln!(
+            "left out {} PDFs: {}, then run rummage index again",
+            sync.pdfs_without_tools,
+            extract::PDF_TOOLS_HINT
+        );
+    }
+    let mut first_pass_over = false;
+    let done = index::embed_pending(&store, |progress| {
         // Just the name: a full path wraps in a narrow terminal and the line can't be redrawn.
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let name: String = name.chars().take(60).collect();
-        eprint!("\r\x1b[K[{done}/{total}] {name}");
+        let short = |path: &std::path::Path| -> String {
+            path.file_name().map(|n| n.to_string_lossy().chars().take(60).collect()).unwrap_or_default()
+        };
+        match progress {
+            index::Progress::File { done, total, path } => eprint!("\r\x1b[K[{done}/{total}] {}", short(path)),
+            index::Progress::Later { path, kind, done, total } => {
+                if !first_pass_over {
+                    first_pass_over = true;
+                    eprintln!(
+                        "\r\x1b[Keverything is searchable; reading the rest of long files ({})",
+                        index::duration(started)
+                    );
+                }
+                eprint!("\r\x1b[K{} {} of {} {}s", short(path), done, total, kind.unit());
+            }
+        }
         std::io::stderr().flush().ok();
     })?;
-    if done > 0 {
-        eprintln!("\r\x1b[Kembedded {done} files in {}", index::duration(started));
+    if done > 0 || first_pass_over {
+        eprintln!("\r\x1b[Kindexed {done} files in {}", index::duration(started));
     }
     Ok(())
 }
@@ -198,6 +220,7 @@ fn search_command(
         let path = PathBuf::from(&hit.path);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let place = match (hit.kind, hit.loc) {
+            (Kind::Pdf, Some(loc)) => format!("  [page {loc:.0}]"),
             (_, Some(loc)) if loc > 1.0 => format!("  [passage {loc:.0}]"),
             _ => String::new(),
         };

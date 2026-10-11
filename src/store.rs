@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
+    /// Text and documents (txt, md, docx, odt, html …), cut into passages.
     Doc,
+    /// PDFs, a page at a time.
+    Pdf,
     Code,
 }
 
@@ -15,13 +18,23 @@ impl Kind {
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Doc => "doc",
+            Kind::Pdf => "pdf",
             Kind::Code => "code",
+        }
+    }
+
+    /// What `loc` counts for this kind.
+    pub fn unit(self) -> &'static str {
+        match self {
+            Kind::Pdf => "page",
+            Kind::Doc | Kind::Code => "passage",
         }
     }
 
     pub fn parse(s: &str) -> Option<Kind> {
         match s {
             "doc" => Some(Kind::Doc),
+            "pdf" => Some(Kind::Pdf),
             "code" => Some(Kind::Code),
             _ => None,
         }
@@ -60,13 +73,15 @@ impl Store {
                  kind TEXT NOT NULL,
                  size INTEGER NOT NULL,
                  mtime INTEGER NOT NULL,
-                 state TEXT NOT NULL,          -- pending | done | failed
-                 error TEXT
+                 state TEXT NOT NULL,          -- pending | partial | done | failed
+                 error TEXT,
+                 parts_done INTEGER,           -- pages or passages embedded so far (a long file goes in steps)
+                 parts_total INTEGER
              );
              CREATE TABLE IF NOT EXISTS segments (
                  id INTEGER PRIMARY KEY,
                  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-                 loc REAL,                     -- passage number from 1 (pages and seconds later)
+                 loc REAL,                     -- passage or page number from 1 (seconds later)
                  excerpt TEXT NOT NULL,
                  vector BLOB NOT NULL          -- 768 little-endian f32
              );
@@ -75,6 +90,16 @@ impl Store {
                  name, text, content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 2'
              );",
         )?;
+        // Indexes made before long files went in steps lack the progress columns.
+        let columns: Vec<String> = db
+            .prepare("SELECT name FROM pragma_table_info('files')")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for column in ["parts_done", "parts_total"] {
+            if !columns.iter().any(|c| c == column) {
+                db.execute(&format!("ALTER TABLE files ADD COLUMN {column} INTEGER"), [])?;
+            }
+        }
         let store = Store { db, file };
         match store.meta("fingerprint")? {
             None => store.set_meta("fingerprint", FINGERPRINT)?,
@@ -118,7 +143,8 @@ impl Store {
         if let Some(existing) = self.file(path)? {
             self.clear_segments(existing.id)?;
             self.db.execute(
-                "UPDATE files SET kind = ?, size = ?, mtime = ?, state = 'pending', error = NULL WHERE id = ?",
+                "UPDATE files SET kind = ?, size = ?, mtime = ?, state = 'pending', error = NULL, parts_done = NULL,
+                 parts_total = NULL WHERE id = ?",
                 params![kind.as_str(), size as i64, mtime, existing.id],
             )?;
             return Ok(existing.id);
@@ -139,6 +165,38 @@ impl Store {
             .filter_map(|r| r.ok())
             .filter_map(|(id, path, kind)| Some((id, PathBuf::from(path), Kind::parse(&kind)?)))
             .collect())
+    }
+
+    /// Files read in part, with how far along: (id, path, kind, parts done, parts total), smallest first.
+    pub fn partial(&self) -> Result<Vec<(i64, PathBuf, Kind, usize, usize)>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, path, kind, parts_done, parts_total FROM files WHERE state = 'partial' ORDER BY parts_total",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        Ok(rows
+            .filter_map(|r| r.ok())
+            .filter_map(|(id, path, kind, done, total)| {
+                Some((id, PathBuf::from(path), Kind::parse(&kind)?, done as usize, total as usize))
+            })
+            .collect())
+    }
+
+    /// Records how far a file has been read: `partial` until every part is in, then `done`.
+    pub fn progress(&self, file_id: i64, done: usize, total: usize) -> Result<()> {
+        let state = if done < total { "partial" } else { "done" };
+        self.db.execute(
+            "UPDATE files SET state = ?, error = NULL, parts_done = ?, parts_total = ? WHERE id = ?",
+            params![state, done as i64, total as i64, file_id],
+        )?;
+        Ok(())
     }
 
     pub fn add_segment(
@@ -189,7 +247,8 @@ impl Store {
     /// Drops every vector so everything embeds again (after a model change).
     pub fn reset_vectors(&self) -> Result<()> {
         self.db.execute_batch(
-            "DELETE FROM words; DELETE FROM segments; UPDATE files SET state = 'pending', error = NULL;",
+            "DELETE FROM words; DELETE FROM segments;
+             UPDATE files SET state = 'pending', error = NULL, parts_done = NULL, parts_total = NULL;",
         )?;
         self.set_meta("fingerprint", FINGERPRINT)
     }

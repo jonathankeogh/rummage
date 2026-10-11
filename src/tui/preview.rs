@@ -2,6 +2,7 @@
 //!
 //! `Preview` is an enum so other kinds (image, PDF page, video frame) can be added next to `Text` and `Code`.
 
+use crate::extract;
 use crate::search::{self, Hit};
 use crate::store::Kind;
 use ratatui::style::{Color, Modifier, Style};
@@ -50,27 +51,106 @@ impl Preview {
     pub fn load(hit: &Hit, terms: &[String]) -> Preview {
         let path = Path::new(&hit.path);
         let loc = hit.loc.map(|l| l.round().max(1.0) as usize).unwrap_or(1);
-        let text = match read_text(path) {
+        if hit.kind == Kind::Pdf {
+            return match pdf_pages(path, loc, terms) {
+                Ok(shown) => Preview::Text(shown),
+                Err(e) if !hit.excerpt.is_empty() => {
+                    Preview::Text(shown(text_lines(&format!("{}\n\n({e:#})", hit.excerpt), terms), 0))
+                }
+                Err(e) => Preview::Message(format!("can't read the PDF: {e:#}")),
+            };
+        }
+        let text = match read_document(path, hit.kind) {
             Ok(Some(text)) => text,
             Ok(None) => return Preview::Message("binary file".into()),
             Err(_) if !hit.excerpt.is_empty() => hit.excerpt.clone(),
-            Err(e) => return Preview::Message(format!("can't read file: {e}")),
+            Err(e) => return Preview::Message(format!("can't read file: {e:#}")),
         };
         let (window, focus) = window(&text, loc);
-        let shown = |lines: Vec<Line<'static>>| {
-            let anchor = first_marked(&lines[focus.min(lines.len())..]).map(|i| focus + i).or(first_marked(&lines));
-            Shown { lines, focus, anchor }
-        };
         match hit.kind {
-            Kind::Code => Preview::Code(shown(code_lines(&window, path, terms))),
-            Kind::Doc => Preview::Text(shown(
-                window
-                    .lines()
-                    .map(|l| Line::from(overlay(vec![(Style::default(), l.replace('\t', "    "))], terms)))
-                    .collect(),
-            )),
+            Kind::Code => Preview::Code(shown(code_lines(&window, path, terms), focus)),
+            _ => Preview::Text(shown(text_lines(&window, terms), focus)),
         }
     }
+}
+
+/// `lines` opening at `focus`, or at the first marked line from there on.
+fn shown(lines: Vec<Line<'static>>, focus: usize) -> Shown {
+    let anchor = first_marked(&lines[focus.min(lines.len())..]).map(|i| focus + i).or(first_marked(&lines));
+    Shown { lines, focus, anchor }
+}
+
+/// Prose lines with `terms` marked.
+fn text_lines(text: &str, terms: &[String]) -> Vec<Line<'static>> {
+    text.lines().map(|l| Line::from(overlay(vec![(Style::default(), l.replace('\t', "    "))], terms))).collect()
+}
+
+/// Pages of a PDF around page `page`: a few before, the page, more after, each under a "page N" rule.
+fn pdf_pages(path: &Path, page: usize, terms: &[String]) -> anyhow::Result<Shown> {
+    const BEFORE: usize = 2;
+    const AFTER: usize = 6;
+    let count = extract::pdf_page_count(path)?;
+    let first = page.saturating_sub(BEFORE).max(1);
+    let last = (page + AFTER).min(count).max(first);
+    let rule = Style::default().fg(Color::DarkGray);
+    let mut lines = Vec::new();
+    let mut focus = 0;
+    for (i, text) in extract::pdf_pages(path, first, last)?.iter().enumerate() {
+        let number = first + i;
+        if number == page {
+            focus = lines.len();
+        }
+        lines.push(Line::styled(format!("── page {number} of {count} ──"), rule));
+        if text.trim().is_empty() {
+            lines.push(Line::styled("(no text on this page)", rule));
+        }
+        lines.extend(text_lines(&reflow(text.trim_end()), terms));
+        lines.push(Line::from(""));
+    }
+    Ok(shown(lines, focus))
+}
+
+/// Joins a PDF's hard-wrapped lines back into paragraphs (a blank line ends one), mending words hyphenated across
+/// lines, so the pane can wrap them at its own width.
+pub fn reflow(text: &str) -> String {
+    let mut out = String::new();
+    let mut paragraph = String::new();
+    let flush = |paragraph: &mut String, out: &mut String| {
+        if !paragraph.is_empty() {
+            out.push_str(paragraph);
+            out.push('\n');
+            paragraph.clear();
+        }
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            flush(&mut paragraph, &mut out);
+            out.push('\n');
+            continue;
+        }
+        if paragraph.is_empty() {
+            paragraph.push_str(line);
+        } else if paragraph.ends_with('-') && line.starts_with(|c: char| c.is_lowercase()) {
+            paragraph.pop();
+            paragraph.push_str(line);
+        } else {
+            paragraph.push(' ');
+            paragraph.push_str(line);
+        }
+    }
+    flush(&mut paragraph, &mut out);
+    out
+}
+
+/// A file's text as indexing read it: documents converted (docx, odt, html), anything else as text. `None` for
+/// binary files.
+fn read_document(path: &Path, kind: Kind) -> anyhow::Result<Option<String>> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if kind == Kind::Doc && ["docx", "odt", "html", "htm", "xhtml"].contains(&ext.as_str()) {
+        return Ok(Some(extract::document_text(path)?));
+    }
+    Ok(read_text(path)?)
 }
 
 /// The query's words to mark: the same words the search matched (a leading "code:" is not one).
@@ -269,6 +349,17 @@ mod tests {
         let spans = overlay(vec![(Style::default(), "do".into()), (Style::default(), "g!".into())], &["dog".into()]);
         let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(texts, vec!["do", "g", "!"]);
+    }
+
+    #[test]
+    fn reflow_joins_lines_into_paragraphs() {
+        let text = "We denote its elements to\nemphasise that they\nare classes.\n\nA new para-\ngraph here.";
+        assert_eq!(
+            reflow(text),
+            "We denote its elements to emphasise that they are classes.\n\nA new paragraph here.\n"
+        );
+        // A dash before a capital stays: it's punctuation, not a split word.
+        assert_eq!(reflow("Projective-\nGeometry"), "Projective- Geometry\n");
     }
 
     #[test]

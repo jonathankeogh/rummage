@@ -32,7 +32,7 @@ pub enum Request {
         query: String,
         #[serde(default = "default_limit")]
         limit: usize,
-        /// Only these kinds; none = documents (or code for a "code: …" query).
+        /// Only these kinds; none = documents and PDFs (or code for a "code: …" query).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kinds: Option<Vec<Kind>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,14 +90,14 @@ impl Engine {
         Ok(())
     }
 
-    /// A search as typed: "code: …" searches code; otherwise `kinds`, or documents when none are given.
+    /// A search as typed: "code: …" searches code; otherwise `kinds`, or documents and PDFs when none are given.
     pub fn search(&mut self, text: &str, kinds: Option<&[Kind]>, limit: usize, z_gate: f64) -> Result<Vec<Hit>> {
         self.refresh()?;
         let (query, code) = search::split_code_prefix(text);
         let kinds: HashSet<Kind> = match (code, kinds) {
             (true, _) => [Kind::Code].into(),
             (false, Some(kinds)) if !kinds.is_empty() => kinds.iter().copied().collect(),
-            _ => [Kind::Doc].into(),
+            _ => [Kind::Doc, Kind::Pdf].into(),
         };
         if query.is_empty() {
             return Ok(Vec::new());

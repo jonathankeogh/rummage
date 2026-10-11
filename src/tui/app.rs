@@ -9,6 +9,8 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
 use std::cell::{Cell, RefCell};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -78,7 +80,8 @@ impl Filter {
     fn next(self) -> Filter {
         match self {
             Filter::All => Filter::Only(Kind::Doc),
-            Filter::Only(Kind::Doc) => Filter::Only(Kind::Code),
+            Filter::Only(Kind::Doc) => Filter::Only(Kind::Pdf),
+            Filter::Only(Kind::Pdf) => Filter::Only(Kind::Code),
             Filter::Only(Kind::Code) => Filter::All,
         }
     }
@@ -120,6 +123,34 @@ pub struct App {
     /// The results list's scroll position, kept between draws.
     pub list: RefCell<ListState>,
     last_click: Option<(Instant, usize)>,
+    /// Show PDF pages as pictures rather than text (Ctrl-v).
+    pub page_view: bool,
+    /// How this terminal draws pictures (kitty, iTerm2, sixel, or half-blocks anywhere).
+    pub picker: Option<Picker>,
+    /// The selected PDF page, drawn for the preview's size: what it was made for, and the picture or why not.
+    pub page_image: RefCell<Option<(PageKey, Result<StatefulProtocol, String>)>>,
+}
+
+/// How this terminal draws pictures: asked the first time a page is shown (not at start, so a terminal that never
+/// answers costs nothing until then). `RUMMAGE_PICTURES=halfblocks` skips the question: half-blocks work in any
+/// terminal with colour.
+fn ask_terminal() -> Picker {
+    if std::env::var("RUMMAGE_PICTURES").is_ok_and(|v| v == "halfblocks") {
+        return Picker::halfblocks();
+    }
+    let options = ratatui_image::picker::cap_parser::QueryStdioOptions {
+        timeout: Duration::from_millis(500),
+        ..Default::default()
+    };
+    Picker::from_query_stdio_with_options(options).unwrap_or_else(|_| Picker::halfblocks())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageKey {
+    path: String,
+    page: usize,
+    width: u16,
+    height: u16,
 }
 
 /// The preview's size in rows at one width.
@@ -164,6 +195,9 @@ impl App {
             areas: Cell::new(Areas::default()),
             list: RefCell::new(ListState::default()),
             last_click: None,
+            page_view: false,
+            picker: None,
+            page_image: RefCell::new(None),
         }
     }
 
@@ -256,6 +290,12 @@ impl App {
             }
             KeyCode::Enter => return selected.map_or(Action::None, Action::Open),
             KeyCode::Char('o') if ctrl => return selected.map_or(Action::None, Action::Reveal),
+            KeyCode::Char('v') if ctrl => {
+                self.page_view = !self.page_view;
+                if self.page_view && selected.is_some_and(|i| self.hits[i].kind != Kind::Pdf) {
+                    self.notify("page view shows PDFs; other files stay as text");
+                }
+            }
             KeyCode::Char('y') if ctrl => return selected.map_or(Action::None, Action::Copy),
             KeyCode::Char('u') if ctrl => {
                 self.query.clear();
@@ -347,6 +387,34 @@ impl App {
         self.metrics.set(None);
     }
 
+    /// Draws the selected PDF page for the preview's current size, when the page view is on and it changed.
+    pub fn refresh_page_image(&mut self) {
+        let Some(i) = self.selected_hit().filter(|&i| self.page_view && self.hits[i].kind == Kind::Pdf) else {
+            return;
+        };
+        let picker = self.picker.get_or_insert_with(ask_terminal);
+        let area = self.areas.get().preview;
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let hit = &self.hits[i];
+        let key = PageKey {
+            path: hit.path.clone(),
+            page: hit.loc.map_or(1, |l| l.round().max(1.0) as usize),
+            width: area.width,
+            height: area.height,
+        };
+        if self.page_image.borrow().as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        let height_px = area.height as u32 * picker.font_size().height as u32;
+        let image = crate::extract::pdf_page_png(std::path::Path::new(&key.path), key.page, height_px)
+            .and_then(|png| Ok(image::load_from_memory(&png)?))
+            .map(|image| picker.new_resize_protocol(image))
+            .map_err(|e| format!("can't draw the page: {e:#}"));
+        *self.page_image.borrow_mut() = Some((key, image));
+    }
+
     pub fn preview(&self) -> Option<&Preview> {
         self.preview.as_ref().map(|(_, p)| p)
     }
@@ -409,10 +477,13 @@ pub(crate) mod tests {
     #[test]
     fn filter_cycles_and_limits_rows() {
         let (mut app, _rx) = app();
-        app.hits = vec![hit("/a.md", Kind::Doc), hit("/b.rs", Kind::Code), hit("/c.md", Kind::Doc)];
-        assert_eq!(app.visible(), vec![0, 1, 2]);
+        app.hits =
+            vec![hit("/a.md", Kind::Doc), hit("/b.rs", Kind::Code), hit("/c.md", Kind::Doc), hit("/d.pdf", Kind::Pdf)];
+        assert_eq!(app.visible(), vec![0, 1, 2, 3]);
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.visible(), vec![0, 2]);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.visible(), vec![3]);
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.visible(), vec![1]);
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));

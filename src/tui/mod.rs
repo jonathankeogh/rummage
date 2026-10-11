@@ -58,6 +58,7 @@ fn event_loop(terminal: &mut Term, app: &mut App, responses: &std::sync::mpsc::R
             app.apply_response(response);
         }
         app.refresh_preview();
+        app.refresh_page_image();
         terminal.draw(|frame| ui::render(frame, app))?;
         // Poll briefly so results and the spinner show up without a key press.
         if !event::poll(Duration::from_millis(60))? {
@@ -73,8 +74,10 @@ fn event_loop(terminal: &mut Term, app: &mut App, responses: &std::sync::mpsc::R
             Action::None => {}
             Action::Quit => return Ok(()),
             Action::Open(i) => {
-                let (path, code) = (app.hits[i].path.clone(), app.hits[i].kind == crate::store::Kind::Code);
-                if let Err(e) = open(terminal, &path, code) {
+                let hit = &app.hits[i];
+                let page = (hit.kind == crate::store::Kind::Pdf).then(|| hit.loc.map_or(1, |l| l.round() as usize));
+                let (path, code) = (hit.path.clone(), hit.kind == crate::store::Kind::Code);
+                if let Err(e) = open(terminal, &path, code, page) {
                     app.notify(format!("can't open: {e:#}"));
                 }
             }
@@ -100,7 +103,7 @@ fn opener() -> &'static str {
 }
 
 /// Open a file: code in `$EDITOR` if set (the interface steps aside while it runs), anything else with the desktop.
-fn open(terminal: &mut Term, path: &str, code: bool) -> Result<()> {
+fn open(terminal: &mut Term, path: &str, code: bool, page: Option<usize>) -> Result<()> {
     let editor = std::env::var("EDITOR").ok().filter(|e| code && !e.trim().is_empty());
     if let Some(editor) = editor {
         let mut words = editor.split_whitespace();
@@ -113,7 +116,28 @@ fn open(terminal: &mut Term, path: &str, code: bool) -> Result<()> {
         status.with_context(|| format!("running {editor}"))?;
         return Ok(());
     }
+    if let Some(page) = page {
+        if let Some((viewer, args)) = pdf_viewer_at(page) {
+            return detached(viewer, &args.iter().map(String::as_str).chain([path]).collect::<Vec<_>>());
+        }
+    }
     detached(opener(), &[path])
+}
+
+/// A PDF viewer on PATH that can open at a page, with the arguments that do it. macOS's `open` can't, so there the
+/// file opens at its start.
+fn pdf_viewer_at(page: usize) -> Option<(&'static str, Vec<String>)> {
+    let page = page.to_string();
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    let viewers: [(&str, Vec<String>); 3] = [
+        ("zathura", vec!["--page".into(), page.clone()]),
+        ("evince", vec!["--page-index".into(), page.clone()]),
+        ("okular", vec!["--page".into(), page]),
+    ];
+    let path = std::env::var_os("PATH")?;
+    viewers.into_iter().find(|(name, _)| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
 }
 
 /// Show the file in the file manager (macOS selects it in Finder; elsewhere the parent folder opens).

@@ -19,12 +19,13 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const HINTS: &str = " ↑↓ move  ⇧↑↓ scroll  ⏎ open  ^o reveal  ^y copy  tab kind  F1 help  esc quit ";
 const NOTICE_FOR: Duration = Duration::from_secs(2);
 
-const HELP: [(&str, &str); 11] = [
+const HELP: [(&str, &str); 12] = [
     ("type", "search as you type (\"code:\" first searches code)"),
     ("↑ ↓  ^p ^n", "move through results"),
     ("⇧↑ ⇧↓  PgUp PgDn", "scroll the preview"),
     ("mouse", "click a result, click again to open; wheel scrolls"),
     ("⏎", "open the file ($EDITOR for code)"),
+    ("^v", "PDFs: switch between the page's text and a picture of it"),
     ("^o", "reveal in the file manager"),
     ("^y", "copy the path (works over ssh)"),
     ("tab", "show all, docs or code"),
@@ -95,13 +96,15 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
 /// One result row: marker, kind, file name, and the passage number at the right edge.
 fn row_line(hit: &Hit, selected: bool, width: usize) -> Line<'static> {
     let name = Path::new(&hit.path).file_name().map_or(hit.path.clone(), |n| n.to_string_lossy().into_owned());
-    let place = match hit.loc {
-        Some(loc) if loc > 1.0 => format!("#{}", loc.round() as i64),
+    let place = match (hit.kind, hit.loc) {
+        (Kind::Pdf, Some(loc)) => format!("p{}", loc.round() as i64),
+        (_, Some(loc)) if loc > 1.0 => format!("#{}", loc.round() as i64),
         _ => String::new(),
     };
     let marker = if selected { "▸" } else { " " };
     let kind_color = match hit.kind {
         Kind::Doc => Color::Cyan,
+        Kind::Pdf => Color::Magenta,
         Kind::Code => Color::Yellow,
     };
     let fixed = 2 + 5 + place.chars().count() + 1;
@@ -142,7 +145,21 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
 
     let (Some(i), Some(preview)) = (app.selected_hit(), app.preview()) else { return };
     let hit = &app.hits[i];
+    let page_view = app.page_view && hit.kind == Kind::Pdf;
+    if page_view {
+        match app.page_image.borrow_mut().as_mut() {
+            Some((_, Ok(protocol))) => {
+                frame.render_stateful_widget(ratatui_image::StatefulImage::default(), preview_area, protocol)
+            }
+            Some((_, Err(message))) => frame.render_widget(
+                Paragraph::new(message.clone()).style(Style::default().fg(Color::Red)).wrap(Wrap { trim: true }),
+                preview_area,
+            ),
+            None => {}
+        }
+    }
     match preview {
+        _ if page_view => {}
         Preview::Text(shown) | Preview::Code(shown) => {
             let paragraph = Paragraph::new(shown.lines.clone()).wrap(Wrap { trim: false });
             // Counting wrapped rows means laying out every line: done once per preview and width.
@@ -181,9 +198,13 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
     }
+    let mut detail = why(hit);
+    if hit.kind == Kind::Pdf {
+        detail += if page_view { " · ^v text" } else { " · ^v page" };
+    }
     let info = vec![
         Line::from(Span::styled(tilde(Path::new(&hit.path)), Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled(why(hit), Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(detail, Style::default().fg(Color::DarkGray))),
     ];
     frame.render_widget(Paragraph::new(info), info_inner);
 }

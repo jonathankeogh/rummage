@@ -23,8 +23,9 @@ pub struct Options {
     pub excluded: Vec<PathBuf>,
 }
 
-/// Plain text documents. Rich formats (PDF, docx, HTML) come in a later milestone.
-const DOC_EXTENSIONS: &[&str] = &["txt", "text", "md", "markdown", "rst", "org", "adoc"];
+/// Documents read as text: plain text, plus docx, odt and html converted (see `extract::document_text`).
+const DOC_EXTENSIONS: &[&str] =
+    &["txt", "text", "md", "markdown", "rst", "org", "adoc", "docx", "odt", "html", "htm", "xhtml"];
 
 const SOURCE_EXTENSIONS: &[&str] = &[
     "py", "pyi", "pyx", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "m", "mm", "swift", "ts", "tsx", "mts",
@@ -100,11 +101,14 @@ const PROJECT_MARKERS: &[&str] = &[
 ];
 
 const MAX_DOC_BYTES: u64 = 20 << 20;
+/// PDFs carry images and fonts, so they're bigger for the same text (the page limit bounds the work).
+const MAX_PDF_BYTES: u64 = 500 << 20;
 const MAX_CODE_BYTES: u64 = 1 << 20;
 
 /// Every file to index under `roots`, sorted by path.
-pub fn walk(roots: &[PathBuf], options: &Options) -> Vec<Found> {
+pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
     let mut found = Vec::new();
+    let mut pdfs_without_tools = 0;
     for root in roots {
         let excluded = options.excluded.clone();
         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -143,8 +147,16 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Vec<Found> {
             }
             let path = entry.path();
             let Some(kind) = classify(path, options) else { continue };
+            if kind == Kind::Pdf && !crate::extract::pdf_tools() {
+                pdfs_without_tools += 1;
+                continue;
+            }
             let Ok(meta) = entry.metadata() else { continue };
-            let limit = if kind == Kind::Code { MAX_CODE_BYTES } else { MAX_DOC_BYTES };
+            let limit = match kind {
+                Kind::Code => MAX_CODE_BYTES,
+                Kind::Pdf => MAX_PDF_BYTES,
+                Kind::Doc => MAX_DOC_BYTES,
+            };
             if meta.len() == 0 || meta.len() > limit {
                 continue;
             }
@@ -159,7 +171,14 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Vec<Found> {
     }
     found.sort_by(|a, b| a.path.cmp(&b.path));
     found.dedup_by(|a, b| a.path == b.path);
-    found
+    Walk { found, pdfs_without_tools }
+}
+
+/// What a walk found.
+pub struct Walk {
+    pub found: Vec<Found>,
+    /// PDFs left out because poppler's tools aren't installed.
+    pub pdfs_without_tools: usize,
 }
 
 /// What kind of file this is for rummage, or None to leave it alone.
@@ -185,6 +204,9 @@ fn classify(path: &Path, options: &Options) -> Option<Kind> {
             || CODE_FILE_NAMES.contains(&name.as_ref())
             || name.starts_with("Dockerfile");
         return code.then_some(Kind::Code);
+    }
+    if ext == "pdf" {
+        return Some(Kind::Pdf);
     }
     DOC_EXTENSIONS.contains(&ext.as_str()).then_some(Kind::Doc)
 }
