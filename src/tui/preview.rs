@@ -27,8 +27,11 @@ const READ_LIMIT: u64 = 16 << 20;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Shown {
     pub lines: Vec<Line<'static>>,
-    /// Index in `lines` of the passage's first line: the pane opens scrolled here.
+    /// Index in `lines` of the passage's first line.
     pub focus: usize,
+    /// Index in `lines` of the first marked line from the passage on: the pane opens with it in view. `None` when
+    /// nothing is marked (a meaning match with none of the query's words); then the pane opens at the passage.
+    pub anchor: Option<usize>,
 }
 
 /// What to show for the selected hit.
@@ -54,7 +57,10 @@ impl Preview {
             Err(e) => return Preview::Message(format!("can't read file: {e}")),
         };
         let (window, focus) = window(&text, loc);
-        let shown = |lines| Shown { lines, focus };
+        let shown = |lines: Vec<Line<'static>>| {
+            let anchor = first_marked(&lines[focus.min(lines.len())..]).map(|i| focus + i).or(first_marked(&lines));
+            Shown { lines, focus, anchor }
+        };
         match hit.kind {
             Kind::Code => Preview::Code(shown(code_lines(&window, path, terms))),
             Kind::Doc => Preview::Text(shown(
@@ -128,6 +134,11 @@ pub fn find_matches(line: &str, terms: &[String]) -> Vec<(usize, usize)> {
         }
     }
     merged
+}
+
+/// Index of the first line with a marked word.
+fn first_marked(lines: &[Line]) -> Option<usize> {
+    lines.iter().position(|line| line.spans.iter().any(|s| s.style.bg == Some(Color::Yellow)))
 }
 
 fn mark(style: Style) -> Style {

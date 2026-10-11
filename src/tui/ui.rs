@@ -149,10 +149,11 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
             let metrics = match app.metrics.get() {
                 Some(m) if m.width == preview_area.width => m,
                 _ => {
-                    let before = Paragraph::new(shown.lines[..shown.focus].to_vec()).wrap(Wrap { trim: false });
+                    let landing = shown.anchor.unwrap_or(shown.focus);
+                    let before = Paragraph::new(shown.lines[..landing].to_vec()).wrap(Wrap { trim: false });
                     let m = Metrics {
                         width: preview_area.width,
-                        focus: before.line_count(preview_area.width),
+                        landing: before.line_count(preview_area.width),
                         total: paragraph.line_count(preview_area.width),
                     };
                     app.metrics.set(Some(m));
@@ -161,8 +162,10 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
             };
             let height = preview_area.height as usize;
             let max = metrics.total.saturating_sub(height);
-            // Open at the passage, with a line of what comes before it.
-            let scroll = app.scroll.get().unwrap_or(metrics.focus.saturating_sub(1)).min(max);
+            // Open with the first marked word a third of the way down, measured at the pane's size now (a later resize
+            // may move it out of view; it isn't chased). Nothing marked: open at the passage, a line of context above.
+            let lead = if shown.anchor.is_some() { height / 3 } else { 1 };
+            let scroll = app.scroll.get().unwrap_or(metrics.landing.saturating_sub(lead)).min(max);
             app.scroll.set(Some(scroll));
             frame.render_widget(paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)), preview_area);
             if metrics.total > height {
@@ -276,6 +279,28 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(marked, vec!["Dog", "beach"]);
+    }
+
+    #[test]
+    fn a_narrow_pane_opens_with_the_match_in_view() {
+        let dir = std::env::temp_dir().join(format!("rummage-tui-narrow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("play.txt");
+        // One passage: a long run of prose (dozens of wrapped rows in a narrow pane), then the matched word.
+        let filler = "and so the evening wore on with talk of nothing much at all ".repeat(25);
+        std::fs::write(&note, format!("ACT ONE\n{filler}\nThe soldiers were fighting in the square.\nEXIT\n")).unwrap();
+        let mut app = new_app();
+        app.query = "fighting".into();
+        let mut found = hit(note.to_str().unwrap(), Kind::Doc);
+        found.loc = Some(1.0);
+        app.hits = vec![found];
+        let screen = draw(&mut app, 70, 16);
+        assert!(screen.contains("fighting"), "{screen}");
+        assert!(!screen.contains("ACT ONE"), "scrolled past the passage start: {screen}");
+        // Meaning-only (nothing marked): the pane opens at the passage start.
+        app.query = "a quarrel".into();
+        let screen = draw(&mut app, 70, 16);
+        assert!(screen.contains("ACT ONE"), "{screen}");
     }
 
     #[test]

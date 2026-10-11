@@ -126,8 +126,8 @@ pub struct App {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Metrics {
     pub width: u16,
-    /// Rows before the passage starts.
-    pub focus: usize,
+    /// Rows before the line the pane opens at (the first marked line, else the passage's start).
+    pub landing: usize,
     pub total: usize,
 }
 
