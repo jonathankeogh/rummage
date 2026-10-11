@@ -30,12 +30,94 @@ pub struct Options {
     pub limit: usize,
     pub z_gate: f64,
     pub word_weight: f64,
+    /// How much a passage's closeness to the index's centre counts against it (see `Vectors::centrality`).
+    pub hub_penalty: f64,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { kinds: None, limit: 10, z_gate: 2.0, word_weight: 2.0 }
+        // RUMMAGE_HUB_PENALTY overrides the tuned value, for evals.
+        let hub_penalty = std::env::var("RUMMAGE_HUB_PENALTY").ok().and_then(|v| v.parse().ok()).unwrap_or(HUB_PENALTY);
+        Options { kinds: None, limit: 10, z_gate: 2.0, word_weight: 2.0, hub_penalty }
     }
+}
+
+/// Tuned on DigUp's evals and real folders (see `search`).
+pub const HUB_PENALTY: f64 = 1.0;
+
+/// Everyday searches, mixed on purpose: their mean is where queries in general sit. A passage close to it is somewhat
+/// similar to any query (a hub); a query close to it says little of its own.
+pub const TYPICAL_QUERIES: &[&str] = &[
+    "a dog on the beach",
+    "my tax return from last year",
+    "notes from the team meeting",
+    "how to cook rice",
+    "error message when installing the app",
+    "photos from the wedding",
+    "the contract with the landlord",
+    "a function that parses dates",
+    "chicken curry recipe",
+    "flight booking confirmation",
+    "invoice from the plumber",
+    "lecture slides on linear algebra",
+    "the bank statement for March",
+    "a podcast about sleep",
+    "my CV",
+    "screenshot of the payment error",
+    "train timetable to Galway",
+    "the paper on transformers",
+    "birthday party plans",
+    "how to reset the router",
+    "insurance policy for the car",
+    "a poem about the sea",
+    "budget spreadsheet",
+    "the email about the deadline",
+    "notes on the history of Rome",
+    "a diagram of the network",
+    "medical test results",
+    "gym workout routine",
+    "the lease renewal letter",
+    "a video of the concert",
+    "the recipe for brown bread",
+    "a list of books to read",
+    "the quarterly sales report",
+    "instructions for the washing machine",
+    "my passport scan",
+    "a talk about climate change",
+    "the code that sends emails",
+    "minutes of the board meeting",
+    "a map of the city",
+    "a letter from the school",
+];
+
+/// Where typical queries sit (the mean of `TYPICAL_QUERIES`' vectors) and how spread out they are around it.
+#[derive(Clone)]
+pub struct QueryCentre {
+    pub centre: Vec<f32>,
+    /// Mean and spread of the typical queries' own closeness to the centre.
+    pub mean: f64,
+    pub spread: f64,
+}
+
+impl QueryCentre {
+    /// From the typical queries' vectors.
+    pub fn from_vectors(vectors: &[Vec<f32>]) -> QueryCentre {
+        let n = vectors.len().max(1) as f32;
+        let mut centre = vec![0.0f32; DIM];
+        for v in vectors {
+            for (c, x) in centre.iter_mut().zip(v) {
+                *c += x / n;
+            }
+        }
+        let at: Vec<f64> = vectors.iter().map(|v| dot(v, &centre) as f64).collect();
+        let mean = at.iter().sum::<f64>() / at.len().max(1) as f64;
+        let spread = (at.iter().map(|a| (a - mean).powi(2)).sum::<f64>() / at.len().max(1) as f64).sqrt().max(1e-6);
+        QueryCentre { centre, mean, spread }
+    }
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 /// All vectors of an index in memory, one row each, for scoring every one against a query.
@@ -44,12 +126,24 @@ pub struct Vectors {
     row_segment: Vec<i64>,
     row_file: Vec<i64>,
     file_kind: HashMap<i64, Kind>,
+    /// Where typical queries sit, once known (see `set_query_centre`).
+    query_centre: Option<QueryCentre>,
+    /// Each row's closeness to where typical queries sit: its average similarity to typical queries. A passage with
+    /// little meaning of its own (menus, boilerplate, a cover page) is somewhat similar to any query and turns up for
+    /// unrelated ones: a "hub". All zero until the query centre is set.
+    centrality: Vec<f32>,
 }
 
 impl Vectors {
     pub fn load(store: &Store) -> Result<Vectors> {
-        let mut vectors =
-            Vectors { matrix: Vec::new(), row_segment: Vec::new(), row_file: Vec::new(), file_kind: HashMap::new() };
+        let mut vectors = Vectors {
+            matrix: Vec::new(),
+            row_segment: Vec::new(),
+            row_file: Vec::new(),
+            file_kind: HashMap::new(),
+            query_centre: None,
+            centrality: Vec::new(),
+        };
         let mut statement = store.db.prepare("SELECT id, kind FROM files")?;
         for row in statement.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
             let (id, kind) = row?;
@@ -68,7 +162,21 @@ impl Vectors {
             vectors.row_segment.push(row.get(0)?);
             vectors.row_file.push(row.get(1)?);
         }
+        vectors.centrality = vec![0.0; vectors.row_segment.len()];
         Ok(vectors)
+    }
+
+    /// Measures every row against where typical queries sit, for the hub penalty.
+    pub fn set_query_centre(&mut self, centre: QueryCentre) {
+        self.centrality = self.cosines(&centre.centre);
+        self.query_centre = Some(centre);
+    }
+
+    /// How much closer to where typical queries sit `query` is than typical queries are, in their standard
+    /// deviations: above 0, vaguer than usual. None until the query centre is set.
+    pub fn query_vagueness(&self, query: &[f32]) -> Option<f64> {
+        let centre = self.query_centre.as_ref()?;
+        Some((dot(query, &centre.centre) as f64 - centre.mean) / centre.spread)
     }
 
     pub fn len(&self) -> usize {
@@ -151,11 +259,26 @@ pub fn search(
         (Some(_), None) => false,
     };
 
+    // A vague query ("for", "things") is close to where all queries sit and says little of its own: a meaning match
+    // must stand out further, and counts for less, the vaguer it is. Descriptive queries (below 0) are unaffected.
+    let vagueness = query
+        .filter(|_| std::env::var("RUMMAGE_VAGUENESS").map_or(true, |v| v != "0"))
+        .and_then(|q| vectors.query_vagueness(q))
+        .unwrap_or(0.0)
+        .max(0.0);
+    let z_gate = options.z_gate + vagueness;
+
     // Meaning: every passage on this query's scale; each file keeps its best.
     let mut best: HashMap<i64, (f64, f64, usize)> = HashMap::new(); // file → (z, cosine, row)
     if let Some(query) = query.filter(|q| q.len() == DIM && !vectors.is_empty()) {
         let cosines = vectors.cosines(query);
-        let z = standardize(&cosines);
+        // Hubs lose the head start they get from being a little similar to everything.
+        let adjusted: Vec<f32> =
+            cosines.iter().zip(&vectors.centrality).map(|(&c, &h)| c - (options.hub_penalty as f32) * h).collect();
+        let z = standardize(&adjusted);
+        if std::env::var_os("RUMMAGE_DEBUG").is_some() {
+            eprintln!("query vagueness {:.2}", vectors.query_vagueness(query).unwrap_or(f64::NAN));
+        }
         for row in 0..cosines.len() {
             let file = vectors.row_file[row];
             if allowed(file) && best.get(&file).is_none_or(|b| z[row] > b.0) {
@@ -200,7 +323,8 @@ pub fn search(
     // plus a bonus that grows with word coverage; an exact lookup leans on words.
     let (meaning_weight, words_weight) =
         if is_lookup(&terms) { (0.5, options.word_weight * 2.0) } else { (1.0, options.word_weight) };
-    let mut candidates: HashSet<i64> = best.iter().filter(|(_, b)| b.0 >= options.z_gate).map(|(f, _)| *f).collect();
+    let meaning_weight = meaning_weight / (1.0 + vagueness);
+    let mut candidates: HashSet<i64> = best.iter().filter(|(_, b)| b.0 >= z_gate).map(|(f, _)| *f).collect();
     candidates.extend(coverage.iter().filter(|(_, share)| **share >= 0.5).map(|(f, _)| *f));
     let mut scored: Vec<(i64, f64)> = candidates
         .into_iter()
@@ -230,7 +354,7 @@ pub fn search(
         // has the words but the meaning passage holds none of them, the words' passage is the better place to land:
         // the reader sees what they typed, marked.
         let segment = match (meaning, words) {
-            (Some(m), Some(w)) if m.0 >= options.z_gate => {
+            (Some(m), Some(w)) if m.0 >= z_gate => {
                 let meaning_segment = vectors.row_segment[m.2];
                 if meaning_segment == w.1 || has_words(meaning_segment)? { meaning_segment } else { w.1 }
             }
@@ -286,6 +410,43 @@ mod tests {
         assert!(is_lookup(&terms("0x80070005 20931")));
         assert!(!is_lookup(&terms("error 0x80070005")));
         assert!(!is_lookup(&terms("a dog on the beach")));
+    }
+
+    fn unit(i: usize, j: usize) -> Vec<f32> {
+        // Half along axis i, half along axis j, normalized.
+        let mut v = vec![0.0; DIM];
+        v[i] += std::f32::consts::FRAC_1_SQRT_2;
+        v[j] += std::f32::consts::FRAC_1_SQRT_2;
+        v
+    }
+
+    #[test]
+    fn query_centre_and_vagueness() {
+        // Typical queries all share axis 0 and differ on another axis.
+        let typical: Vec<Vec<f32>> = (1..=4).map(|j| unit(0, j)).collect();
+        let centre = QueryCentre::from_vectors(&typical);
+        assert!((centre.centre[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        let mut vectors = Vectors {
+            matrix: Vec::new(),
+            row_segment: Vec::new(),
+            row_file: Vec::new(),
+            file_kind: HashMap::new(),
+            query_centre: None,
+            centrality: Vec::new(),
+        };
+        assert_eq!(vectors.query_vagueness(&unit(0, 1)), None, "unknown until the centre is set");
+        // Two rows: a hub along the shared axis, and a passage off on its own.
+        let mut hub = vec![0.0; DIM];
+        hub[0] = 1.0;
+        let own = unit(5, 6);
+        vectors.matrix = [hub.clone(), own].concat();
+        vectors.row_segment = vec![1, 2];
+        vectors.row_file = vec![1, 2];
+        vectors.set_query_centre(centre);
+        assert!(vectors.centrality[0] > 0.5 && vectors.centrality[1].abs() < 1e-6, "{:?}", vectors.centrality);
+        // A query right on the shared axis is vaguer than the typical ones; one off on its own is not vague at all.
+        assert!(vectors.query_vagueness(&hub).unwrap() > 0.0);
+        assert!(vectors.query_vagueness(&unit(7, 8)).unwrap() < 0.0);
     }
 
     #[test]

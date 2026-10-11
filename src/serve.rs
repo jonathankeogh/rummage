@@ -65,15 +65,20 @@ pub struct Engine {
     vectors: Vectors,
     embedder: Embedder,
     data_version: i64,
+    /// Where typical queries sit, worked out once (about 50 ms) for the hub penalty.
+    query_centre: search::QueryCentre,
 }
 
 impl Engine {
     pub fn open(dir: &Path) -> Result<Engine> {
         let store = Store::open(dir)?;
-        let vectors = Vectors::load(&store)?;
-        let embedder = Embedder::load(&ModelFiles::locate()?, true)?;
+        let mut vectors = Vectors::load(&store)?;
+        let mut embedder = Embedder::load(&ModelFiles::locate()?, true)?;
+        let typical: Vec<String> = search::TYPICAL_QUERIES.iter().map(|q| prompts::query(q)).collect();
+        let query_centre = search::QueryCentre::from_vectors(&embedder.embed_texts(&typical)?);
+        vectors.set_query_centre(query_centre.clone());
         let data_version = data_version(&store)?;
-        Ok(Engine { store, vectors, embedder, data_version })
+        Ok(Engine { store, vectors, embedder, data_version, query_centre })
     }
 
     pub fn vector_count(&self) -> usize {
@@ -85,6 +90,7 @@ impl Engine {
         let version = data_version(&self.store)?;
         if version != self.data_version {
             self.vectors = Vectors::load(&self.store)?;
+            self.vectors.set_query_centre(self.query_centre.clone());
             self.data_version = version;
         }
         Ok(())
