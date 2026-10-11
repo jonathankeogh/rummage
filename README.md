@@ -4,8 +4,9 @@ Instant multimodal semantic file search for the Unix terminal. Describe what you
 by meaning and by exact words, locally, on any GPU or CPU. Type `rummage` for a yazi-style interface, or use it inside
 yazi with the plugin.
 
-**Status: milestone 1 of 9.** Text search works end to end: plain text, Markdown and (with `--code`) source code.
-Images, PDFs, audio, video, the interface and the yazi plugin are coming.
+**Status: milestone 2 of 9.** Text search works end to end (plain text, Markdown and, with `--code`, source code),
+through a background service that keeps searches instant. Images, PDFs, audio, video, the interface and the yazi
+plugin are coming.
 
 ## Build
 
@@ -35,6 +36,11 @@ rummage index --code ~/code              # also read code in code projects...
 rummage search "code: retry a failed call with backoff"   # ...and search it with "code:"
 rummage status
 ```
+
+Searches go through a small background service that keeps the model loaded, so after the first one they take about
+10 ms. The first search starts it; it quits after 15 idle minutes and picks up re-indexing on its own. `rummage serve`
+runs it in the foreground (`--linger 0` never quits), `rummage stop` stops it, and `rummage search --no-serve` skips
+it. Its log is `serve.log` in the index folder.
 
 `--json` on search prints results for scripts. The index lives in `$XDG_DATA_HOME/rummage` (or
 `~/.local/share/rummage`); set `RUMMAGE_INDEX` or `--index` to use another. `RUMMAGE_MODELS` points at a folder with

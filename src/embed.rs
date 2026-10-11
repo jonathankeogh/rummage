@@ -38,6 +38,10 @@ pub struct Embedder {
     position: sys::llama_pos,
 }
 
+// The llama.cpp objects belong to this Embedder alone and are only used through &mut self, so moving it to another
+// thread is safe (the service keeps it behind a Mutex).
+unsafe impl Send for Embedder {}
+
 const MAX_SEQUENCES: i32 = 16;
 
 impl Embedder {

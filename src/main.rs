@@ -1,12 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use rummage::crawl;
-use rummage::embed::{Embedder, prompts};
 use rummage::index;
 use rummage::paths::{self, ModelFiles, tilde};
-use rummage::search::{self, Vectors};
+use rummage::serve;
 use rummage::store::{self, Kind, Store};
-use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -52,9 +50,20 @@ enum Command {
         zgate: f64,
         #[arg(long)]
         json: bool,
+        /// Search in this process instead of through the background service
+        #[arg(long)]
+        no_serve: bool,
     },
     /// What's in the index
     Status,
+    /// Keep the model loaded so searches are instant (searches start this in the background on their own)
+    Serve {
+        /// Quit after this many idle minutes (0: never)
+        #[arg(long, default_value_t = 15)]
+        linger: u64,
+    },
+    /// Stop the background service
+    Stop,
 }
 
 fn main() {
@@ -71,10 +80,24 @@ fn run() -> Result<()> {
         Some(Command::Index { folders, code, exclude, reindex }) => {
             index_command(&dir, folders, code, exclude, reindex)
         }
-        Some(Command::Search { words, limit, kind, zgate, json }) => {
-            search_command(&dir, words, limit, kind, zgate, json)
+        Some(Command::Search { words, limit, kind, zgate, json, no_serve }) => {
+            search_command(&dir, words, limit, kind, zgate, json, no_serve)
         }
         Some(Command::Status) => status(&dir),
+        Some(Command::Serve { linger }) => {
+            serve::serve(&dir, (linger > 0).then(|| std::time::Duration::from_secs(linger * 60)))
+        }
+        Some(Command::Stop) => match serve::Client::connect(&dir) {
+            Ok(mut client) => {
+                client.request(&serve::Request::Quit)?;
+                eprintln!("stopped the search service");
+                Ok(())
+            }
+            Err(_) => {
+                eprintln!("the search service isn't running");
+                Ok(())
+            }
+        },
         None => {
             // The interface comes in milestone 3.
             use clap::CommandFactory;
@@ -117,7 +140,10 @@ fn index_command(dir: &PathBuf, folders: Vec<PathBuf>, code: bool, exclude: Vec<
     );
     let started = Instant::now();
     let done = index::embed_pending(&store, |done, total, path| {
-        eprint!("\r\x1b[K[{done}/{total}] {}", tilde(path));
+        // Just the name: a full path wraps in a narrow terminal and the line can't be redrawn.
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name: String = name.chars().take(60).collect();
+        eprint!("\r\x1b[K[{done}/{total}] {name}");
         std::io::stderr().flush().ok();
     })?;
     if done > 0 {
@@ -133,30 +159,39 @@ fn search_command(
     kind: Vec<String>,
     zgate: f64,
     json: bool,
+    no_serve: bool,
 ) -> Result<()> {
-    let mut query = words.join(" ");
-    let code = query.trim_start().to_lowercase().starts_with("code:");
-    if code {
-        query = query.trim_start()[5..].trim().to_string();
-    }
-    let kinds: HashSet<Kind> = if code {
-        [Kind::Code].into()
-    } else if kind.is_empty() {
-        [Kind::Doc].into()
-    } else {
-        kind.iter().map(|k| Kind::parse(k).with_context(|| format!("unknown kind {k}"))).collect::<Result<_>>()?
-    };
-    let store = Store::open(dir)?;
+    let query = words.join(" ");
+    let kinds: Vec<Kind> =
+        kind.iter().map(|k| Kind::parse(k).with_context(|| format!("unknown kind {k}"))).collect::<Result<_>>()?;
+    let kinds = (!kinds.is_empty()).then_some(kinds);
     let started = Instant::now();
-    let vectors = Vectors::load(&store)?;
-    let loaded = started.elapsed();
-    let mut embedder = Embedder::load(&ModelFiles::locate()?, true)?;
-    let encoder_ready = started.elapsed();
-    let vector = embedder.embed_texts(&[prompts::query(&query)])?.pop();
-    let encoded = started.elapsed();
-    let options = search::Options { kinds: Some(kinds), limit, z_gate: zgate, ..Default::default() };
-    let hits = search::search(&store, &vectors, &query, vector.as_deref(), &options)?;
-    let searched = started.elapsed();
+    let (hits, timing) = if no_serve {
+        let mut engine = serve::Engine::open(dir)?;
+        let loaded = started.elapsed();
+        let hits = engine.search(&query, kinds.as_deref(), limit, zgate)?;
+        let timing = format!(
+            "{} vectors · start {:.2} s · search {:.0} ms, in this process",
+            engine.vector_count(),
+            loaded.as_secs_f64(),
+            (started.elapsed() - loaded).as_secs_f64() * 1000.0
+        );
+        (hits, timing)
+    } else {
+        let mut client = serve::Client::connect_or_start(dir)?;
+        let connected = started.elapsed();
+        let response = client.search(&query, kinds, limit, zgate)?;
+        let mut timing = format!(
+            "{} vectors · search {:.0} ms in the service, {:.0} ms here",
+            response.vectors,
+            response.millis,
+            (started.elapsed() - connected).as_secs_f64() * 1000.0
+        );
+        if connected.as_secs_f64() > 0.2 {
+            timing += &format!(" · started the service in {:.1} s", connected.as_secs_f64());
+        }
+        (response.hits, timing)
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&hits)?);
         return Ok(());
@@ -183,14 +218,7 @@ fn search_command(
         println!("      {}", tilde(path.parent().unwrap_or(&path)));
         println!("      “{}”", hit.excerpt.chars().take(160).collect::<String>());
     }
-    eprintln!(
-        "({} vectors · load {:.0} ms · model start {:.2} s · query {:.0} ms · search {:.0} ms)",
-        vectors.len(),
-        loaded.as_secs_f64() * 1000.0,
-        (encoder_ready - loaded).as_secs_f64(),
-        (encoded - encoder_ready).as_secs_f64() * 1000.0,
-        (searched - encoded).as_secs_f64() * 1000.0
-    );
+    eprintln!("({timing})");
     Ok(())
 }
 
@@ -223,5 +251,9 @@ fn status(dir: &PathBuf) -> Result<()> {
     }
     let size = std::fs::metadata(&store.file).map(|m| m.len()).unwrap_or(0);
     println!("size: {:.1} MB", size as f64 / 1e6);
+    match serve::Client::connect(dir).and_then(|mut c| c.request(&serve::Request::Ping)) {
+        Ok(_) => println!("search service: running"),
+        Err(_) => println!("search service: not running (a search starts it)"),
+    }
     Ok(())
 }

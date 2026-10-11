@@ -10,7 +10,7 @@ use anyhow::Result;
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Hit {
     pub path: String,
     pub kind: Kind,
@@ -129,6 +129,15 @@ fn is_lookup(terms: &[String]) -> bool {
         })
 }
 
+/// "code: retry with backoff" → ("retry with backoff", true): a search of code, and nothing else.
+pub fn split_code_prefix(text: &str) -> (&str, bool) {
+    let trimmed = text.trim_start();
+    match trimmed.get(..5) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("code:") => (trimmed[5..].trim(), true),
+        _ => (text.trim(), false),
+    }
+}
+
 pub fn search(
     store: &Store,
     vectors: &Vectors,
@@ -242,6 +251,14 @@ mod tests {
     #[test]
     fn terms_drop_stopwords_and_repeats() {
         assert_eq!(terms("Where is the lease clause about PETS, pets?"), vec!["lease", "clause", "pets"]);
+    }
+
+    #[test]
+    fn code_prefix() {
+        assert_eq!(split_code_prefix("  Code:  retry backoff "), ("retry backoff", true));
+        assert_eq!(split_code_prefix("code:"), ("", true));
+        assert_eq!(split_code_prefix("source code: retry"), ("source code: retry", false));
+        assert_eq!(split_code_prefix("dé"), ("dé", false));
     }
 
     #[test]
