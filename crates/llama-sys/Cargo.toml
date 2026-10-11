@@ -1,0 +1,14 @@
+[package]
+name = "rummage-llama-sys"
+version = "0.1.0"
+edition = "2024"
+description = "llama.cpp (pinned in vendor/llama.cpp, with patches/) built for rummage, and its raw bindings"
+links = "llama"
+
+[build-dependencies]
+bindgen = "0.72.1"
+cmake = "0.1.58"
+
+[features]
+cuda = []
+vulkan = []
