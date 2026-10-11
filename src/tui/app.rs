@@ -1,0 +1,371 @@
+//! Interface state: the query, results, selection and the search worker that fills them in.
+
+use super::backend::Backend;
+use super::preview::{Preview, query_terms};
+use crate::search::Hit;
+use crate::store::Kind;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
+
+/// How many hits to ask the backend for.
+pub const LIMIT: usize = 50;
+/// How long the query must sit still before a search starts.
+pub const DEBOUNCE: Duration = Duration::from_millis(80);
+
+/// A search to run.
+pub struct Request {
+    pub id: u64,
+    pub query: String,
+}
+
+/// A finished search, tagged with the request it answers.
+pub struct Response {
+    pub id: u64,
+    pub result: Result<Vec<Hit>, String>,
+}
+
+/// Start the search thread. It waits for the query to settle, then searches; of several queued requests only the
+/// newest runs.
+pub fn spawn_worker<B: Backend>(mut backend: B) -> (Sender<Request>, Receiver<Response>) {
+    let (request_tx, request_rx) = mpsc::channel::<Request>();
+    let (response_tx, response_rx) = mpsc::channel::<Response>();
+    std::thread::spawn(move || {
+        while let Ok(mut request) = request_rx.recv() {
+            loop {
+                match request_rx.recv_timeout(DEBOUNCE) {
+                    Ok(newer) => request = newer,
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+            let result = backend.search(&request.query, LIMIT).map_err(|e| format!("{e:#}"));
+            if response_tx.send(Response { id: request.id, result }).is_err() {
+                return;
+            }
+        }
+    });
+    (request_tx, response_rx)
+}
+
+/// What the main loop should do after a key.
+#[derive(Debug, PartialEq)]
+pub enum Action {
+    None,
+    Quit,
+    Open(usize),
+    Reveal(usize),
+    Copy(usize),
+}
+
+/// Which hits to show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    All,
+    Only(Kind),
+}
+
+impl Filter {
+    fn next(self) -> Filter {
+        match self {
+            Filter::All => Filter::Only(Kind::Doc),
+            Filter::Only(Kind::Doc) => Filter::Only(Kind::Code),
+            Filter::Only(Kind::Code) => Filter::All,
+        }
+    }
+
+    /// Name for the title bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            Filter::All => "all",
+            Filter::Only(kind) => kind.as_str(),
+        }
+    }
+}
+
+pub struct App {
+    pub query: String,
+    pub hits: Vec<Hit>,
+    pub filter: Filter,
+    /// Position within `visible()`.
+    pub selected: usize,
+    pub help: bool,
+    /// The last search failed with this.
+    pub error: Option<String>,
+    /// A message for the footer, with when it appeared.
+    pub notice: Option<(String, Instant)>,
+    pub tick: usize,
+    requests: Sender<Request>,
+    /// The newest request sent; answers to older ones are stale.
+    latest: u64,
+    /// The newest request answered.
+    answered: u64,
+    /// The selected hit's preview and what it was made for.
+    preview: Option<(PreviewKey, Preview)>,
+}
+
+#[derive(PartialEq)]
+struct PreviewKey {
+    path: String,
+    loc: Option<i64>,
+    query: String,
+}
+
+impl App {
+    pub fn new(requests: Sender<Request>) -> App {
+        App {
+            query: String::new(),
+            hits: Vec::new(),
+            filter: Filter::All,
+            selected: 0,
+            help: false,
+            error: None,
+            notice: None,
+            tick: 0,
+            requests,
+            latest: 0,
+            answered: 0,
+            preview: None,
+        }
+    }
+
+    /// A search is running or queued.
+    pub fn searching(&self) -> bool {
+        self.answered < self.latest
+    }
+
+    /// Indices into `hits` that pass the kind filter.
+    pub fn visible(&self) -> Vec<usize> {
+        (0..self.hits.len())
+            .filter(|&i| matches!(self.filter, Filter::All) || self.filter == Filter::Only(self.hits[i].kind))
+            .collect()
+    }
+
+    /// Index into `hits` of the selected row.
+    pub fn selected_hit(&self) -> Option<usize> {
+        self.visible().get(self.selected).copied()
+    }
+
+    /// Ask for results for the current query, making any answer to an older query stale.
+    fn query_changed(&mut self) {
+        self.latest += 1;
+        if self.query.trim().is_empty() {
+            self.answered = self.latest;
+            self.hits.clear();
+            self.error = None;
+            self.selected = 0;
+        } else {
+            let _ = self.requests.send(Request { id: self.latest, query: self.query.clone() });
+        }
+    }
+
+    /// Take a search answer. Returns false (and changes nothing) if it is for an old query.
+    pub fn apply_response(&mut self, response: Response) -> bool {
+        if response.id != self.latest {
+            return false;
+        }
+        self.answered = response.id;
+        match response.result {
+            Ok(hits) => {
+                self.hits = hits;
+                self.error = None;
+            }
+            Err(e) => {
+                self.hits.clear();
+                self.error = Some(e);
+            }
+        }
+        self.selected = 0;
+        true
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let len = self.visible().len();
+        if len > 0 {
+            self.selected = (self.selected as isize + delta).clamp(0, len as isize - 1) as usize;
+        }
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        if key.kind == KeyEventKind::Release {
+            return Action::None;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.help {
+            // Any key closes help; Ctrl-c still quits.
+            self.help = false;
+            return if ctrl && key.code == KeyCode::Char('c') { Action::Quit } else { Action::None };
+        }
+        let selected = self.selected_hit();
+        match key.code {
+            KeyCode::Esc => return Action::Quit,
+            KeyCode::Char('c') if ctrl => return Action::Quit,
+            KeyCode::F(1) => self.help = true,
+            KeyCode::Char('?') if self.query.is_empty() => self.help = true,
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::Char('p') if ctrl => self.move_selection(-1),
+            KeyCode::Char('n') if ctrl => self.move_selection(1),
+            KeyCode::PageUp => self.move_selection(-10),
+            KeyCode::PageDown => self.move_selection(10),
+            KeyCode::Tab => {
+                self.filter = self.filter.next();
+                self.selected = 0;
+            }
+            KeyCode::Enter => return selected.map_or(Action::None, Action::Open),
+            KeyCode::Char('o') if ctrl => return selected.map_or(Action::None, Action::Reveal),
+            KeyCode::Char('y') if ctrl => return selected.map_or(Action::None, Action::Copy),
+            KeyCode::Char('u') if ctrl => {
+                self.query.clear();
+                self.query_changed();
+            }
+            KeyCode::Char('w') if ctrl => {
+                let trimmed = self.query.trim_end().len();
+                self.query.truncate(self.query[..trimmed].rfind(' ').map_or(0, |i| i + 1));
+                self.query_changed();
+            }
+            KeyCode::Backspace => {
+                if self.query.pop().is_some() {
+                    self.query_changed();
+                }
+            }
+            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                self.query.push(c);
+                self.query_changed();
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Show a message in the footer for a moment.
+    pub fn notify(&mut self, message: impl Into<String>) {
+        self.notice = Some((message.into(), Instant::now()));
+    }
+
+    /// Make the preview match the selection and query, reading the file only when they changed.
+    pub fn refresh_preview(&mut self) {
+        let Some(i) = self.selected_hit() else {
+            self.preview = None;
+            return;
+        };
+        let hit = &self.hits[i];
+        let key = PreviewKey { path: hit.path.clone(), loc: hit.loc.map(|l| l as i64), query: self.query.clone() };
+        if self.preview.as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        let preview = Preview::load(hit, &query_terms(&self.query));
+        self.preview = Some((key, preview));
+    }
+
+    pub fn preview(&self) -> Option<&Preview> {
+        self.preview.as_ref().map(|(_, p)| p)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use ratatui::crossterm::event::KeyEvent;
+
+    pub fn hit(path: &str, kind: Kind) -> Hit {
+        Hit {
+            path: path.into(),
+            kind,
+            score: 1.0,
+            z: Some(3.1),
+            cosine: None,
+            keyword_rank: Some(2),
+            loc: Some(1.0),
+            excerpt: String::new(),
+        }
+    }
+
+    fn app() -> (App, Receiver<Request>) {
+        let (tx, rx) = mpsc::channel();
+        (App::new(tx), rx)
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn stale_results_are_dropped() {
+        let (mut app, rx) = app();
+        type_str(&mut app, "do");
+        let ids: Vec<u64> = rx.try_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert!(app.searching());
+        // the answer to "d" arrives after "do" was typed: ignored
+        assert!(!app.apply_response(Response { id: 1, result: Ok(vec![hit("/a", Kind::Doc)]) }));
+        assert!(app.hits.is_empty() && app.searching());
+        assert!(app.apply_response(Response { id: 2, result: Ok(vec![hit("/b", Kind::Doc)]) }));
+        assert_eq!(app.hits[0].path, "/b");
+        assert!(!app.searching());
+    }
+
+    #[test]
+    fn clearing_the_query_invalidates_pending_search() {
+        let (mut app, _rx) = app();
+        type_str(&mut app, "a");
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(!app.searching());
+        assert!(!app.apply_response(Response { id: 1, result: Ok(vec![hit("/a", Kind::Doc)]) }));
+        assert!(app.hits.is_empty());
+    }
+
+    #[test]
+    fn filter_cycles_and_limits_rows() {
+        let (mut app, _rx) = app();
+        app.hits = vec![hit("/a.md", Kind::Doc), hit("/b.rs", Kind::Code), hit("/c.md", Kind::Doc)];
+        assert_eq!(app.visible(), vec![0, 1, 2]);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.visible(), vec![0, 2]);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.visible(), vec![1]);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.filter, Filter::All);
+    }
+
+    #[test]
+    fn keys_move_and_act() {
+        let (mut app, _rx) = app();
+        app.hits = vec![hit("/a.md", Kind::Doc), hit("/b.rs", Kind::Code)];
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected, 1);
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::Open(0));
+        assert_eq!(app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)), Action::Copy(0));
+        assert_eq!(app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Action::Quit);
+        // '?' opens help only on an empty query, otherwise it is typed
+        app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(app.help);
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!app.help && app.query.is_empty());
+        type_str(&mut app, "why?");
+        assert_eq!(app.query, "why?");
+    }
+
+    #[test]
+    fn worker_runs_only_the_newest_request() {
+        struct Echo;
+        impl Backend for Echo {
+            fn search(&mut self, query: &str, _limit: usize) -> anyhow::Result<Vec<Hit>> {
+                Ok(vec![hit(query, Kind::Doc)])
+            }
+        }
+        let (tx, rx) = spawn_worker(Echo);
+        for (id, q) in [(1, "d"), (2, "do"), (3, "dog")] {
+            tx.send(Request { id, query: q.into() }).unwrap();
+        }
+        let response = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(response.id, 3);
+        assert_eq!(response.result.unwrap()[0].path, "dog");
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+}
