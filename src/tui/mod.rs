@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use app::{Action, App};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use std::io::{Stdout, Write};
@@ -40,12 +40,14 @@ pub fn run<B: Backend>(backend: B) -> Result<()> {
 
 fn enter() -> Result<Term> {
     enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    // Mouse reporting: clicks and the wheel come to the interface (hold Shift, or Option in some terminals, to select
+    // text the usual way).
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     Ok(Terminal::new(CrosstermBackend::new(std::io::stdout()))?)
 }
 
 fn leave() -> Result<()> {
-    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())
 }
@@ -62,8 +64,12 @@ fn event_loop(terminal: &mut Term, app: &mut App, responses: &std::sync::mpsc::R
             app.tick = app.tick.wrapping_add(1);
             continue;
         }
-        let Event::Key(key) = event::read()? else { continue };
-        match app.on_key(key) {
+        let action = match event::read()? {
+            Event::Key(key) => app.on_key(key),
+            Event::Mouse(mouse) => app.on_mouse(mouse),
+            _ => continue,
+        };
+        match action {
             Action::None => {}
             Action::Quit => return Ok(()),
             Action::Open(i) => {

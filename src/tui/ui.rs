@@ -1,6 +1,6 @@
 //! Drawing the three panes: results, preview, and the path/why strip, plus the help overlay.
 
-use super::app::App;
+use super::app::{App, Areas, Metrics};
 use super::preview::{Preview, why};
 use crate::paths::tilde;
 use crate::search::Hit;
@@ -9,17 +9,21 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use std::path::Path;
 use std::time::Duration;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const HINTS: &str = " ↑↓ move  ⏎ open  ^o reveal  ^y copy  tab kind  ? help  esc quit ";
+const HINTS: &str = " ↑↓ move  ⇧↑↓ scroll  ⏎ open  ^o reveal  ^y copy  tab kind  F1 help  esc quit ";
 const NOTICE_FOR: Duration = Duration::from_secs(2);
 
-const HELP: [(&str, &str); 9] = [
+const HELP: [(&str, &str); 11] = [
     ("type", "search as you type (\"code:\" first searches code)"),
     ("↑ ↓  ^p ^n", "move through results"),
+    ("⇧↑ ⇧↓  PgUp PgDn", "scroll the preview"),
+    ("mouse", "click a result, click again to open; wheel scrolls"),
     ("⏎", "open the file ($EDITOR for code)"),
     ("^o", "reveal in the file manager"),
     ("^y", "copy the path (works over ssh)"),
@@ -59,6 +63,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_results(frame: &mut Frame, app: &App, area: Rect) {
+    app.areas.set(Areas { results: area, ..app.areas.get() });
     let visible = app.visible();
     if visible.is_empty() {
         let message = if let Some(error) = &app.error {
@@ -81,7 +86,8 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(row, &i)| ListItem::new(row_line(&app.hits[i], row == app.selected, width)))
         .collect();
-    let mut state = ListState::default().with_selected(Some(app.selected));
+    let mut state = app.list.borrow_mut();
+    state.select(Some(app.selected));
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -129,6 +135,7 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(divider.clone(), preview_area);
         inner
     };
+    app.areas.set(Areas { preview: preview_area, ..app.areas.get() });
     let info_block = divider.clone();
     let info_inner = info_block.inner(info_area);
     frame.render_widget(info_block, info_area);
@@ -136,8 +143,33 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
     let (Some(i), Some(preview)) = (app.selected_hit(), app.preview()) else { return };
     let hit = &app.hits[i];
     match preview {
-        Preview::Text(lines) | Preview::Code(lines) => {
-            frame.render_widget(Paragraph::new(lines.clone()).wrap(Wrap { trim: false }), preview_area);
+        Preview::Text(shown) | Preview::Code(shown) => {
+            let paragraph = Paragraph::new(shown.lines.clone()).wrap(Wrap { trim: false });
+            // Counting wrapped rows means laying out every line: done once per preview and width.
+            let metrics = match app.metrics.get() {
+                Some(m) if m.width == preview_area.width => m,
+                _ => {
+                    let before = Paragraph::new(shown.lines[..shown.focus].to_vec()).wrap(Wrap { trim: false });
+                    let m = Metrics {
+                        width: preview_area.width,
+                        focus: before.line_count(preview_area.width),
+                        total: paragraph.line_count(preview_area.width),
+                    };
+                    app.metrics.set(Some(m));
+                    m
+                }
+            };
+            let height = preview_area.height as usize;
+            let max = metrics.total.saturating_sub(height);
+            // Open at the passage, with a line of what comes before it.
+            let scroll = app.scroll.get().unwrap_or(metrics.focus.saturating_sub(1)).min(max);
+            app.scroll.set(Some(scroll));
+            frame.render_widget(paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)), preview_area);
+            if metrics.total > height {
+                let mut bar = ScrollbarState::new(max).position(scroll).viewport_content_length(height);
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight).begin_symbol(None).end_symbol(None);
+                frame.render_stateful_widget(scrollbar, preview_area, &mut bar);
+            }
         }
         Preview::Message(message) => {
             frame.render_widget(
@@ -154,14 +186,14 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let width = 66.min(area.width);
+    let width = 72.min(area.width);
     let height = (HELP.len() as u16 + 4).min(area.height);
     let popup = Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height);
     let mut lines: Vec<Line> = HELP
         .iter()
         .map(|(keys, what)| {
             Line::from(vec![
-                Span::styled(format!("{keys:<12}"), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{keys:<17}"), Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(*what),
             ])
         })
@@ -236,10 +268,14 @@ mod tests {
     fn matched_words_are_highlighted() {
         let mut app = with_hits();
         app.refresh_preview();
-        let Some(Preview::Text(lines)) = app.preview() else { panic!("no text preview") };
-        let marked: Vec<&str> =
-            lines[1].spans.iter().filter(|s| s.style.bg == Some(Color::Yellow)).map(|s| s.content.as_ref()).collect();
-        assert_eq!(marked, vec!["the", "Dog", "the", "beach", "on"]);
+        let Some(Preview::Text(shown)) = app.preview() else { panic!("no text preview") };
+        let marked: Vec<&str> = shown.lines[1]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Yellow))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(marked, vec!["Dog", "beach"]);
     }
 
     #[test]

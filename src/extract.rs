@@ -6,8 +6,8 @@ use std::path::Path;
 /// About 450 tokens a passage, with a little overlap so a sentence cut in two is still found (DigUp's sizes).
 pub const PASSAGE_CHARS: usize = 1800;
 pub const OVERLAP_CHARS: usize = 200;
-/// A very long document keeps its first passages only (for now).
-pub const MAX_PASSAGES: usize = 500;
+/// A very long document keeps its first passages only (for now): 5,000 passages is about 8 MB of text.
+pub const MAX_PASSAGES: usize = 5000;
 
 /// The file's text, or an error for binary files.
 pub fn read_text(path: &Path) -> Result<String> {

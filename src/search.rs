@@ -110,15 +110,15 @@ const STOPWORDS: &[&str] = &[
     "my", "me", "i", "we", "you", "your", "this", "these", "those", "there", "they", "them", "some", "any",
 ];
 
-/// The query's words worth matching: lowercased, two letters or more, no stopwords, each once.
+/// The query's words worth matching: lowercased, two letters or more, no stopwords, each once. A query of nothing but
+/// stopwords ("for", "how to") keeps them: then the words are all there is to search for.
 pub fn terms(text: &str) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 2).collect();
+    let content: Vec<&str> = words.iter().copied().filter(|w| !STOPWORDS.contains(w)).collect();
+    let chosen = if content.is_empty() { words } else { content };
     let mut seen = HashSet::new();
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.chars().count() >= 2 && !STOPWORDS.contains(w))
-        .filter(|w| seen.insert(w.to_string()))
-        .map(String::from)
-        .collect()
+    chosen.into_iter().filter(|w| seen.insert(*w)).map(String::from).collect()
 }
 
 /// Every word has a digit, and letters or 4+ characters: an invoice number, an error code. Words count for more.
@@ -210,20 +210,31 @@ pub fn search(
             (file, meaning_weight * z + words_weight * words)
         })
         .collect();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-
     let keyword_rank: HashMap<i64, (usize, i64)> =
         keyword.iter().enumerate().map(|(i, (file, segment))| (*file, (i + 1, *segment))).collect();
+    // Ties (common with word-only matches, which all score the same) go to the better keyword match.
+    let rank_of = |file: &i64| keyword_rank.get(file).map_or(usize::MAX, |r| r.0);
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(rank_of(&a.0).cmp(&rank_of(&b.0))).then(a.0.cmp(&b.0)));
     let mut hits = Vec::new();
+    let any_word = patterns.join(" OR ");
+    let mut word_check = store.db.prepare("SELECT 1 FROM words WHERE words MATCH ? AND rowid = ?")?;
+    let mut has_words =
+        |segment: i64| -> Result<bool> { Ok(!any_word.is_empty() && word_check.exists(params![any_word, segment])?) };
     let mut statement = store.db.prepare(
         "SELECT f.path, f.kind, s.loc, s.excerpt FROM segments s JOIN files f ON f.id = s.file_id WHERE s.id = ?",
     )?;
     for (file, score) in scored.into_iter().take(options.limit) {
         let meaning = best.get(&file);
         let words = keyword_rank.get(&file);
-        // Point at the best meaning passage if it stands out, else at the one the words matched.
+        // Point at the best meaning passage if it stands out, else at the one the words matched. When the file also
+        // has the words but the meaning passage holds none of them, the words' passage is the better place to land:
+        // the reader sees what they typed, marked.
         let segment = match (meaning, words) {
-            (Some(m), w) if m.0 >= options.z_gate || w.is_none() => vectors.row_segment[m.2],
+            (Some(m), Some(w)) if m.0 >= options.z_gate => {
+                let meaning_segment = vectors.row_segment[m.2];
+                if meaning_segment == w.1 || has_words(meaning_segment)? { meaning_segment } else { w.1 }
+            }
+            (Some(m), None) => vectors.row_segment[m.2],
             (_, Some(w)) => w.1,
             _ => continue,
         };
@@ -251,6 +262,14 @@ mod tests {
     #[test]
     fn terms_drop_stopwords_and_repeats() {
         assert_eq!(terms("Where is the lease clause about PETS, pets?"), vec!["lease", "clause", "pets"]);
+    }
+
+    #[test]
+    fn stopword_only_queries_keep_their_words() {
+        assert_eq!(terms("for"), vec!["for"]);
+        assert_eq!(terms("How to"), vec!["how", "to"]);
+        assert_eq!(terms("how to bake"), vec!["bake"]);
+        assert!(terms("a").is_empty());
     }
 
     #[test]

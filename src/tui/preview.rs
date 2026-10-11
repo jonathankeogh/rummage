@@ -1,8 +1,8 @@
-//! The right-hand pane: the matched passage of a file, with the query's words marked.
+//! The right-hand pane: the file around the matched passage, with the query's words marked, opening at the passage.
 //!
 //! `Preview` is an enum so other kinds (image, PDF page, video frame) can be added next to `Text` and `Code`.
 
-use crate::search::Hit;
+use crate::search::{self, Hit};
 use crate::store::Kind;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -16,15 +16,28 @@ use syntect::util::LinesWithEndings;
 
 /// Passages are ~1800 characters and start 1600 apart (200 overlap).
 pub const PASSAGE_STEP: usize = 1600;
-const PASSAGE_LEN: usize = 1800;
+/// How much of the file around the passage the pane holds, in lines: enough to scroll through, little enough to
+/// highlight at once.
+const LINES_BEFORE: usize = 300;
+const LINES_AFTER: usize = 1500;
+/// Files are read up to this many bytes.
+const READ_LIMIT: u64 = 16 << 20;
+
+/// Lines of a file to show, and where the matched passage starts among them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shown {
+    pub lines: Vec<Line<'static>>,
+    /// Index in `lines` of the passage's first line: the pane opens scrolled here.
+    pub focus: usize,
+}
 
 /// What to show for the selected hit.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Preview {
-    /// A passage of prose.
-    Text(Vec<Line<'static>>),
-    /// A passage of source code, syntax highlighted.
-    Code(Vec<Line<'static>>),
+    /// Prose.
+    Text(Shown),
+    /// Source code, syntax highlighted.
+    Code(Shown),
     /// The file can't be previewed; say why.
     Message(String),
 }
@@ -34,45 +47,36 @@ impl Preview {
     pub fn load(hit: &Hit, terms: &[String]) -> Preview {
         let path = Path::new(&hit.path);
         let loc = hit.loc.map(|l| l.round().max(1.0) as usize).unwrap_or(1);
-        let text = match read_prefix(path, loc) {
+        let text = match read_text(path) {
             Ok(Some(text)) => text,
             Ok(None) => return Preview::Message("binary file".into()),
             Err(_) if !hit.excerpt.is_empty() => hit.excerpt.clone(),
             Err(e) => return Preview::Message(format!("can't read file: {e}")),
         };
-        let passage = passage(&text, loc);
+        let (window, focus) = window(&text, loc);
+        let shown = |lines| Shown { lines, focus };
         match hit.kind {
-            Kind::Code => Preview::Code(code_lines(&passage, path, terms)),
-            Kind::Doc => Preview::Text(
-                passage
+            Kind::Code => Preview::Code(shown(code_lines(&window, path, terms))),
+            Kind::Doc => Preview::Text(shown(
+                window
                     .lines()
                     .map(|l| Line::from(overlay(vec![(Style::default(), l.replace('\t', "    "))], terms)))
                     .collect(),
-            ),
+            )),
         }
     }
 }
 
-/// The lower-cased words of a query worth marking (a leading "code:" is not one).
+/// The query's words to mark: the same words the search matched (a leading "code:" is not one).
 pub fn query_terms(query: &str) -> Vec<String> {
-    let query = query.trim_start();
-    let query = query.strip_prefix("code:").unwrap_or(query);
-    let mut terms: Vec<String> = Vec::new();
-    for word in query.split(|c: char| !c.is_alphanumeric()) {
-        let word = word.to_lowercase();
-        if word.chars().count() >= 2 && !terms.contains(&word) {
-            terms.push(word);
-        }
-    }
-    terms
+    search::terms(search::split_code_prefix(query).0)
 }
 
-/// Read enough of a file to reach passage `loc`. `None` for binary files.
-fn read_prefix(path: &Path, loc: usize) -> std::io::Result<Option<String>> {
-    let limit = (loc * PASSAGE_STEP + PASSAGE_LEN + 1000) * 4;
+/// The file's text, or `None` for binary files.
+fn read_text(path: &Path) -> std::io::Result<Option<String>> {
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?.take(limit as u64).read_to_end(&mut bytes)?;
-    if bytes.contains(&0) {
+    std::fs::File::open(path)?.take(READ_LIMIT).read_to_end(&mut bytes)?;
+    if bytes[..bytes.len().min(8192)].contains(&0) {
         return Ok(None);
     }
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
@@ -85,23 +89,21 @@ pub fn passage_start(text: &str, loc: usize) -> usize {
     text[..at].rfind('\n').map_or(0, |i| i + 1)
 }
 
-/// The text of passage `loc`: from its start for ~1800 characters, ending at a line end.
-pub fn passage(text: &str, loc: usize) -> String {
-    let rest = &text[passage_start(text, loc)..];
-    match rest.char_indices().nth(PASSAGE_LEN) {
-        None => rest.to_string(),
-        Some((end, _)) => {
-            let cut = &rest[..end];
-            cut[..cut.rfind('\n').map_or(end, |i| i + 1)].to_string()
-        }
-    }
+/// The lines of `text` around passage `loc`, and the index among them of the passage's first line.
+pub fn window(text: &str, loc: usize) -> (String, usize) {
+    let start_line = text[..passage_start(text, loc)].matches('\n').count();
+    let first = start_line.saturating_sub(LINES_BEFORE);
+    let lines: Vec<&str> = text.lines().skip(first).take(start_line - first + LINES_AFTER).collect();
+    (lines.join("\n"), start_line - first)
 }
 
-/// Byte ranges of `line` where any of `terms` (lower-case) occurs, ignoring case; overlapping ranges are merged.
+/// Byte ranges of `line` where any of `terms` (lower-case) occurs as a whole word, ignoring case; overlapping ranges
+/// are merged.
 pub fn find_matches(line: &str, terms: &[String]) -> Vec<(usize, usize)> {
     // One lower-case char per char keeps byte offsets of the original line.
     let chars: Vec<(usize, char, usize)> =
         line.char_indices().map(|(i, c)| (i, c.to_lowercase().next().unwrap_or(c), c.len_utf8())).collect();
+    let word_char = |i: usize| chars.get(i).is_some_and(|c| c.1.is_alphanumeric());
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for term in terms {
         let term: Vec<char> = term.chars().collect();
@@ -109,8 +111,10 @@ pub fn find_matches(line: &str, terms: &[String]) -> Vec<(usize, usize)> {
             continue;
         }
         for start in 0..=chars.len() - term.len() {
-            if chars[start..start + term.len()].iter().zip(&term).all(|(a, b)| a.1 == *b) {
-                let last = chars[start + term.len() - 1];
+            let end = start + term.len();
+            let whole = (start == 0 || !word_char(start - 1)) && !word_char(end);
+            if whole && chars[start..end].iter().zip(&term).all(|(a, b)| a.1 == *b) {
+                let last = chars[end - 1];
                 ranges.push((chars[start].0, last.0 + last.2));
             }
         }
@@ -160,7 +164,7 @@ fn syntaxes() -> &'static (SyntaxSet, ThemeSet) {
     SETS.get_or_init(|| (SyntaxSet::load_defaults_newlines(), ThemeSet::load_defaults()))
 }
 
-fn code_lines(passage: &str, path: &Path, terms: &[String]) -> Vec<Line<'static>> {
+fn code_lines(text: &str, path: &Path, terms: &[String]) -> Vec<Line<'static>> {
     let (syntax_set, themes) = syntaxes();
     let syntax = path
         .extension()
@@ -168,7 +172,7 @@ fn code_lines(passage: &str, path: &Path, terms: &[String]) -> Vec<Line<'static>
         .and_then(|e| syntax_set.find_syntax_by_extension(e))
         .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
     let mut highlighter = HighlightLines::new(syntax, &themes.themes["base16-ocean.dark"]);
-    LinesWithEndings::from(passage)
+    LinesWithEndings::from(text)
         .map(|line| {
             let line = line.replace('\t', "    ");
             let plain = || vec![(Style::default(), line.trim_end_matches('\n').to_string())];
@@ -213,23 +217,33 @@ mod tests {
     }
 
     #[test]
-    fn passage_ends_at_line_end() {
-        let text = "line of words\n".repeat(300);
-        let p = passage(&text, 1);
-        assert!(p.ends_with('\n') && p.chars().count() <= PASSAGE_LEN);
-        assert_eq!(passage("tiny", 1), "tiny");
+    fn window_surrounds_the_passage() {
+        let text: String = (0..5000).map(|i| format!("line {i} with some words in it\n")).collect();
+        // Passage 3 starts about 3200 characters in: line 3200 / 30 chars a line ≈ 106.
+        let (shown, focus) = window(&text, 3);
+        let lines: Vec<&str> = shown.lines().collect();
+        assert!(lines[0] == "line 0 with some words in it", "starts at the top: fewer than 300 lines before");
+        assert!(lines[focus].starts_with("line 10"), "{}", lines[focus]);
+        // Far into the file, the window starts 300 lines before the passage.
+        let (shown, focus) = window(&text, 60);
+        assert_eq!(focus, LINES_BEFORE);
+        assert_eq!(shown.lines().count(), LINES_BEFORE + LINES_AFTER);
+        assert_eq!(window("tiny", 1), ("tiny".to_string(), 0));
     }
 
     #[test]
-    fn terms_drop_code_prefix_and_short_words() {
+    fn terms_follow_the_search() {
         assert_eq!(query_terms("code: Retry a failed-call, retry"), vec!["retry", "failed", "call"]);
+        assert_eq!(query_terms("a dog on the beach"), vec!["dog", "beach"]);
+        assert_eq!(query_terms("how"), vec!["how"]);
     }
 
     #[test]
-    fn matches_ignore_case_and_merge() {
+    fn matches_are_whole_words_ignoring_case() {
         let terms = query_terms("dog beach");
         assert_eq!(find_matches("The DOG on the Beach", &terms), vec![(4, 7), (15, 20)]);
-        assert_eq!(find_matches("abcd", &["ab".into(), "bc".into()]), vec![(0, 3)]);
+        assert!(find_matches("dogma hotdogs", &terms).is_empty());
+        assert_eq!(find_matches("how? show how-to", &["how".into()]), vec![(0, 3), (10, 13)]);
         // multi-byte text keeps byte offsets of the original
         assert_eq!(find_matches("café Dog", &["dog".into()]), vec![(6, 9)]);
     }

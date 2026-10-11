@@ -4,7 +4,12 @@ use super::backend::Backend;
 use super::preview::{Preview, query_terms};
 use crate::search::Hit;
 use crate::store::Kind;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
+use ratatui::widgets::ListState;
+use std::cell::{Cell, RefCell};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -12,6 +17,10 @@ use std::time::{Duration, Instant};
 pub const LIMIT: usize = 50;
 /// How long the query must sit still before a search starts.
 pub const DEBOUNCE: Duration = Duration::from_millis(80);
+/// Two clicks on one row this close together open it.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// Rows a wheel notch or Shift-arrow scrolls the preview.
+const SCROLL_STEP: isize = 3;
 
 /// A search to run.
 pub struct Request {
@@ -102,6 +111,30 @@ pub struct App {
     answered: u64,
     /// The selected hit's preview and what it was made for.
     preview: Option<(PreviewKey, Preview)>,
+    /// The preview's first shown row (after wrapping); `None` until drawn, which opens it at the passage.
+    pub scroll: Cell<Option<usize>>,
+    /// Wrapped-row counts of the current preview, for the width they were measured at (see `ui`).
+    pub metrics: Cell<Option<Metrics>>,
+    /// Where the last draw put the results list and the preview, for mouse clicks.
+    pub areas: Cell<Areas>,
+    /// The results list's scroll position, kept between draws.
+    pub list: RefCell<ListState>,
+    last_click: Option<(Instant, usize)>,
+}
+
+/// The preview's size in rows at one width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Metrics {
+    pub width: u16,
+    /// Rows before the passage starts.
+    pub focus: usize,
+    pub total: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Areas {
+    pub results: Rect,
+    pub preview: Rect,
 }
 
 #[derive(PartialEq)]
@@ -126,6 +159,11 @@ impl App {
             latest: 0,
             answered: 0,
             preview: None,
+            scroll: Cell::new(None),
+            metrics: Cell::new(None),
+            areas: Cell::new(Areas::default()),
+            list: RefCell::new(ListState::default()),
+            last_click: None,
         }
     }
 
@@ -176,6 +214,7 @@ impl App {
             }
         }
         self.selected = 0;
+        *self.list.borrow_mut() = ListState::default();
         true
     }
 
@@ -197,8 +236,13 @@ impl App {
             return if ctrl && key.code == KeyCode::Char('c') { Action::Quit } else { Action::None };
         }
         let selected = self.selected_hit();
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => return Action::Quit,
+            KeyCode::Up if shift => self.scroll_preview(-SCROLL_STEP),
+            KeyCode::Down if shift => self.scroll_preview(SCROLL_STEP),
+            KeyCode::PageUp => self.scroll_preview(-self.page()),
+            KeyCode::PageDown => self.scroll_preview(self.page()),
             KeyCode::Char('c') if ctrl => return Action::Quit,
             KeyCode::F(1) => self.help = true,
             KeyCode::Char('?') if self.query.is_empty() => self.help = true,
@@ -206,8 +250,6 @@ impl App {
             KeyCode::Down => self.move_selection(1),
             KeyCode::Char('p') if ctrl => self.move_selection(-1),
             KeyCode::Char('n') if ctrl => self.move_selection(1),
-            KeyCode::PageUp => self.move_selection(-10),
-            KeyCode::PageDown => self.move_selection(10),
             KeyCode::Tab => {
                 self.filter = self.filter.next();
                 self.selected = 0;
@@ -238,6 +280,51 @@ impl App {
         Action::None
     }
 
+    /// Wheel over the results moves the selection; over the preview it scrolls. A click selects a row; a second click
+    /// on it opens it. Any click closes help.
+    pub fn on_mouse(&mut self, mouse: MouseEvent) -> Action {
+        let at = Position::new(mouse.column, mouse.row);
+        let areas = self.areas.get();
+        if self.help {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.help = false;
+            }
+            return Action::None;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollDown if areas.preview.contains(at) => self.scroll_preview(SCROLL_STEP),
+            MouseEventKind::ScrollUp if areas.preview.contains(at) => self.scroll_preview(-SCROLL_STEP),
+            MouseEventKind::ScrollDown if areas.results.contains(at) => self.move_selection(1),
+            MouseEventKind::ScrollUp if areas.results.contains(at) => self.move_selection(-1),
+            MouseEventKind::Down(MouseButton::Left) if areas.results.contains(at) => {
+                let row = self.list.borrow().offset() + (mouse.row - areas.results.y) as usize;
+                let visible = self.visible();
+                let Some(&hit) = visible.get(row) else { return Action::None };
+                let now = Instant::now();
+                let double = self.last_click.is_some_and(|(t, r)| r == row && now.duration_since(t) < DOUBLE_CLICK);
+                self.selected = row;
+                if double {
+                    self.last_click = None;
+                    return Action::Open(hit);
+                }
+                self.last_click = Some((now, row));
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Scroll the preview by `rows` (clamped when drawn).
+    pub fn scroll_preview(&mut self, rows: isize) {
+        let from = self.scroll.get().unwrap_or(0) as isize;
+        self.scroll.set(Some((from + rows).max(0) as usize));
+    }
+
+    /// A page of preview, less two rows of overlap.
+    fn page(&self) -> isize {
+        (self.areas.get().preview.height as isize - 2).max(1)
+    }
+
     /// Show a message in the footer for a moment.
     pub fn notify(&mut self, message: impl Into<String>) {
         self.notice = Some((message.into(), Instant::now()));
@@ -256,6 +343,8 @@ impl App {
         }
         let preview = Preview::load(hit, &query_terms(&self.query));
         self.preview = Some((key, preview));
+        self.scroll.set(None);
+        self.metrics.set(None);
     }
 
     pub fn preview(&self) -> Option<&Preview> {
@@ -349,6 +438,49 @@ pub(crate) mod tests {
         assert!(!app.help && app.query.is_empty());
         type_str(&mut app, "why?");
         assert_eq!(app.query, "why?");
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    #[test]
+    fn mouse_selects_opens_and_scrolls() {
+        let (mut app, _rx) = app();
+        app.hits = vec![hit("/a", Kind::Doc), hit("/b", Kind::Doc), hit("/c", Kind::Doc)];
+        app.areas.set(Areas { results: Rect::new(1, 1, 40, 10), preview: Rect::new(42, 1, 40, 10) });
+        let click = || mouse(MouseEventKind::Down(MouseButton::Left), 5, 3);
+        // One click selects row 2; a second click on it opens it.
+        assert_eq!(app.on_mouse(click()), Action::None);
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.on_mouse(click()), Action::Open(2));
+        // A click below the last row does nothing.
+        assert_eq!(app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 8)), Action::None);
+        assert_eq!(app.selected, 2);
+        // The wheel moves the selection over the results and scrolls over the preview.
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 5, 5));
+        assert_eq!(app.selected, 1);
+        app.scroll.set(Some(10));
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 50, 5));
+        assert_eq!(app.scroll.get(), Some(13));
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 50, 5));
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 50, 5));
+        assert_eq!(app.scroll.get(), Some(7));
+    }
+
+    #[test]
+    fn shift_arrows_and_pages_scroll_the_preview() {
+        let (mut app, _rx) = app();
+        app.hits = vec![hit("/a", Kind::Doc), hit("/b", Kind::Doc)];
+        app.areas.set(Areas { preview: Rect::new(0, 0, 40, 12), ..Areas::default() });
+        app.scroll.set(Some(0));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!((app.scroll.get(), app.selected), (Some(3), 0), "Shift-↓ scrolls, the selection stays");
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.scroll.get(), Some(13));
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.scroll.get(), Some(0), "never above the top");
     }
 
     #[test]
