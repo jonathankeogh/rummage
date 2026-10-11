@@ -1,0 +1,274 @@
+//! Drawing the three panes: results, preview, and the path/why strip, plus the help overlay.
+
+use super::app::App;
+use super::preview::{Preview, why};
+use crate::paths::tilde;
+use crate::search::Hit;
+use crate::store::Kind;
+use ratatui::Frame;
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use std::path::Path;
+use std::time::Duration;
+
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const HINTS: &str = " ↑↓ move  ⏎ open  ^o reveal  ^y copy  tab kind  ? help  esc quit ";
+const NOTICE_FOR: Duration = Duration::from_secs(2);
+
+const HELP: [(&str, &str); 9] = [
+    ("type", "search as you type (\"code:\" first searches code)"),
+    ("↑ ↓  ^p ^n", "move through results"),
+    ("⏎", "open the file ($EDITOR for code)"),
+    ("^o", "reveal in the file manager"),
+    ("^y", "copy the path (works over ssh)"),
+    ("tab", "show all, docs or code"),
+    ("^u  ^w", "clear the query, delete a word"),
+    ("? or F1", "this help (? only on an empty query)"),
+    ("esc  ^c", "quit"),
+];
+
+/// Draw the whole interface.
+pub fn render(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let spinner = if app.searching() { format!(" {}", SPINNER[app.tick % SPINNER.len()]) } else { String::new() };
+    let mut title = vec![
+        Span::raw(" rummage ─ "),
+        Span::styled(app.query.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("█", Style::default().fg(Color::Gray)),
+    ];
+    title.push(Span::raw(format!("{spinner} ")));
+    let footer = match &app.notice {
+        Some((message, at)) if at.elapsed() < NOTICE_FOR => format!(" {message} "),
+        _ => HINTS.to_string(),
+    };
+    let mut block = Block::bordered().title(Line::from(title)).title_bottom(Line::from(footer));
+    if app.filter != super::app::Filter::All {
+        block = block.title(Line::from(format!(" {} only ", app.filter.label())).right_aligned());
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [left, right] = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(inner);
+    render_results(frame, app, left);
+    render_right(frame, app, right);
+    if app.help {
+        render_help(frame, area);
+    }
+}
+
+fn render_results(frame: &mut Frame, app: &App, area: Rect) {
+    let visible = app.visible();
+    if visible.is_empty() {
+        let message = if let Some(error) = &app.error {
+            format!("search failed: {error}")
+        } else if app.query.trim().is_empty() {
+            "type to search".to_string()
+        } else if app.searching() {
+            format!("{} searching…", SPINNER[app.tick % SPINNER.len()])
+        } else {
+            "no good matches".to_string()
+        };
+        let style =
+            if app.error.is_some() { Style::default().fg(Color::Red) } else { Style::default().fg(Color::DarkGray) };
+        frame.render_widget(Paragraph::new(message).style(style).wrap(Wrap { trim: true }), area);
+        return;
+    }
+    let width = area.width as usize;
+    let items: Vec<ListItem> = visible
+        .iter()
+        .enumerate()
+        .map(|(row, &i)| ListItem::new(row_line(&app.hits[i], row == app.selected, width)))
+        .collect();
+    let mut state = ListState::default().with_selected(Some(app.selected));
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// One result row: marker, kind, file name, and the passage number at the right edge.
+fn row_line(hit: &Hit, selected: bool, width: usize) -> Line<'static> {
+    let name = Path::new(&hit.path).file_name().map_or(hit.path.clone(), |n| n.to_string_lossy().into_owned());
+    let place = match hit.loc {
+        Some(loc) if loc > 1.0 => format!("#{}", loc.round() as i64),
+        _ => String::new(),
+    };
+    let marker = if selected { "▸" } else { " " };
+    let kind_color = match hit.kind {
+        Kind::Doc => Color::Cyan,
+        Kind::Code => Color::Yellow,
+    };
+    let fixed = 2 + 5 + place.chars().count() + 1;
+    let room = width.saturating_sub(fixed).max(1);
+    let name = truncate(&name, room);
+    let pad = room.saturating_sub(name.chars().count());
+    let kind_style = if selected { Style::default() } else { Style::default().fg(kind_color) };
+    Line::from(vec![
+        Span::raw(format!("{marker} ")),
+        Span::styled(format!("{:<5}", hit.kind.as_str()), kind_style),
+        Span::raw(name),
+        Span::raw(" ".repeat(pad + 1)),
+        Span::raw(place),
+    ])
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let keep: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{keep}…")
+}
+
+fn render_right(frame: &mut Frame, app: &App, area: Rect) {
+    let [preview_area, info_area] = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
+    let divider =
+        Block::bordered().borders(ratatui::widgets::Borders::LEFT).border_style(Style::default().fg(Color::DarkGray));
+    let preview_area = {
+        let inner = divider.inner(preview_area);
+        frame.render_widget(divider.clone(), preview_area);
+        inner
+    };
+    let info_block = divider.clone();
+    let info_inner = info_block.inner(info_area);
+    frame.render_widget(info_block, info_area);
+
+    let (Some(i), Some(preview)) = (app.selected_hit(), app.preview()) else { return };
+    let hit = &app.hits[i];
+    match preview {
+        Preview::Text(lines) | Preview::Code(lines) => {
+            frame.render_widget(Paragraph::new(lines.clone()).wrap(Wrap { trim: false }), preview_area);
+        }
+        Preview::Message(message) => {
+            frame.render_widget(
+                Paragraph::new(message.clone()).style(Style::default().fg(Color::DarkGray)),
+                preview_area,
+            );
+        }
+    }
+    let info = vec![
+        Line::from(Span::styled(tilde(Path::new(&hit.path)), Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(why(hit), Style::default().fg(Color::DarkGray))),
+    ];
+    frame.render_widget(Paragraph::new(info), info_inner);
+}
+
+fn render_help(frame: &mut Frame, area: Rect) {
+    let width = 66.min(area.width);
+    let height = (HELP.len() as u16 + 4).min(area.height);
+    let popup = Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height);
+    let mut lines: Vec<Line> = HELP
+        .iter()
+        .map(|(keys, what)| {
+            Line::from(vec![
+                Span::styled(format!("{keys:<12}"), Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(*what),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::styled("any key closes this", Style::default().fg(Color::DarkGray)));
+    let block = Block::bordered().title(" help ").title_alignment(Alignment::Center);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::tests::hit;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::mpsc;
+
+    fn draw(app: &mut App, width: u16, height: u16) -> String {
+        app.refresh_preview();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn new_app() -> App {
+        App::new(mpsc::channel().0)
+    }
+
+    fn with_hits() -> App {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("rummage-tui-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("beach-trip.md");
+        std::fs::write(&note, "# Beach trip\nWe took the Dog to the beach on Saturday.\nIt rained.\n").unwrap();
+        let mut app = new_app();
+        app.query = "dog on the beach".into();
+        let mut first = hit(note.to_str().unwrap(), Kind::Doc);
+        first.loc = Some(1.0);
+        let mut second = hit("/nowhere/lease.txt", Kind::Doc);
+        second.loc = Some(3.0);
+        app.hits = vec![first, second, hit("/nowhere/retry.rs", Kind::Code)];
+        app
+    }
+
+    #[test]
+    fn empty_query() {
+        let screen = draw(&mut new_app(), 80, 12);
+        assert!(screen.contains("rummage ─ █"), "{screen}");
+        assert!(screen.contains("type to search"));
+        assert!(screen.contains("esc quit"));
+    }
+
+    #[test]
+    fn results_and_preview() {
+        let screen = draw(&mut with_hits(), 140, 14);
+        assert!(screen.contains("rummage ─ dog on the beach█"), "{screen}");
+        assert!(screen.contains("▸ doc  beach-trip.md"), "{screen}");
+        assert!(screen.contains("lease.txt") && screen.contains("#3"));
+        assert!(screen.contains("code retry.rs"));
+        assert!(screen.contains("We took the Dog to the beach"), "{screen}");
+        assert!(screen.contains("beach-trip.md") && screen.contains("meaning z 3.1 · words #2"));
+    }
+
+    #[test]
+    fn matched_words_are_highlighted() {
+        let mut app = with_hits();
+        app.refresh_preview();
+        let Some(Preview::Text(lines)) = app.preview() else { panic!("no text preview") };
+        let marked: Vec<&str> =
+            lines[1].spans.iter().filter(|s| s.style.bg == Some(Color::Yellow)).map(|s| s.content.as_ref()).collect();
+        assert_eq!(marked, vec!["the", "Dog", "the", "beach", "on"]);
+    }
+
+    #[test]
+    fn missing_file_says_so() {
+        let mut app = with_hits();
+        app.selected = 1;
+        let screen = draw(&mut app, 100, 14);
+        assert!(screen.contains("can't read file"), "{screen}");
+        assert!(screen.contains("/nowhere/lease.txt"));
+    }
+
+    #[test]
+    fn help_overlay() {
+        let mut app = new_app();
+        app.help = true;
+        let screen = draw(&mut app, 90, 20);
+        assert!(screen.contains("help") && screen.contains("reveal in the file manager"), "{screen}");
+        assert!(screen.contains("any key closes this"));
+    }
+
+    #[test]
+    fn no_matches_and_filter() {
+        let mut app = new_app();
+        app.query = "zzzz".into();
+        let screen = draw(&mut app, 80, 12);
+        assert!(screen.contains("no good matches"), "{screen}");
+        let mut app = with_hits();
+        app.filter = crate::tui::app::Filter::Only(Kind::Code);
+        let screen = draw(&mut app, 100, 14);
+        assert!(screen.contains("code only") && !screen.contains("lease.txt"), "{screen}");
+    }
+}
