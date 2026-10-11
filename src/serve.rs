@@ -206,9 +206,15 @@ fn handle(stream: UnixStream, engine: &Mutex<Engine>, last_request: &AtomicU64, 
     Ok(())
 }
 
+/// Removes the socket and exits at once. Not `std::process::exit`: that runs C++ static destructors, and llama.cpp's
+/// Metal backend asserts when its device is torn down while the model (held by another thread) still uses it. The OS
+/// frees everything anyway.
 fn quit(socket: &Path) -> ! {
+    unsafe extern "C" {
+        fn _exit(status: i32) -> !;
+    }
     std::fs::remove_file(socket).ok();
-    std::process::exit(0);
+    unsafe { _exit(0) }
 }
 
 fn now_seconds() -> u64 {
