@@ -48,7 +48,9 @@ pub fn read_parts(path: &Path, kind: Kind, range: Range<usize>) -> Result<Parts>
             .collect();
         return Ok(Parts { parts, total });
     }
-    let text = if kind == Kind::Code { read_text(path)? } else { document_text(path)? };
+    // Code is read as written (an html template keeps its markup); only notebooks are converted.
+    let notebook = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ipynb"));
+    let text = if kind == Kind::Code && !notebook { read_text(path)? } else { document_text(path)? };
     let all = passages(&text, PASSAGE_CHARS, OVERLAP_CHARS, MAX_PASSAGES);
     let total = all.len();
     let parts = all
@@ -66,6 +68,7 @@ pub fn document_text(path: &Path) -> Result<String> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     match ext.as_str() {
         "docx" => office_text(path, "word/document.xml", Office::Word),
+        "ipynb" => notebook_text(path),
         "odt" => office_text(path, "content.xml", Office::OpenDocument),
         "html" | "htm" | "xhtml" => {
             let bytes = std::fs::read(path)?;
@@ -73,6 +76,28 @@ pub fn document_text(path: &Path) -> Result<String> {
         }
         _ => read_text(path),
     }
+}
+
+/// A Jupyter notebook's cells, code and markdown, without their outputs (plots, tables, logs), each under a
+/// `# %%` marker as in Python scripts that hold cells.
+fn notebook_text(path: &Path) -> Result<String> {
+    let notebook: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?).context("not a notebook (JSON)")?;
+    let mut out = String::new();
+    for cell in notebook["cells"].as_array().into_iter().flatten() {
+        let kind = cell["cell_type"].as_str().unwrap_or("code");
+        if kind != "code" && kind != "markdown" {
+            continue;
+        }
+        let source = match &cell["source"] {
+            serde_json::Value::Array(lines) => lines.iter().filter_map(|l| l.as_str()).collect::<String>(),
+            serde_json::Value::String(text) => text.clone(),
+            _ => continue,
+        };
+        out += if kind == "markdown" { "# %% [markdown]\n" } else { "# %%\n" };
+        out += source.trim_end();
+        out += "\n\n";
+    }
+    Ok(out)
 }
 
 enum Office {
@@ -300,6 +325,28 @@ mod tests {
                </office:document-content>"#,
         );
         assert_eq!(document_text(&path).unwrap(), "Sleep\nKeep the room cool.\n");
+    }
+
+    #[test]
+    fn notebooks_keep_cells_not_outputs() {
+        let path = scratch("explore.ipynb");
+        std::fs::write(
+            &path,
+            r##"{"cells": [
+                {"cell_type": "markdown", "source": ["# Class balance\n", "Count each class."]},
+                {"cell_type": "code", "source": "df.label.value_counts().plot.bar()", "outputs": [{"data": {"image/png": "iVBORw0KGgo"}}]},
+                {"cell_type": "raw", "source": "skip me"}
+            ], "nbformat": 4}"##,
+        )
+        .unwrap();
+        let text = document_text(&path).unwrap();
+        assert_eq!(
+            text,
+            "# %% [markdown]\n# Class balance\nCount each class.\n\n# %%\ndf.label.value_counts().plot.bar()\n\n"
+        );
+        // Code passages of a notebook are its cells, not its JSON.
+        let read = read_parts(&path, Kind::Code, 0..10).unwrap();
+        assert!(read.parts[0].text.contains("value_counts") && !read.parts[0].text.contains("iVBOR"));
     }
 
     #[test]

@@ -7,6 +7,8 @@
 use crate::embed::DIM;
 use crate::store::{Kind, Store};
 use anyhow::Result;
+use half::f16;
+use half::slice::HalfFloatSliceExt;
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 
@@ -116,13 +118,24 @@ impl QueryCentre {
     }
 }
 
+/// Dot product over 8 running sums, which the compiler turns into SIMD (a single running sum can't be reordered).
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    let mut sums = [0.0f32; 8];
+    let (a8, b8) = (a.chunks_exact(8), b.chunks_exact(8));
+    let tail: f32 = a8.remainder().iter().zip(b8.remainder()).map(|(x, y)| x * y).sum();
+    for (x, y) in a8.zip(b8) {
+        for i in 0..8 {
+            sums[i] += x[i] * y[i];
+        }
+    }
+    sums.iter().sum::<f32>() + tail
 }
 
 /// All vectors of an index in memory, one row each, for scoring every one against a query.
 pub struct Vectors {
-    matrix: Vec<f32>,
+    /// Every vector, row after row, in half precision: half the memory of f32, and cosines come out within about 0.001
+    /// (DigUp keeps its vectors the same way).
+    matrix: Vec<f16>,
     row_segment: Vec<i64>,
     row_file: Vec<i64>,
     file_kind: HashMap<i64, Kind>,
@@ -158,7 +171,9 @@ impl Vectors {
             if blob.len() != DIM * 4 {
                 continue;
             }
-            vectors.matrix.extend(blob.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+            vectors
+                .matrix
+                .extend(blob.chunks_exact(4).map(|b| f16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))));
             vectors.row_segment.push(row.get(0)?);
             vectors.row_file.push(row.get(1)?);
         }
@@ -189,7 +204,16 @@ impl Vectors {
 
     /// Cosine of the query with every row (all vectors are L2-normalized, so a dot product).
     fn cosines(&self, query: &[f32]) -> Vec<f32> {
-        self.matrix.chunks_exact(DIM).map(|row| row.iter().zip(query).map(|(a, b)| a * b).sum()).collect()
+        // A block of rows at a time back to f32 (SIMD where the CPU has it), then plain dot products.
+        const BLOCK: usize = 256;
+        let mut floats = vec![0.0f32; BLOCK * DIM];
+        let mut out = Vec::with_capacity(self.matrix.len() / DIM);
+        for block in self.matrix.chunks(BLOCK * DIM) {
+            let floats = &mut floats[..block.len()];
+            block.convert_to_f32_slice(floats);
+            out.extend(floats.chunks_exact(DIM).map(|row| dot(row, query)));
+        }
+        out
     }
 }
 
@@ -420,6 +444,37 @@ mod tests {
         v
     }
 
+    /// cargo test --release -- --ignored --nocapture scoring_speed
+    #[test]
+    #[ignore]
+    fn scoring_speed() {
+        let rows = 100_000;
+        let mut seed = 1u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        };
+        let matrix: Vec<f16> = (0..rows * DIM).map(|_| f16::from_f32(next() * 0.07)).collect();
+        let vectors = Vectors {
+            matrix,
+            row_segment: vec![0; rows],
+            row_file: vec![0; rows],
+            file_kind: HashMap::new(),
+            query_centre: None,
+            centrality: Vec::new(),
+        };
+        let query: Vec<f32> = (0..DIM).map(|_| next() * 0.07).collect();
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            std::hint::black_box(vectors.cosines(&query));
+        }
+        eprintln!(
+            "{rows} rows: {:.1} ms a query, {} MB",
+            started.elapsed().as_secs_f64() * 100.0,
+            rows * DIM * 2 >> 20
+        );
+    }
+
     #[test]
     fn query_centre_and_vagueness() {
         // Typical queries all share axis 0 and differ on another axis.
@@ -439,7 +494,7 @@ mod tests {
         let mut hub = vec![0.0; DIM];
         hub[0] = 1.0;
         let own = unit(5, 6);
-        vectors.matrix = [hub.clone(), own].concat();
+        vectors.matrix = [hub.clone(), own].concat().into_iter().map(f16::from_f32).collect();
         vectors.row_segment = vec![1, 2];
         vectors.row_file = vec![1, 2];
         vectors.set_query_centre(centre);

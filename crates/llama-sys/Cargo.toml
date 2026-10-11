@@ -3,6 +3,7 @@ name = "rummage-llama-sys"
 version = "0.1.0"
 edition = "2024"
 description = "llama.cpp (pinned in vendor/llama.cpp, with patches/) built for rummage, and its raw bindings"
+license = "MIT"
 links = "llama"
 
 [build-dependencies]

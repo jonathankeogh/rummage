@@ -33,7 +33,7 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "ps1", "lua", "pl", "pm", "r", "jl", "dart", "sql", "vue", "svelte", "astro", "html",
     "htm", "css", "scss", "sass", "less", "gradle", "cmake", "mk", "proto", "graphql", "gql", "tf", "hcl", "nix",
     "zig", "hs", "ex", "exs", "erl", "clj", "cljs", "elm", "ml", "mli", "vim", "el", "lisp", "asm", "s", "metal",
-    "glsl", "hlsl", "wgsl", "cu", "cuh", "ino", "v", "sv", "tex",
+    "glsl", "hlsl", "wgsl", "cu", "cuh", "ino", "v", "sv", "tex", "ipynb",
 ];
 /// What goes with code: a repo's docs and settings.
 const CODE_TEXT_EXTENSIONS: &[&str] = &["md", "markdown", "rst", "adoc", "org", "txt", "yaml", "yml", "toml"];
@@ -208,7 +208,12 @@ fn classify(path: &Path, options: &Options) -> Option<Kind> {
     if ext == "pdf" {
         return Some(Kind::Pdf);
     }
-    DOC_EXTENSIONS.contains(&ext.as_str()).then_some(Kind::Doc)
+    if DOC_EXTENSIONS.contains(&ext.as_str()) {
+        return Some(Kind::Doc);
+    }
+    // Loose scripts and notebooks outside any project are code too, with --code.
+    let code = SOURCE_EXTENSIONS.contains(&ext.as_str()) || CODE_FILE_NAMES.contains(&name.as_ref());
+    (options.code && code).then_some(Kind::Code)
 }
 
 /// Keys, certificates, password and credential files: never read, wherever they are.

@@ -6,10 +6,12 @@ name = "rummage"
 version = "0.1.0"
 edition = "2024"
 description = "Instant multimodal semantic file search for the Unix terminal"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
+half = "2.7.1"
 html2text = "=0.17.1"
 ignore = "0.4.33"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }

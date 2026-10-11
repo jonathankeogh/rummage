@@ -53,7 +53,7 @@ the model files instead of the Hugging Face cache.
 
 ## What it reads
 
-Text and Markdown, PDFs a page at a time, docx, odt and html, and source code with `--code`. Long files go in two
+Text and Markdown, PDFs a page at a time, docx, odt and html, and with `--code` source code and notebooks, in projects and as loose scripts. Long files go in two
 passes: the first 30 pages of a big PDF or 40 passages of a long document right away, the rest once everything else
 is in, so a 500-page PDF can't hold up the first pass. Scanned PDFs (no text) wait for OCR.
 
@@ -67,6 +67,10 @@ Text is cut into ~1,800-character passages, each embedded by EmbeddingGemma 2 th
 `vendor/llama.cpp`, built by `crates/llama-sys`). One SQLite file holds a vector per passage plus an FTS5 keyword
 index. A search scores every vector, keeps passages that stand out for that query, and boosts files that contain the
 query's words.
+
+## License
+
+MIT (see [LICENSE](LICENSE)).
 
 Credits: [DigUp](https://github.com/ARahim3/DigUp) for the approach, skip rules and ranking (see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), [llama.cpp](https://github.com/ggml-org/llama.cpp) and

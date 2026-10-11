@@ -147,7 +147,9 @@ pub fn reflow(text: &str) -> String {
 /// binary files.
 fn read_document(path: &Path, kind: Kind) -> anyhow::Result<Option<String>> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if kind == Kind::Doc && ["docx", "odt", "html", "htm", "xhtml"].contains(&ext.as_str()) {
+    let converted =
+        ext == "ipynb" || (kind == Kind::Doc && ["docx", "odt", "html", "htm", "xhtml"].contains(&ext.as_str()));
+    if converted {
         return Ok(Some(extract::document_text(path)?));
     }
     Ok(read_text(path)?)
@@ -260,6 +262,7 @@ fn code_lines(text: &str, path: &Path, terms: &[String]) -> Vec<Line<'static>> {
     let syntax = path
         .extension()
         .and_then(|e| e.to_str())
+        .map(|e| if e == "ipynb" { "py" } else { e })
         .and_then(|e| syntax_set.find_syntax_by_extension(e))
         .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
     let mut highlighter = HighlightLines::new(syntax, &themes.themes["base16-ocean.dark"]);
