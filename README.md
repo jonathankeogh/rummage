@@ -75,6 +75,14 @@ Text is cut into ~1,800-character passages, each embedded by EmbeddingGemma 2 th
 index. A search scores every vector, keeps passages that stand out for that query, and boosts files that contain the
 query's words.
 
+## Tests
+
+`cargo test --release` runs the unit tests everywhere. With the model files present it also runs
+`tests/reference_vectors.rs` (rummage's vectors must match DigUp's reference vectors, cosine ≥ 0.999) and
+`tests/end_to_end.rs` (index, re-sync, long files in two passes, the service, grep, crash recovery); without them
+(as on CI) those skip. `scripts/eval.py` measures ranking on DigUp's eval sets: build the text parts of its testbed
+somewhere outside a code project (e.g. `~/.cache/rummage-eval`) and see the script's header.
+
 ## License
 
 MIT (see [LICENSE](LICENSE)).

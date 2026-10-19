@@ -2,7 +2,8 @@
 
 Parts of rummage are ported from DigUp (https://github.com/ARahim3/DigUp): the skip rules in `src/crawl.rs`, the
 passage sizes in `src/extract.rs`, the embedding pipeline in `src/embed.rs`, the ranking in `src/search.rs`, and
-`patches/llama.cpp-no-logits.patch`. DigUp is licensed as follows:
+`patches/llama.cpp-no-logits.patch`; and `tests/reference/` (its reference inputs and vectors, made with DigUp's
+`scripts/testbed/make_reference_inputs.py` and llama.cpp b11461). DigUp is licensed as follows:
 
 ```
 MIT License

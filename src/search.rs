@@ -240,6 +240,12 @@ impl Vectors {
 /// matches the standard deviation of a normal spread). The matches themselves are outliers; with a mean and standard
 /// deviation they'd pull the scale towards themselves, and in a small index two good matches hide each other. The
 /// spread is floored so a flat field doesn't make everything stand out.
+/// The spread of (hub-adjusted) cosines in a real index of thousands of passages, query after query: 0.020 to 0.035,
+/// mostly about 0.025 (measured on a 2,883-passage index, 2026-10-19).
+const PRIOR_SPREAD: f64 = 0.025;
+/// How many passages' worth the typical spread counts for.
+const PRIOR_WEIGHT: f64 = 50.0;
+
 fn standardize(scores: &[f32]) -> Vec<f64> {
     if scores.is_empty() {
         return Vec::new();
@@ -251,7 +257,15 @@ fn standardize(scores: &[f32]) -> Vec<f64> {
     let mut values: Vec<f64> = scores.iter().map(|&s| s as f64).collect();
     let center = median(&mut values);
     let mut deviations: Vec<f64> = scores.iter().map(|&s| (s as f64 - center).abs()).collect();
-    let deviation = (median(&mut deviations) * 1.4826).max(0.02);
+    let measured = median(&mut deviations) * 1.4826;
+    // Few passages measure the spread badly (from 0.020 to 0.047 for 8 passages, query to query), and a clear best
+    // match can then fail to stand out. So the measured spread is blended with a typical one, weighing in as if from
+    // PRIOR_WEIGHT passages: a small index leans on the typical spread, a big one on its own.
+    let n = scores.len() as f64;
+    let deviation = ((n * measured + PRIOR_WEIGHT * PRIOR_SPREAD) / (n + PRIOR_WEIGHT)).max(0.02);
+    if std::env::var_os("RUMMAGE_DEBUG").is_some() {
+        eprintln!("spread {deviation:.4} (measured {measured:.4}) over {} passages", scores.len());
+    }
     scores.iter().map(|&s| (s as f64 - center) / deviation).collect()
 }
 
