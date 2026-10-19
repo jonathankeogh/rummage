@@ -1,6 +1,7 @@
 //! Interface state: the query, results, selection and the search worker that fills them in.
 
 use super::backend::Backend;
+use super::player::Player;
 use super::preview::{Preview, query_terms};
 use crate::search::Hit;
 use crate::store::Kind;
@@ -24,6 +25,16 @@ pub const DEBOUNCE: Duration = Duration::from_millis(80);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Rows a wheel notch or Shift-arrow scrolls the preview.
 const SCROLL_STEP: isize = 3;
+/// Seconds ← and → skip while listening.
+const SKIP: f64 = 10.0;
+/// A wheel flips a PDF's page at most this often (a trackpad sends many notches).
+const FLIP_EVERY: Duration = Duration::from_millis(250);
+/// Rows the waveform takes under a video's frame.
+pub const WAVE_ROWS: u16 = 6;
+/// A waveform is measured in slices this long, averaged into the pane's columns when drawn.
+const WAVE_SLICE: f64 = 0.025;
+/// A recording up to this long shows whole in the waveform; a longer one shows this much around the moment.
+const WAVE_SPAN: f64 = 240.0;
 
 /// A search to run.
 pub struct Request {
@@ -165,6 +176,29 @@ pub struct App {
     pub picker: Option<Picker>,
     /// The selected PDF page, drawn for the preview's size: what it was made for, and the picture or why not.
     pub page_image: RefCell<Option<(PageKey, Result<StatefulProtocol, String>)>>,
+    /// The selected file and place; pages flipped and listening start again when it changes.
+    shown: Option<(String, Option<i64>)>,
+    /// Pages flipped from the matched one in a PDF's page view, and the PDF's length.
+    pub page_shift: i64,
+    pub pdf_length: Option<(String, usize)>,
+    last_flip: Option<Instant>,
+    /// The selected recording's or video's waveform: for which file, and the waveform, why not, or still coming.
+    pub wave: Option<(String, WaveState)>,
+    /// Listening to the selected recording or video (Ctrl-s).
+    pub player: Option<Player>,
+}
+
+/// A stretch of sound drawn as a waveform: `from`..`to` seconds of the file, `levels` loud from 0 to 1.
+pub struct Wave {
+    pub from: f64,
+    pub to: f64,
+    pub length: Option<f64>,
+    pub levels: Vec<f32>,
+}
+
+pub enum WaveState {
+    Coming(Receiver<Result<Wave, String>>),
+    Ready(Result<Wave, String>),
 }
 
 /// How this terminal draws pictures: asked the first time a page is shown (not at start, so a terminal that never
@@ -236,6 +270,12 @@ impl App {
             pictures_as_text: false,
             picker: None,
             page_image: RefCell::new(None),
+            shown: None,
+            page_shift: 0,
+            pdf_length: None,
+            last_flip: None,
+            wave: None,
+            player: None,
         }
     }
 
@@ -324,8 +364,21 @@ impl App {
             KeyCode::Esc => return Action::Quit,
             KeyCode::Up if shift => self.scroll_preview(-SCROLL_STEP),
             KeyCode::Down if shift => self.scroll_preview(SCROLL_STEP),
+            KeyCode::PageUp if self.flips_pages() => self.flip(-1),
+            KeyCode::PageDown if self.flips_pages() => self.flip(1),
             KeyCode::PageUp => self.scroll_preview(-self.page()),
             KeyCode::PageDown => self.scroll_preview(self.page()),
+            KeyCode::Left | KeyCode::Right => {
+                let forward = key.code == KeyCode::Right;
+                if self.flips_pages() {
+                    self.flip(if forward { 1 } else { -1 });
+                } else if let Some(player) = self.player.as_mut() {
+                    if let Err(e) = player.skip(if forward { SKIP } else { -SKIP }) {
+                        self.notify(format!("{e:#}"));
+                    }
+                }
+            }
+            KeyCode::Char('s') if ctrl => self.listen(),
             KeyCode::Char('c') if ctrl => return Action::Quit,
             KeyCode::F(1) => self.help = true,
             KeyCode::Char('?') if self.query.is_empty() => self.help = true,
@@ -337,7 +390,11 @@ impl App {
                 self.filter = self.filter.next();
                 self.selected = 0;
             }
-            KeyCode::Enter => return selected.map_or(Action::None, Action::Open),
+            KeyCode::Enter => {
+                // Your player takes over from the one in here.
+                self.player = None;
+                return selected.map_or(Action::None, Action::Open);
+            }
             KeyCode::Char('o') if ctrl => return selected.map_or(Action::None, Action::Reveal),
             KeyCode::Char('v') if ctrl => match selected.map(|i| self.hits[i].kind) {
                 Some(Kind::Pdf) => self.pdf_pages = !self.pdf_pages,
@@ -382,6 +439,8 @@ impl App {
             return Action::None;
         }
         match mouse.kind {
+            MouseEventKind::ScrollDown if areas.preview.contains(at) && self.flips_pages() => self.flip_by_wheel(1),
+            MouseEventKind::ScrollUp if areas.preview.contains(at) && self.flips_pages() => self.flip_by_wheel(-1),
             MouseEventKind::ScrollDown if areas.preview.contains(at) => self.scroll_preview(SCROLL_STEP),
             MouseEventKind::ScrollUp if areas.preview.contains(at) => self.scroll_preview(-SCROLL_STEP),
             MouseEventKind::ScrollDown if areas.results.contains(at) => self.move_selection(1),
@@ -396,6 +455,7 @@ impl App {
                 self.moved = true;
                 if double {
                     self.last_click = None;
+                    self.player = None;
                     return Action::Open(hit);
                 }
                 self.last_click = Some((now, row));
@@ -403,6 +463,101 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    /// A PDF's page view is showing: paging keys and the wheel flip pages.
+    fn flips_pages(&self) -> bool {
+        self.selected_hit().is_some_and(|i| self.hits[i].kind == Kind::Pdf && self.pdf_pages)
+    }
+
+    /// Flip `by` pages (clamped to the PDF when drawn).
+    fn flip(&mut self, by: i64) {
+        self.page_shift += by;
+        self.last_flip = Some(Instant::now());
+    }
+
+    fn flip_by_wheel(&mut self, by: i64) {
+        if self.last_flip.is_none_or(|at| at.elapsed() >= FLIP_EVERY) {
+            self.flip(by);
+        }
+    }
+
+    /// The page the PDF's page view shows: the matched one, flipped.
+    pub fn shown_page(&self, hit: &Hit) -> usize {
+        let matched = hit.loc.map_or(1, |l| l.round().max(1.0) as usize) as i64;
+        let length = self.pdf_length.as_ref().filter(|(p, _)| *p == hit.path).map_or(i64::MAX, |(_, n)| *n as i64);
+        (matched + self.page_shift).clamp(1, length.max(1)) as usize
+    }
+
+    /// Ctrl-s: listen to the selected recording or video from its moment, or pause and go on.
+    fn listen(&mut self) {
+        let Some(i) = self.selected_hit().filter(|&i| self.hits[i].kind.is_timed()) else {
+            self.notify("^s plays recordings and videos");
+            return;
+        };
+        let hit = &self.hits[i];
+        let result = match self.player.as_mut().filter(|p| p.path == hit.path) {
+            Some(player) => player.toggle(),
+            None => {
+                let length = self.wave_length(&hit.path);
+                Player::start(&hit.path, hit.loc.unwrap_or(0.0), length).map(|p| self.player = Some(p))
+            }
+        };
+        if let Err(e) = result {
+            self.notify(format!("{e:#}"));
+        }
+    }
+
+    fn wave_length(&self, path: &str) -> Option<f64> {
+        match &self.wave {
+            Some((p, WaveState::Ready(Ok(wave)))) if p == path => wave.length,
+            _ => None,
+        }
+    }
+
+    /// Starts measuring the selected recording's or video's waveform (on its own thread), and picks it up once made.
+    pub fn refresh_wave(&mut self) {
+        if let Some(player) = self.player.as_mut() {
+            player.poll();
+        }
+        let Some(i) = self.selected_hit().filter(|&i| self.hits[i].kind.is_timed()) else {
+            self.wave = None;
+            return;
+        };
+        let hit = &self.hits[i];
+        if let Some((path, WaveState::Coming(made))) = &self.wave {
+            if *path == hit.path {
+                if let Ok(wave) = made.try_recv() {
+                    self.wave = Some((hit.path.clone(), WaveState::Ready(wave)));
+                }
+                return;
+            }
+        }
+        if self.wave.as_ref().is_some_and(|(path, _)| *path == hit.path) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (path, start, end) = (hit.path.clone(), hit.loc.unwrap_or(0.0), hit.loc_end.or(hit.loc).unwrap_or(0.0));
+        std::thread::spawn(move || {
+            let file = std::path::Path::new(&path);
+            let length = crate::media::duration(file);
+            // A short recording shows whole; a long one, a few minutes around the moment.
+            let (from, to) = match length {
+                Some(length) if length <= WAVE_SPAN => (0.0, length),
+                Some(length) => {
+                    let middle = (start + end) / 2.0;
+                    let from = (middle - WAVE_SPAN / 2.0).clamp(0.0, length - WAVE_SPAN);
+                    (from, from + WAVE_SPAN)
+                }
+                None => ((start - WAVE_SPAN / 2.0).max(0.0), end + WAVE_SPAN / 2.0),
+            };
+            let slices = ((to - from) / WAVE_SLICE).ceil().clamp(1.0, 20_000.0) as usize;
+            let wave = crate::media::loudness(file, from, to, slices)
+                .map(|levels| Wave { from, to, length, levels })
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(wave);
+        });
+        self.wave = Some((hit.path.clone(), WaveState::Coming(rx)));
     }
 
     /// Scroll the preview by `rows` (clamped when drawn).
@@ -432,6 +587,14 @@ impl App {
         if self.preview.as_ref().is_some_and(|(k, _)| *k == key) {
             return;
         }
+        let place = (hit.path.clone(), hit.loc.map(|l| l as i64));
+        if self.shown.as_ref() != Some(&place) {
+            self.page_shift = 0;
+            if self.player.as_ref().is_some_and(|p| p.path != hit.path) {
+                self.player = None;
+            }
+            self.shown = Some(place);
+        }
         let preview = Preview::load(hit, &query_terms(&self.query));
         self.preview = Some((key, preview));
         self.scroll.set(None);
@@ -449,18 +612,26 @@ impl App {
         let Some(i) = self.selected_hit().filter(|&i| self.shows_picture(self.hits[i].kind)) else {
             return;
         };
+        let hit = &self.hits[i];
+        if hit.kind == Kind::Pdf && self.pdf_length.as_ref().is_none_or(|(p, _)| *p != hit.path) {
+            let length = crate::extract::pdf_page_count(std::path::Path::new(&hit.path)).unwrap_or(usize::MAX);
+            self.pdf_length = Some((hit.path.clone(), length));
+        }
+        let page = self.shown_page(hit);
+        let hit = &self.hits[i];
         let picker = self.picker.get_or_insert_with(ask_terminal);
-        let area = self.areas.get().preview;
+        let mut area = self.areas.get().preview;
+        // A video's frame leaves room for its waveform below.
+        if hit.kind == Kind::Video {
+            area.height = area.height.saturating_sub(WAVE_ROWS);
+        }
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let hit = &self.hits[i];
         let key = PageKey {
             path: hit.path.clone(),
             // A page number, or a video's moment in tenths of a second.
-            page: hit
-                .loc
-                .map_or(1, |l| if hit.kind == Kind::Video { (l * 10.0) as usize } else { l.round().max(1.0) as usize }),
+            page: if hit.kind == Kind::Video { (hit.loc.unwrap_or(0.0) * 10.0) as usize } else { page },
             width: area.width,
             height: area.height,
         };

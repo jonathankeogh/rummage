@@ -55,6 +55,43 @@ pub fn duration(path: &Path) -> Option<f64> {
     probe(path, "format=duration").ok()?.trim().parse().ok().filter(|d: &f64| d.is_finite() && *d > 0.0)
 }
 
+/// A stretch of sound for a waveform: how loud each of `slices` equal parts of `from`..`to` seconds is, from 0 (silent)
+/// to 1 (as loud as its loudest 1%). Decoded at a low rate, so minutes take a fraction of a second.
+pub fn loudness(path: &Path, from: f64, to: f64, slices: usize) -> Result<Vec<f32>> {
+    const RATE: usize = 4000;
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-ss", &format!("{from:.3}"), "-t", &format!("{:.3}", (to - from).max(0.1))])
+        .arg("-i")
+        .arg(path)
+        .args(["-vn", "-ac", "1", "-ar", &RATE.to_string(), "-f", "s16le", "-"])
+        .stderr(Stdio::null())
+        .output()
+        .context("can't run ffmpeg")?;
+    let samples: Vec<f32> =
+        output.stdout.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect();
+    if samples.is_empty() {
+        bail!("no sound in {}", path.display());
+    }
+    let wanted = ((to - from) * RATE as f64) as usize;
+    let per_slice = (wanted.max(samples.len()) as f64 / slices.max(1) as f64).max(1.0);
+    let mut levels: Vec<f32> = (0..slices)
+        .map(|i| {
+            let start = (i as f64 * per_slice) as usize;
+            let end = (((i + 1) as f64 * per_slice) as usize).min(samples.len());
+            let part = samples.get(start..end).unwrap_or(&[]);
+            if part.is_empty() { 0.0 } else { (part.iter().map(|s| s * s).sum::<f32>() / part.len() as f32).sqrt() }
+        })
+        .collect();
+    // Scaled linearly to the loudest 1% (a square root, or the single loudest slice, flattens speech into a block).
+    let mut sorted = levels.clone();
+    sorted.sort_by(f32::total_cmp);
+    let loud = sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)].max(1e-4);
+    for level in &mut levels {
+        *level = (*level / loud).min(1.0);
+    }
+    Ok(levels)
+}
+
 /// Which kinds of streams it has: (audio, video).
 pub fn streams(path: &Path) -> (bool, bool) {
     let text = probe(path, "stream=codec_type").unwrap_or_default();
@@ -309,6 +346,30 @@ mod tests {
         }
         assert_eq!(average_hash(&flat), average_hash(&flat.clone()));
         assert!((average_hash(&flat) ^ average_hash(&split)).count_ones() > 4);
+    }
+
+    #[test]
+    fn loudness_follows_the_sound() {
+        if !available() {
+            eprintln!("skipped: no ffmpeg");
+            return;
+        }
+        // 2 s of silence, then 2 s of tone.
+        let dir = std::env::temp_dir().join(format!("rummage-loudness-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("half.wav");
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=2", "-f", "lavfi", "-i"])
+            .args(["sine=frequency=440:sample_rate=16000:duration=2", "-filter_complex", "[0][1]concat=n=2:v=0:a=1"])
+            .arg(&wav)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let levels = loudness(&wav, 0.0, 4.0, 8).unwrap();
+        assert_eq!(levels.len(), 8);
+        assert!(levels[..3].iter().all(|l| *l < 0.05), "{levels:?}");
+        assert!(levels[5..].iter().all(|l| *l > 0.8), "{levels:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

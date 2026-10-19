@@ -319,7 +319,37 @@ fn interface(dir: &PathBuf) -> Result<()> {
 }
 
 fn status(dir: &PathBuf) -> Result<()> {
-    let store = Store::open(dir)?;
+    // An index that can't be used (made by another version) still leaves the rest worth showing.
+    match Store::open(dir) {
+        Ok(store) => index_status(dir, &store)?,
+        Err(error) => println!("index: {}\n  {error:#}", tilde(dir)),
+    }
+    match ModelFiles::locate() {
+        Ok(models) => println!("model files: {}", tilde(models.text.parent().unwrap_or(&models.text))),
+        Err(error) => println!("model files: missing\n{error}"),
+    }
+    let backend = if cfg!(target_os = "macos") {
+        "Metal"
+    } else if cfg!(feature = "cuda") {
+        "CUDA"
+    } else if cfg!(feature = "vulkan") {
+        "Vulkan"
+    } else {
+        "CPU"
+    };
+    println!("runs on: {backend}");
+    println!("tools (optional; each adds a kind of file or a way to open one):");
+    for (found, name, adds, hint) in tools() {
+        match found {
+            Some(which) => println!("  {name:<10} {:<17} {adds}", format!("found {which}")),
+            None => println!("  {name:<10} {:<17} {adds}: {hint}", "missing"),
+        }
+    }
+    Ok(())
+}
+
+/// The index's folders, files by kind and state, size and service.
+fn index_status(dir: &PathBuf, store: &Store) -> Result<()> {
     println!("index: {}", tilde(&store.file));
     let roots = store.roots()?;
     println!(
@@ -338,13 +368,9 @@ fn status(dir: &PathBuf) -> Result<()> {
         statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
     for row in rows {
         let (kind, state, count) = row?;
-        println!("  {kind:<5} {state:<8} {count}");
+        println!("  {kind:<10} {state:<8} {count}");
     }
     println!("model: {}", store.meta("fingerprint")?.unwrap_or_default());
-    match ModelFiles::locate() {
-        Ok(models) => println!("model files: {}", tilde(models.text.parent().unwrap_or(&models.text))),
-        Err(error) => println!("model files: missing\n{error}"),
-    }
     let size = std::fs::metadata(&store.file).map(|m| m.len()).unwrap_or(0);
     println!("size: {:.1} MB", size as f64 / 1e6);
     match serve::Client::connect(dir).and_then(|mut c| c.request(&serve::Request::Ping)) {
@@ -352,4 +378,56 @@ fn status(dir: &PathBuf) -> Result<()> {
         Err(_) => println!("search service: not running (a search starts it)"),
     }
     Ok(())
+}
+
+/// The programs rummage uses when they're there: whether each is found (and which), what it adds, how to get it.
+fn tools() -> Vec<(Option<String>, &'static str, &'static str, &'static str)> {
+    let first = |names: &[&str]| names.iter().find(|n| paths::on_path(n)).map(|n| n.to_string());
+    let mut tools = vec![
+        (
+            extract::pdf_tools().then(|| "pdftotext".to_string()),
+            "poppler",
+            "PDFs, page by page",
+            extract::PDF_TOOLS_HINT,
+        ),
+        (
+            rummage::ocr::available().then(|| "tesseract".to_string()),
+            "tesseract",
+            "words in screenshots and scans",
+            rummage::ocr::HINT,
+        ),
+        (
+            rummage::media::available().then(|| "ffmpeg".to_string()),
+            "ffmpeg",
+            "recordings and videos",
+            rummage::media::HINT,
+        ),
+        (
+            rummage::picture::heic_tool().map(String::from),
+            "libheif",
+            "iPhone photos (HEIC)",
+            rummage::picture::HEIC_HINT,
+        ),
+        (
+            first(&["mpv", "ffplay"]),
+            "player",
+            "listening in the interface (^s)",
+            "install mpv (brew install mpv, apt install mpv), or ffmpeg's ffplay",
+        ),
+        (
+            first(&["mpv", "vlc"]),
+            "mpv, vlc",
+            "opening a recording at the moment (⏎)",
+            "install mpv or VLC; otherwise it opens from the start",
+        ),
+    ];
+    if !cfg!(target_os = "macos") {
+        tools.push((
+            first(&["zathura", "evince", "okular"]),
+            "viewer",
+            "opening a PDF at the page (⏎)",
+            "install zathura, evince or okular; otherwise it opens at the first page",
+        ));
+    }
+    tools
 }

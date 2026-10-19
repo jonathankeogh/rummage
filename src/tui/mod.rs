@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod backend;
+pub mod player;
 pub mod preview;
 pub mod ui;
 
@@ -59,6 +60,7 @@ fn event_loop(terminal: &mut Term, app: &mut App, responses: &std::sync::mpsc::R
         }
         app.refresh_preview();
         app.refresh_page_image();
+        app.refresh_wave();
         terminal.draw(|frame| ui::render(frame, app))?;
         // Poll briefly so results and the spinner show up without a key press.
         if !event::poll(Duration::from_millis(60))? {

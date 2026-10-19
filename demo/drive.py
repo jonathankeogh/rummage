@@ -15,15 +15,17 @@ import time
 import tty
 
 # (text to type, or a key; seconds to wait after it)
-CTRL_U, CTRL_V = "\x15", "\x16"
+CTRL_U, CTRL_V, CTRL_S, RIGHT = "\x15", "\x16", "\x13", "\x1b[C"
 STEPS = [
     (None, 1.2),
     ("dog playing at the beach", 3.0),
     (CTRL_U, 0.3),
     ("late fee if the rent is paid late", 2.4),
-    (CTRL_V, 2.6),
+    (CTRL_V, 2.2),
+    (RIGHT, 1.6),
     (CTRL_U, 0.3),
-    ("how long does caffeine stay in your body", 3.0),
+    ("how long does caffeine stay in your body", 2.0),
+    (CTRL_S, 3.6),
     (CTRL_U, 0.3),
     ("card declined", 3.0),
     (CTRL_U, 0.3),
@@ -37,7 +39,7 @@ STEPS = [
 
 def duration() -> float:
     """Seconds the whole script takes (for the recorder)."""
-    return sum(wait + (len(text) * 0.075 if text and len(text) > 1 else 0) for text, wait in STEPS)
+    return sum(wait + (len(text) * 0.075 if text and len(text) > 1 and text[0] != "\x1b" else 0) for text, wait in STEPS)
 
 
 if len(sys.argv) > 1 and sys.argv[1] == "--duration":
@@ -86,7 +88,7 @@ try:
     while go and not os.path.exists(go) and time.time() - started < 60:
         pump(0.05)
     for text, wait in STEPS:
-        if text and len(text) > 1:
+        if text and len(text) > 1 and not text.startswith("\x1b"):
             for c in text:
                 os.write(master, c.encode())
                 pump(random.uniform(0.045, 0.105))

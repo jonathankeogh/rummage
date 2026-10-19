@@ -1,6 +1,6 @@
 //! Drawing the three panes: results, preview, and the path/why strip, plus the help overlay.
 
-use super::app::{App, Areas, Metrics};
+use super::app::{App, Areas, Metrics, WAVE_ROWS, WaveState};
 use super::preview::{Preview, why};
 use crate::paths::tilde;
 use crate::search::Hit;
@@ -19,13 +19,15 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const HINTS: &str = " ↑↓ move  ⇧↑↓ scroll  ⏎ open  ^o reveal  ^y copy  tab kind  F1 help  esc quit ";
 const NOTICE_FOR: Duration = Duration::from_secs(2);
 
-const HELP: [(&str, &str); 12] = [
+const HELP: [(&str, &str); 14] = [
     ("type", "search as you type (\"code:\" first searches code)"),
     ("↑ ↓  ^p ^n", "move through results"),
     ("⇧↑ ⇧↓  PgUp PgDn", "scroll the preview"),
     ("mouse", "click a result, click again to open; wheel scrolls"),
     ("⏎", "open the file ($EDITOR for code)"),
-    ("^v", "PDFs: switch between the page's text and a picture of it"),
+    ("^v", "PDFs: the page's text or the page; pictures: the picture or its words"),
+    ("←→  PgUp PgDn", "a PDF's page view: other pages"),
+    ("^s  ←→", "listen to a recording or video from its moment; skip 10 s"),
     ("^o", "reveal in the file manager"),
     ("^y", "copy the path (works over ssh)"),
     ("tab", "show all, docs or code"),
@@ -151,6 +153,24 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
     let (Some(i), Some(preview)) = (app.selected_hit(), app.preview()) else { return };
     let hit = &app.hits[i];
     let page_view = app.shows_picture(hit.kind);
+    // Sound gets a waveform: under a video's frame, at the top for a recording.
+    let full_area = preview_area;
+    let (preview_area, wave_area) = match hit.kind {
+        Kind::Video => {
+            let [top, wave] = Layout::vertical([Constraint::Min(1), Constraint::Length(WAVE_ROWS)]).areas(full_area);
+            (top, Some(wave))
+        }
+        Kind::Audio => {
+            // A recording has the pane to itself: a taller waveform.
+            let height = (full_area.height / 2).clamp(WAVE_ROWS, 14);
+            let [wave, rest] = Layout::vertical([Constraint::Length(height), Constraint::Min(0)]).areas(full_area);
+            (rest, Some(wave))
+        }
+        _ => (full_area, None),
+    };
+    if let Some(wave_area) = wave_area {
+        render_wave(frame, app, hit, wave_area);
+    }
     if page_view {
         match app.page_image.borrow_mut().as_mut() {
             Some((_, Ok(protocol))) => {
@@ -165,6 +185,8 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
     }
     match preview {
         _ if page_view => {}
+        // The waveform says it all for a recording.
+        _ if hit.kind == Kind::Audio => {}
         Preview::Text(shown) | Preview::Code(shown) => {
             let paragraph = Paragraph::new(shown.lines.clone()).wrap(Wrap { trim: false });
             // Counting wrapped rows means laying out every line: done once per preview and width.
@@ -205,18 +227,132 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     let mut detail = why(hit);
-    if hit.kind == Kind::Pdf {
-        detail += if page_view { " · ^v text" } else { " · ^v page" };
+    if hit.kind == Kind::Pdf && page_view {
+        let length = app.pdf_length.as_ref().filter(|(p, _)| *p == hit.path).map(|(_, n)| *n);
+        let page = app.shown_page(hit);
+        detail += &match length {
+            Some(n) if n != usize::MAX => format!(" · p {page}/{n} · ←→ pages · ^v text"),
+            _ => format!(" · p {page} · ←→ pages · ^v text"),
+        };
+    } else if hit.kind == Kind::Pdf {
+        detail += " · ^v page";
     } else if hit.kind.is_picture() {
         detail += if page_view { " · ^v words" } else { " · ^v picture" };
     } else if hit.kind.is_timed() {
-        detail += " · ⏎ plays from here";
+        detail += " · ⏎ your player";
     }
     let info = vec![
         Line::from(Span::styled(tilde(Path::new(&hit.path)), Style::default().add_modifier(Modifier::BOLD))),
         Line::from(Span::styled(detail, Style::default().fg(Color::DarkGray))),
     ];
     frame.render_widget(Paragraph::new(info), info_inner);
+}
+
+/// The selected recording's or video's sound: a waveform with the matched stretch marked, where listening has got to,
+/// and the keys.
+fn render_wave(frame: &mut Frame, app: &App, hit: &Hit, area: Rect) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let wave = match &app.wave {
+        Some((path, WaveState::Ready(Ok(wave)))) if *path == hit.path => wave,
+        Some((path, WaveState::Ready(Err(e)))) if *path == hit.path => {
+            frame.render_widget(Paragraph::new(format!("no waveform: {e}")).style(dim), area);
+            return;
+        }
+        _ => {
+            frame.render_widget(Paragraph::new("drawing the sound…").style(dim), area);
+            return;
+        }
+    };
+    let width = area.width as usize;
+    if width < 8 || area.height < 4 {
+        return;
+    }
+    let player = app.player.as_ref().filter(|p| p.path == hit.path);
+    let at = player.map(|p| p.position());
+    let heard_from = player.map_or(0.0, |p| p.heard_from);
+    let (start, end) = (hit.loc.unwrap_or(0.0), hit.loc_end.or(hit.loc).unwrap_or(0.0));
+    let column = |seconds: f64| ((seconds - wave.from) / (wave.to - wave.from) * width as f64) as isize;
+    let playhead = at.map(column);
+    let mut lines: Vec<Line> = Vec::new();
+
+    // What matched, and how listening is going.
+    let mut top = vec![Span::styled(
+        format!(
+            "{} {}–{}",
+            if hit.kind == Kind::Video { "frame and sound" } else { "sound" },
+            clock(start),
+            clock(end)
+        ),
+        Style::default().fg(Color::Yellow),
+    )];
+    top.push(Span::styled(
+        match (player, at) {
+            (Some(p), Some(at)) if p.is_playing() => format!("   ▶ {}   ^s pause · ←→ 10 s", clock(at)),
+            (Some(_), Some(at)) => format!("   ❚❚ {}   ^s play on · ←→ 10 s", clock(at)),
+            _ => format!("   ^s listen from {}", clock(start)),
+        },
+        dim,
+    ));
+    lines.push(Line::from(top));
+
+    // The waveform, mirrored about its middle in half-cell steps: each column the slices under it, averaged.
+    let rows = (area.height as usize - 2) / 2 * 2;
+    let half = rows / 2;
+    let slices = wave.levels.len();
+    let levels: Vec<f32> = (0..width)
+        .map(|c| {
+            let a = (c * slices / width).min(slices - 1);
+            let b = ((c + 1) * slices / width).clamp(a + 1, slices);
+            wave.levels[a..b].iter().sum::<f32>() / (b - a) as f32
+        })
+        .collect();
+    for row in 0..rows {
+        // Cells from the middle line, and which way this row faces.
+        let (from_middle, upper) = if row < half { (half - 1 - row, true) } else { (row - half, false) };
+        let spans: Vec<Span> = levels
+            .iter()
+            .enumerate()
+            .map(|(c, level)| {
+                let reach = if *level > 0.01 { ((level * rows as f32).round() as usize).max(1) } else { 0 };
+                let glyph = match reach.saturating_sub(from_middle * 2) {
+                    0 => " ",
+                    1 if upper => "▄",
+                    1 => "▀",
+                    _ => "█",
+                };
+                let seconds = wave.from + (c as f64 + 0.5) / width as f64 * (wave.to - wave.from);
+                let colour = if playhead == Some(c as isize) {
+                    Color::White
+                } else if at.is_some_and(|at| seconds >= heard_from && seconds <= at) {
+                    Color::Cyan
+                } else if seconds >= start && seconds <= end.max(start) {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                };
+                Span::styled(glyph, Style::default().fg(colour))
+            })
+            .collect();
+        lines.push(Line::from(spans));
+    }
+
+    // The times at each end, and where listening is.
+    let (left, right) = (clock(wave.from), clock(wave.to));
+    let mut axis: Vec<char> = format!("{left:<w$}", w = width).chars().take(width).collect();
+    for (k, ch) in right.chars().enumerate() {
+        if let Some(slot) = axis.get_mut(width - right.chars().count() + k) {
+            *slot = ch;
+        }
+    }
+    if let Some(c) = playhead.filter(|c| (0..width as isize).contains(c)) {
+        axis[c as usize] = '▲';
+    }
+    lines.push(Line::styled(axis.into_iter().collect::<String>(), dim));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn clock(seconds: f64) -> String {
+    crate::media::clock(seconds)
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
