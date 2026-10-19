@@ -78,6 +78,11 @@ exact text (or a `/regex/`) in the text and code files themselves, newest first,
 also finds files too big to index. One score orders both: meaning, plus a bonus for the query's words or a grep match,
 plus a little for being recent. The interface shows meaning results at once and merges grep's as they arrive.
 
+Words match with their English endings ("invoices" finds "invoice"); the word you're still typing matches as the start
+of longer words ("invo" finds "invoice"). A query made of codes (`INV-20931`, `0x80070005`, `ECONNRESET`,
+`refreshAccessToken`, `max_retries`) is an exact lookup: the words count double and meaning half. In a `code:` search
+words count half as much as elsewhere, since code repeats the same words everywhere.
+
 Text is cut into ~1,800-character passages, each embedded by EmbeddingGemma 2 through llama.cpp (pinned in
 `vendor/llama.cpp`, built by `crates/llama-sys`). One SQLite file holds a vector per passage plus an FTS5 keyword
 index. A search scores every vector, keeps passages that stand out for that query, and boosts files that contain the
@@ -89,7 +94,9 @@ query's words.
 `tests/reference_vectors.rs` (rummage's vectors must match DigUp's reference vectors, cosine ≥ 0.999) and
 `tests/end_to_end.rs` (index, re-sync, long files in two passes, the service, grep, crash recovery); without them
 (as on CI) those skip. `scripts/eval.py` measures ranking on DigUp's eval sets: build the text parts of its testbed
-somewhere outside a code project (e.g. `~/.cache/rummage-eval`) and see the script's header.
+somewhere outside a code project (e.g. `~/.cache/rummage-eval`) and see the script's header. `scripts/sweep.py` runs
+every eval set with one ranking weight changed at a time (each weight can be overridden by `RUMMAGE_<NAME>`, e.g.
+`RUMMAGE_WORD_WEIGHT=1.5`).
 
 ## License
 

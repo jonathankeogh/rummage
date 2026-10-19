@@ -65,12 +65,13 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options) -> Resul
         }
     }
     let on_disk: std::collections::HashSet<&Path> = found.iter().map(|f| f.path.as_path()).collect();
-    for root in roots {
-        for (id, path) in store.files_under(root)? {
-            if !on_disk.contains(path.as_path()) {
-                store.remove_file(id)?;
-                summary.removed += 1;
-            }
+    // Gone: deleted, excluded, or under no indexed folder any more. A folder missing altogether (an unplugged drive)
+    // keeps its files until it's back.
+    let missing: Vec<&PathBuf> = roots.iter().filter(|root| !root.exists()).collect();
+    for (id, path) in store.files_under(Path::new("/"))? {
+        if !on_disk.contains(path.as_path()) && !missing.iter().any(|root| path.starts_with(root)) {
+            store.remove_file(id)?;
+            summary.removed += 1;
         }
     }
     tx.commit()?;
@@ -389,4 +390,30 @@ fn embed_scanned_page(embedder: &mut Embedder, path: &Path, page: usize) -> Resu
 pub fn duration(started: Instant) -> String {
     let seconds = started.elapsed().as_secs_f64();
     if seconds < 90.0 { format!("{seconds:.1} s") } else { format!("{:.0} min", seconds / 60.0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn files_leave_with_their_folder_but_not_with_an_unplugged_drive() {
+        let dir = std::env::temp_dir().join(format!("rummage-sync-{}", std::process::id()));
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        for folder in [&a, &b] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("note.md"), "A note about the garden and what to plant in spring.").unwrap();
+        }
+        let store = Store::open(&dir.join("index")).unwrap();
+        let options = crawl::Options { code: false, excluded: Vec::new() };
+        assert_eq!(sync(&store, &[a.clone(), b.clone()], &options).unwrap().new_or_changed, 2);
+        // b is no longer indexed: its file goes.
+        assert_eq!(sync(&store, std::slice::from_ref(&a), &options).unwrap().removed, 1);
+        // a is missing altogether, as an unplugged drive would be: its file stays.
+        let moved = dir.join("a-away");
+        std::fs::rename(&a, &moved).unwrap();
+        assert_eq!(sync(&store, std::slice::from_ref(&a), &options).unwrap().removed, 0);
+        assert_eq!(store.files_under(&a).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

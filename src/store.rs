@@ -107,7 +107,13 @@ impl Kind {
 }
 
 /// Which model and pipeline made the vectors. An index made with another one must embed again.
-pub const FINGERPRINT: &str = "embeddinggemma-2@bfcd298+llama.cpp-b11461/vectors1";
+pub const FINGERPRINT: &str = "embeddinggemma-2@bfcd298+llama.cpp-b11461/vectors1/stemmed-words";
+
+/// The keyword index: file names and text, contentless (the text stays in the files), English endings stemmed
+/// ("invoices" finds "invoice"), accents ignored. A change here changes `FINGERPRINT`: its text can't be read back.
+const WORDS_TABLE: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS words USING fts5(
+    name, text, content='', contentless_delete=1, tokenize='porter unicode61 remove_diacritics 2'
+);";
 
 pub struct Store {
     pub db: Connection,
@@ -152,11 +158,9 @@ impl Store {
                  modality TEXT NOT NULL DEFAULT 'text',  -- text | image | audio: what the vector was made from
                  loc_end REAL                  -- where a stretch of sound or video ends, in seconds
              );
-             CREATE INDEX IF NOT EXISTS segments_file ON segments(file_id);
-             CREATE VIRTUAL TABLE IF NOT EXISTS words USING fts5(
-                 name, text, content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 2'
-             );",
+             CREATE INDEX IF NOT EXISTS segments_file ON segments(file_id);",
         )?;
+        db.execute_batch(WORDS_TABLE)?;
         // Indexes made before long files went in steps lack the progress columns.
         let columns: Vec<String> = db
             .prepare("SELECT name FROM pragma_table_info('files')")?
@@ -348,9 +352,10 @@ impl Store {
     /// Drops every vector so everything embeds again (after a model change).
     pub fn reset_vectors(&self) -> Result<()> {
         self.db.execute_batch(
-            "DELETE FROM words; DELETE FROM segments;
+            "DROP TABLE IF EXISTS words; DELETE FROM segments;
              UPDATE files SET state = 'pending', error = NULL, parts_done = NULL, parts_total = NULL;",
         )?;
+        self.db.execute_batch(WORDS_TABLE)?;
         self.set_meta("fingerprint", FINGERPRINT)
     }
 }

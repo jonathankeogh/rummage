@@ -43,12 +43,19 @@ pub enum Request {
         kinds: Option<Vec<Kind>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zgate: Option<f64>,
+        /// The query is still being typed: its last word matches as the start of longer words.
+        #[serde(default, skip_serializing_if = "is_false")]
+        typing: bool,
     },
     Quit,
 }
 
 fn yes() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 fn is_true(b: &bool) -> bool {
@@ -139,7 +146,7 @@ impl Engine {
     /// A search as typed: "code: …" searches code; otherwise `kinds`, or documents and PDFs when none are given.
     /// A whole search, grep included (it waits for grep, up to `GREP_DEADLINE`).
     pub fn search(&mut self, text: &str, kinds: Option<&[Kind]>, limit: usize, z_gate: f64) -> Result<Vec<Hit>> {
-        let (hits, pending) = self.search_start(text, kinds, limit, z_gate)?;
+        let (hits, pending) = self.search_start(text, kinds, limit, z_gate, false)?;
         let Some(pending) = pending else { return Ok(hits) };
         let deadline = Instant::now() + GREP_DEADLINE;
         let files = crate::crawl::grep_files(&pending.roots, pending.code);
@@ -155,6 +162,7 @@ impl Engine {
         kinds: Option<&[Kind]>,
         limit: usize,
         z_gate: f64,
+        typing: bool,
     ) -> Result<(Vec<Hit>, Option<Pending>)> {
         self.refresh()?;
         let (query, code) = search::split_code_prefix(text);
@@ -167,7 +175,8 @@ impl Engine {
             return Ok((Vec::new(), None));
         }
         let vector = self.embedder.embed_texts(&[prompts::query(query)])?.pop();
-        let options = search::Options { kinds: Some(kinds.clone()), limit, z_gate, ..Default::default() };
+        let options =
+            search::Options { kinds: Some(kinds.clone()), limit, z_gate, prefix_last: typing, ..Default::default() };
         let prepared = search::prepare(&self.store, &self.vectors, query, vector.as_deref(), &options)?;
         let hits = search::rank(&self.store, &self.vectors, &prepared, &[], search::now())?;
         // Grep reads text and code files; PDFs and pictures alone have nothing for it.
@@ -336,9 +345,9 @@ fn handle(
                 let vectors = engine.lock().unwrap().vector_count();
                 send(&Response { ok: true, vectors, ..Default::default() })?;
             }
-            Request::Search { id, query, limit, grep, kinds, zgate } => {
+            Request::Search { id, query, limit, grep, kinds, zgate, typing } => {
                 let started_search =
-                    engine.lock().unwrap().search_start(&query, kinds.as_deref(), limit, zgate.unwrap_or(2.0));
+                    engine.lock().unwrap().search_start(&query, kinds.as_deref(), limit, zgate.unwrap_or(2.0), typing);
                 let vectors = engine.lock().unwrap().vector_count();
                 let (hits, pending) = match started_search {
                     Ok(result) => result,
@@ -433,13 +442,21 @@ impl Client {
         if let Ok(client) = Client::connect(dir) {
             return Ok(client);
         }
-        start_in_background(dir)?;
+        let log_start = std::fs::metadata(log_path(dir)).map_or(0, |m| m.len());
+        let mut service = start_in_background(dir)?;
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
             if let Ok(mut client) = Client::connect(dir) {
                 if client.request(&Request::Ping).is_ok_and(|r| r.ok) {
                     return Ok(client);
                 }
+            }
+            // A service that stopped at once (an index from another version, a missing model) says why in its log.
+            if service.try_wait()?.is_some() && Client::connect(dir).is_err() {
+                let log = std::fs::read(log_path(dir)).unwrap_or_default();
+                let said = String::from_utf8_lossy(log.get(log_start as usize..).unwrap_or_default());
+                let reason = said.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("it stopped");
+                bail!("the search service didn't start: {}", reason.trim_start_matches("rummage: "));
             }
             if Instant::now() > deadline {
                 bail!(
@@ -490,7 +507,7 @@ impl Client {
         zgate: f64,
         grep: bool,
     ) -> Result<Response> {
-        Ok(self.search_stream(query, kinds, limit, zgate, grep, &mut |_| true)?.expect("never abandoned"))
+        Ok(self.search_stream(query, kinds, limit, zgate, grep, false, &mut |_| true)?.expect("never abandoned"))
     }
 
     /// A search whose first response goes to `first` before the final one arrives. If `first` returns false the
@@ -502,11 +519,12 @@ impl Client {
         limit: usize,
         zgate: f64,
         grep: bool,
+        typing: bool,
         first: &mut dyn FnMut(&Response) -> bool,
     ) -> Result<Option<Response>> {
         self.last_id += 1;
         let id = self.last_id;
-        let request = Request::Search { id, query: query.to_string(), limit, grep, kinds, zgate: Some(zgate) };
+        let request = Request::Search { id, query: query.to_string(), limit, grep, kinds, zgate: Some(zgate), typing };
         writeln!(self.writer, "{}", serde_json::to_string(&request)?)?;
         loop {
             let response = self.read()?;
@@ -546,7 +564,8 @@ impl ServiceBackend {
             Some(client) => client,
             None => self.client.insert(Client::connect_or_start(&self.dir)?),
         };
-        let done = client.search_stream(query, None, limit, 2.0, true, &mut |r| first(r.hits.clone()))?;
+        // Searches here are made as the query is typed.
+        let done = client.search_stream(query, None, limit, 2.0, true, true, &mut |r| first(r.hits.clone()))?;
         Ok(done.map(|r| r.hits))
     }
 }
@@ -580,7 +599,7 @@ pub fn log_path(dir: &Path) -> PathBuf {
 
 /// Starts `rummage serve` for `dir` detached from this terminal (its own process group, so Ctrl-C here doesn't stop
 /// it), logging to `serve.log`.
-fn start_in_background(dir: &Path) -> Result<()> {
+fn start_in_background(dir: &Path) -> Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     std::fs::create_dir_all(dir)?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(log_path(dir))?;
@@ -593,8 +612,7 @@ fn start_in_background(dir: &Path) -> Result<()> {
         .stderr(log)
         .process_group(0)
         .spawn()
-        .context("can't start the search service")?;
-    Ok(())
+        .context("can't start the search service")
 }
 
 #[cfg(test)]
@@ -610,6 +628,7 @@ mod tests {
             grep: true,
             kinds: Some(vec![Kind::Doc]),
             zgate: None,
+            typing: false,
         };
         let line = serde_json::to_string(&request).unwrap();
         assert_eq!(line, r#"{"op":"search","id":7,"query":"dog","limit":5,"kinds":["doc"]}"#);

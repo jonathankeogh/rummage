@@ -176,9 +176,26 @@ fn read_document(path: &Path, kind: Kind) -> anyhow::Result<Option<String>> {
     Ok(read_text(path)?)
 }
 
-/// The query's words to mark: the same words the search matched (a leading "code:" is not one).
+/// The query's words to mark: the same words the search matched (a leading "code:" is not one). The word still being
+/// typed (the query doesn't end in a space) ends in `*`: it marks the words it starts, as it matches them.
 pub fn query_terms(query: &str) -> Vec<String> {
-    search::terms(search::split_code_prefix(query).0)
+    let mut terms = search::terms(search::split_code_prefix(query).0);
+    if let Some(last) = terms.last_mut().filter(|t| query.ends_with(t.as_str()) && t.chars().all(char::is_alphanumeric))
+    {
+        last.push('*');
+    }
+    terms
+}
+
+/// A word less its English ending, roughly as the keyword index's stemmer sees it: "invoices", "invoiced" and
+/// "invoice" share "invoic"; "cat" and "category" don't.
+fn root(word: &str) -> &str {
+    for ending in ["ing", "ed", "es", "s", "e"] {
+        if let Some(stem) = word.strip_suffix(ending).filter(|stem| stem.chars().count() >= 3) {
+            return stem;
+        }
+    }
+    word
 }
 
 /// The file's text, or `None` for binary files.
@@ -239,25 +256,54 @@ fn is_converted(path: &Path, kind: Kind) -> bool {
     ext == "ipynb" || (kind == Kind::Doc && ["docx", "odt", "html", "htm", "xhtml"].contains(&ext.as_str()))
 }
 
-/// Byte ranges of `line` where any of `terms` (lower-case) occurs as a whole word, ignoring case; overlapping ranges
-/// are merged.
+/// Byte ranges of `line` where any of `terms` (lower-case) occurs, ignoring case; overlapping ranges are merged. A
+/// word matches a term with the same root ("invoices" marks "invoice"), or that it starts when the term ends in `*`.
+/// A term with punctuation (a code: "inv-20931", "max_retries") matches exactly, as a whole.
 pub fn find_matches(line: &str, terms: &[String]) -> Vec<(usize, usize)> {
     // One lower-case char per char keeps byte offsets of the original line.
     let chars: Vec<(usize, char, usize)> =
         line.char_indices().map(|(i, c)| (i, c.to_lowercase().next().unwrap_or(c), c.len_utf8())).collect();
     let word_char = |i: usize| chars.get(i).is_some_and(|c| c.1.is_alphanumeric());
+    let span = |start: usize, end: usize| (chars[start].0, chars[end - 1].0 + chars[end - 1].2);
     let mut ranges: Vec<(usize, usize)> = Vec::new();
+    // The line's words, as lower-case strings with their char ranges.
+    let mut words: Vec<(usize, usize, String)> = Vec::new();
+    let mut start = None;
+    for i in 0..=chars.len() {
+        match (start, word_char(i)) {
+            (None, true) => start = Some(i),
+            (Some(s), false) => {
+                words.push((s, i, chars[s..i].iter().map(|c| c.1).collect()));
+                start = None;
+            }
+            _ => {}
+        }
+    }
     for term in terms {
+        let (term, prefix) = match term.strip_suffix('*') {
+            Some(t) => (t, true),
+            None => (term.as_str(), false),
+        };
+        if term.is_empty() {
+            continue;
+        }
+        if term.chars().all(char::is_alphanumeric) {
+            for (s, e, word) in &words {
+                if (prefix && word.starts_with(term)) || word == term || root(word) == root(term) {
+                    ranges.push(span(*s, *e));
+                }
+            }
+            continue;
+        }
         let term: Vec<char> = term.chars().collect();
-        if term.is_empty() || term.len() > chars.len() {
+        if term.len() > chars.len() {
             continue;
         }
         for start in 0..=chars.len() - term.len() {
             let end = start + term.len();
             let whole = (start == 0 || !word_char(start - 1)) && !word_char(end);
             if whole && chars[start..end].iter().zip(&term).all(|(a, b)| a.1 == *b) {
-                let last = chars[end - 1];
-                ranges.push((chars[start].0, last.0 + last.2));
+                ranges.push(span(start, end));
             }
         }
     }
@@ -405,8 +451,8 @@ mod tests {
     #[test]
     fn terms_follow_the_search() {
         assert_eq!(query_terms("code: Retry a failed-call, retry"), vec!["retry", "failed", "call"]);
-        assert_eq!(query_terms("a dog on the beach"), vec!["dog", "beach"]);
-        assert_eq!(query_terms("how"), vec!["how"]);
+        assert_eq!(query_terms("a dog on the beach "), vec!["dog", "beach"]);
+        assert_eq!(query_terms("how"), vec!["how*"]);
     }
 
     #[test]
@@ -417,6 +463,15 @@ mod tests {
         assert_eq!(find_matches("how? show how-to", &["how".into()]), vec![(0, 3), (10, 13)]);
         // multi-byte text keeps byte offsets of the original
         assert_eq!(find_matches("café Dog", &["dog".into()]), vec![(6, 9)]);
+        // Endings: the same root marks the whole word; a longer word with another root doesn't.
+        assert_eq!(find_matches("Invoice, invoiced", &["invoices".into()]), vec![(0, 7), (9, 17)]);
+        assert!(find_matches("category", &["cat".into()]).is_empty());
+        // The word being typed marks the words it starts.
+        assert_eq!(query_terms("invoice nor"), vec!["invoice", "nor*"]);
+        assert_eq!(query_terms("invoice nor "), vec!["invoice", "nor"]);
+        assert_eq!(find_matches("Northwind", &["nor*".into()]), vec![(0, 9)]);
+        // Codes match exactly.
+        assert_eq!(find_matches("Invoice INV-20931.", &query_terms("INV-20931 ")), vec![(8, 17)]);
     }
 
     #[test]

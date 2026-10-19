@@ -70,6 +70,18 @@ enum Command {
     Stop,
 }
 
+/// `rummage search … | head` stops quietly when `head` has read enough, as other Unix tools do (Rust otherwise ignores
+/// SIGPIPE and the next print panics). Only for commands that print results: the service and the interface write to
+/// sockets and must outlive a peer that goes away.
+fn quiet_when_piped_output_closes() {
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    unsafe { signal(SIGPIPE, SIG_DFL) };
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("rummage: {error:#}");
@@ -79,6 +91,9 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Command::Search { .. } | Command::Status)) {
+        quiet_when_piped_output_closes();
+    }
     let dir = cli.index.clone().unwrap_or_else(paths::index_dir);
     match cli.command {
         Some(Command::Index { folders, code, exclude, reindex }) => {
@@ -230,7 +245,7 @@ fn search_command(
         let mut engine = serve::Engine::open(dir)?;
         let loaded = started.elapsed();
         let hits = if no_grep {
-            engine.search_start(&query, kinds.as_deref(), limit, zgate)?.0
+            engine.search_start(&query, kinds.as_deref(), limit, zgate, false)?.0
         } else {
             engine.search(&query, kinds.as_deref(), limit, zgate)?
         };

@@ -23,7 +23,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("queries")
 parser.add_argument("--base", required=True, help="the folder the expected paths are relative to")
 parser.add_argument("--index", required=True)
-parser.add_argument("--only", default="txt,md,markdown,pdf,docx,odt,html,htm,py,ts,tsx,swift,ipynb,js,rs,go,sh,jpg,png,wav,mp4")
+parser.add_argument("--only", default="txt,md,markdown,pdf,docx,odt,html,htm,py,ts,tsx,swift,ipynb,js,rs,go,sh,log,jpg,png,wav,mp4")
 parser.add_argument("--rummage", default=str(pathlib.Path(__file__).resolve().parent.parent / "target/release/rummage"))
 parser.add_argument("-v", "--verbose", action="store_true")
 parser.add_argument("extra", nargs="*", help="more arguments for rummage search (after --)")
@@ -41,12 +41,13 @@ def expected_places(query):
         if file.rsplit(".", 1)[-1].lower() not in kinds or not (base / file).exists():
             continue
         low, _, high = place.partition("-")
-        places[file] = (float(low), float(high or low)) if place and file.rsplit(".", 1)[-1].lower() in ("pdf", "wav", "mp4", "mov", "ts", "mp3", "m4a") else None
+        places[file] = (float(low), float(high or low)) if place else None
     return places
 
 
 def lands(hit, place):
-    if place is None:
+    # Places are pages and seconds; a code or text hit's loc is a passage number, so its line ranges aren't checked.
+    if place is None or hit.get("kind") not in ("pdf", "audio", "video"):
         return True
     loc = hit.get("loc")
     if loc is None:

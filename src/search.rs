@@ -41,21 +41,42 @@ pub struct Options {
     pub kinds: Option<HashSet<Kind>>,
     pub limit: usize,
     pub z_gate: f64,
-    pub word_weight: f64,
+    /// How much holding the query's words counts against meaning; None: `WORD_WEIGHT`, or `CODE_WORD_WEIGHT` for a
+    /// search of code alone.
+    pub word_weight: Option<f64>,
     /// How much a passage's closeness to the index's centre counts against it (see `Vectors::centrality`).
     pub hub_penalty: f64,
+    /// The query is being typed: its last word also matches as the start of longer words ("invo" finds "invoice").
+    pub prefix_last: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        // RUMMAGE_HUB_PENALTY overrides the tuned value, for evals.
-        let hub_penalty = std::env::var("RUMMAGE_HUB_PENALTY").ok().and_then(|v| v.parse().ok()).unwrap_or(HUB_PENALTY);
-        Options { kinds: None, limit: 10, z_gate: 2.0, word_weight: 2.0, hub_penalty }
+        Options {
+            kinds: None,
+            limit: 10,
+            z_gate: 2.0,
+            word_weight: None,
+            hub_penalty: tuned("HUB_PENALTY", HUB_PENALTY),
+            prefix_last: false,
+        }
     }
+}
+
+/// A ranking weight, overridden by RUMMAGE_<NAME> for evals (scripts/sweep.py); the service reads it when it starts.
+pub fn tuned(name: &str, default: f64) -> f64 {
+    std::env::var(format!("RUMMAGE_{name}")).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 /// Tuned on DigUp's evals and real folders (see `search`).
 pub const HUB_PENALTY: f64 = 1.0;
+
+/// How much holding the query's words counts (DigUp's tuned 2.0; checked again 2026-10-19 with scripts/sweep.py: 1 or
+/// less lost names and codes among pictures and recordings that look like them, 3 changed nothing).
+pub const WORD_WEIGHT: f64 = 2.0;
+/// Code's words count for less: they're everywhere in code, and a README or Makefile that mentions a few of them beat
+/// the file that does what the query says (DigUp's 1.0; on its code eval R@1 0.88 → 0.97 here, 0.5 no better).
+pub const CODE_WORD_WEIGHT: f64 = 1.0;
 
 /// Everyday searches, mixed on purpose: their mean is where queries in general sit. A passage close to it is somewhat
 /// similar to any query (a hub); a query close to it says little of its own.
@@ -311,11 +332,40 @@ const STOPWORDS: &[&str] = &[
 /// stopwords ("for", "how to") keeps them: then the words are all there is to search for.
 pub fn terms(text: &str) -> Vec<String> {
     let lower = text.to_lowercase();
-    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 2).collect();
+    // A code ("inv-20931", "v1.2.3") or a name from code ("max_retries", "app.config") stays whole, so it matches as a
+    // phrase, as it's written; other words split at punctuation ("pet-friendly" is two words).
+    let mut words: Vec<&str> = Vec::new();
+    for chunk in lower.split_whitespace() {
+        let chunk = chunk.trim_matches(|c: char| !c.is_alphanumeric());
+        let joined = chunk.contains(|c: char| !c.is_alphanumeric());
+        let code = chunk.contains(|c: char| c.is_numeric()) || chunk.contains(['_', '.', '/']);
+        if joined && code && chunk.chars().all(|c| c.is_alphanumeric() || "-_./:".contains(c)) {
+            words.push(chunk);
+        } else {
+            words.extend(chunk.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 2));
+        }
+    }
     let content: Vec<&str> = words.iter().copied().filter(|w| !STOPWORDS.contains(w)).collect();
     let chosen = if content.is_empty() { words } else { content };
     let mut seen = HashSet::new();
     chosen.into_iter().filter(|w| seen.insert(*w)).map(String::from).collect()
+}
+
+/// FTS5 patterns for the query's words, each a phrase as written. A word in no file as typed matches as the start of
+/// longer words, as the last one does while it's being typed (DigUp's): "grok" finds "Grok4" (stemming only covers
+/// endings). A word that is in the index stays whole, so "cat" doesn't bring in "category"; so does a word of two
+/// letters, the start of too many words to stand for one, unless it's the one being typed.
+fn word_patterns(store: &Store, terms: &[String], typing: bool) -> Result<Vec<String>> {
+    let mut indexed = store.db.prepare("SELECT 1 FROM words WHERE words MATCH ? LIMIT 1")?;
+    let mut patterns = Vec::new();
+    for (i, term) in terms.iter().enumerate() {
+        let phrase = format!("\"{}\"", term.replace('"', ""));
+        let whole_word = term.chars().all(char::is_alphanumeric);
+        let being_typed = typing && i + 1 == terms.len();
+        let prefix = whole_word && (being_typed || (term.chars().count() >= 3 && !indexed.exists([&phrase])?));
+        patterns.push(if prefix { format!("{phrase}*") } else { phrase });
+    }
+    Ok(patterns)
 }
 
 /// Kinds a query asks for ("a photo of …", "the screenshot with …", "… in a pdf"): a nudge, not a filter.
@@ -339,12 +389,34 @@ pub fn kind_hints(text: &str) -> HashSet<Kind> {
 /// How much a kind the query asks for counts (DigUp's +1).
 const KIND_HINT_WEIGHT: f64 = 1.0;
 
-/// Every word has a digit, and letters or 4+ characters: an invoice number, an error code. Words count for more.
-fn is_lookup(terms: &[String]) -> bool {
-    !terms.is_empty()
-        && terms.iter().all(|t| {
-            t.chars().any(|c| c.is_numeric()) && (t.chars().any(|c| c.is_alphabetic()) || t.chars().count() >= 4)
-        })
+/// Every word is a code: it has a digit (and letters or 4+ characters: an invoice number, 0x80070005), joins parts
+/// with _ . / (max_retries, app.config), is camelCase (refreshAccessToken) or is a capitalised identifier of 4+
+/// letters (ECONNRESET). A hyphenated word (payments-gw) can be part of a lookup, but alone it's as likely English
+/// (pet-friendly). Words count for more.
+fn is_lookup(text: &str) -> bool {
+    let words: Vec<&str> = text
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty() && !STOPWORDS.contains(&w.to_lowercase().as_str()))
+        .collect();
+    words.iter().all(|w| code(w).is_some()) && words.iter().any(|w| code(w) == Some(true))
+}
+
+/// Some(true) for a code, Some(false) for a hyphenated word, None for neither.
+fn code(word: &str) -> Option<bool> {
+    let chars: Vec<char> = word.chars().collect();
+    let digit = chars.iter().any(|c| c.is_numeric());
+    let letter = chars.iter().any(|c| c.is_alphabetic());
+    let joined_by = |marks: &str| {
+        chars.windows(3).any(|w| w[0].is_alphanumeric() && marks.contains(w[1]) && w[2].is_alphanumeric())
+    };
+    let camel = chars.windows(2).any(|w| w[0].is_lowercase() && w[1].is_uppercase());
+    let capitals = chars.len() >= 4 && chars.iter().all(|c| c.is_uppercase() || c.is_numeric() || *c == '_');
+    if (digit && (letter || chars.len() >= 4)) || (letter && joined_by("_./")) || camel || capitals {
+        Some(true)
+    } else {
+        (letter && joined_by("-")).then_some(false)
+    }
 }
 
 /// "code: retry with backoff" → ("retry with backoff", true): a search of code, and nothing else.
@@ -409,11 +481,7 @@ pub fn prepare(
 
     // A vague query ("for", "things") is close to where all queries sit and says little of its own: a meaning match
     // must stand out further, and counts for less, the vaguer it is. Descriptive queries (below 0) are unaffected.
-    let vagueness = query
-        .filter(|_| std::env::var("RUMMAGE_VAGUENESS").map_or(true, |v| v != "0"))
-        .and_then(|q| vectors.query_vagueness(q))
-        .unwrap_or(0.0)
-        .max(0.0);
+    let vagueness = tuned("VAGUENESS", 1.0) * query.and_then(|q| vectors.query_vagueness(q)).unwrap_or(0.0).max(0.0);
     let z_gate = options.z_gate + vagueness;
 
     // Meaning: every passage on this query's scale; each file keeps its best.
@@ -440,7 +508,7 @@ pub fn prepare(
 
     // Words: which files hold which of the query's words, best keyword match first.
     let terms = terms(text);
-    let patterns: Vec<String> = terms.iter().map(|t| format!("\"{}\"", t.replace('"', ""))).collect();
+    let patterns = word_patterns(store, &terms, options.prefix_last && text.ends_with(char::is_alphanumeric))?;
     let mut keyword: Vec<(i64, i64)> = Vec::new();
     let mut coverage: HashMap<i64, f64> = HashMap::new();
     if !patterns.is_empty() {
@@ -470,8 +538,11 @@ pub fn prepare(
         }
     }
     // An exact lookup (codes, numbers) leans on literal matches.
-    let (meaning_weight, literal_weight) =
-        if is_lookup(&terms) { (0.5, options.word_weight * 2.0) } else { (1.0, options.word_weight) };
+    let code_only = options.kinds.as_ref().is_some_and(|kinds| kinds.len() == 1 && kinds.contains(&Kind::Code));
+    let word_weight = options.word_weight.unwrap_or_else(|| {
+        if code_only { tuned("CODE_WORD_WEIGHT", CODE_WORD_WEIGHT) } else { tuned("WORD_WEIGHT", WORD_WEIGHT) }
+    });
+    let (meaning_weight, literal_weight) = if is_lookup(text) { (0.5, word_weight * 2.0) } else { (1.0, word_weight) };
     Ok(Prepared {
         best,
         keyword,
@@ -488,6 +559,8 @@ pub fn prepare(
 
 /// How much being recent counts, at most (see `rank`).
 const RECENCY_WEIGHT: f64 = 0.5;
+/// What a meaning match below the gate still counts for, per unit of z.
+const WEAK_MEANING: f64 = 0.5;
 /// Recency halves every this many days.
 const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
 
@@ -516,20 +589,25 @@ pub fn rank(store: &Store, vectors: &Vectors, prepared: &Prepared, grep: &[GrepH
     candidates.extend(p.coverage.iter().filter(|(_, share)| **share >= 0.5).map(|(f, _)| *f));
     candidates.extend(grep_of.keys());
 
+    let (recency_weight, weak, hint_weight) = (
+        tuned("RECENCY_WEIGHT", RECENCY_WEIGHT),
+        tuned("WEAK_MEANING", WEAK_MEANING),
+        tuned("KIND_HINT", KIND_HINT_WEIGHT),
+    );
     let recency = |mtime: i64| {
         let days = (now - mtime).max(0) as f64 / 86_400.0;
-        RECENCY_WEIGHT * 0.5f64.powf(days / RECENCY_HALF_LIFE_DAYS)
+        recency_weight * 0.5f64.powf(days / RECENCY_HALF_LIFE_DAYS)
     };
     let mut scored: Vec<(i64, f64)> = candidates
         .into_iter()
         .map(|file| {
             let z = p.best.get(&file).map_or(0.0, |b| b.0);
-            let meaning = if z >= p.z_gate { z } else { z.max(0.0) * 0.5 };
+            let meaning = if z >= p.z_gate { z } else { z.max(0.0) * weak };
             let words = p.coverage.get(&file).copied().unwrap_or(0.0).powf(1.5);
             let literal = if grep_of.contains_key(&file) { 1.0f64.max(words) } else { words };
             let mtime = vectors.file_mtime.get(&file).copied().or(grep_of.get(&file).map(|g| g.mtime)).unwrap_or(0);
             let kind = vectors.file_kind.get(&file).copied().or(grep_of.get(&file).map(|g| g.kind));
-            let hinted = if kind.is_some_and(|k| p.hints.contains(&k)) { KIND_HINT_WEIGHT } else { 0.0 };
+            let hinted = if kind.is_some_and(|k| p.hints.contains(&k)) { hint_weight } else { 0.0 };
             (file, p.meaning_weight * meaning + p.literal_weight * literal + recency(mtime) + hinted)
         })
         .collect();
@@ -613,6 +691,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn words_match_as_written_or_as_the_start_of_longer_ones() {
+        let dir = std::env::temp_dir().join(format!("rummage-patterns-{}", std::process::id()));
+        let store = Store::open(&dir).unwrap();
+        let file = store.upsert_pending(std::path::Path::new("/notes/pets.md"), Kind::Doc, 1, 1).unwrap();
+        store
+            .add_segment(file, 1.0, "pets.md", "The cat sleeps in the category box.", "", None, Modality::Text)
+            .unwrap();
+        let patterns = |words: &[&str], typing| {
+            word_patterns(&store, &words.iter().map(|w| w.to_string()).collect::<Vec<_>>(), typing).unwrap()
+        };
+        // In the index as typed: whole, so "cat" doesn't bring in "category".
+        assert_eq!(patterns(&["cat"], false), ["\"cat\""]);
+        // In no file: the start of longer words; but not two letters.
+        assert_eq!(patterns(&["categ", "ca"], false), ["\"categ\"*", "\"ca\""]);
+        // Being typed: the last word is a start, whatever its length.
+        assert_eq!(patterns(&["cat", "ca"], true), ["\"cat\"", "\"ca\"*"]);
+        // Codes stay phrases.
+        assert_eq!(patterns(&["inv-20931"], true), ["\"inv-20931\""]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn terms_drop_stopwords_and_repeats() {
         assert_eq!(terms("Where is the lease clause about PETS, pets?"), vec!["lease", "clause", "pets"]);
     }
@@ -626,6 +726,14 @@ mod tests {
     }
 
     #[test]
+    fn codes_stay_whole() {
+        assert_eq!(terms("invoice INV-20931?"), vec!["invoice", "inv-20931"]);
+        assert!(is_lookup("INV-20931"));
+        assert_eq!(terms("well-known pet-friendly"), vec!["well", "known", "pet", "friendly"]);
+        assert_eq!(terms("where is max_retries set"), vec!["max_retries", "set"]);
+    }
+
+    #[test]
     fn code_prefix() {
         assert_eq!(split_code_prefix("  Code:  retry backoff "), ("retry backoff", true));
         assert_eq!(split_code_prefix("code:"), ("", true));
@@ -635,10 +743,17 @@ mod tests {
 
     #[test]
     fn lookups_are_codes() {
-        assert!(is_lookup(&terms("INV20931")));
-        assert!(is_lookup(&terms("0x80070005 20931")));
-        assert!(!is_lookup(&terms("error 0x80070005")));
-        assert!(!is_lookup(&terms("a dog on the beach")));
+        assert!(is_lookup("INV20931"));
+        assert!(is_lookup("0x80070005 20931"));
+        assert!(is_lookup("payments-gw ECONNRESET"));
+        assert!(is_lookup("refreshAccessToken"));
+        assert!(is_lookup("the max_retries"));
+        assert!(!is_lookup("error 0x80070005"));
+        assert!(!is_lookup("a dog on the beach"));
+        assert!(!is_lookup("NASA budget"));
+        assert!(!is_lookup("well-known Lisbon"));
+        assert!(!is_lookup("Priya"));
+        assert!(!is_lookup("pet-friendly"));
     }
 
     fn unit(i: usize, j: usize) -> Vec<f32> {
