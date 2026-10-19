@@ -5,10 +5,11 @@
 //! the rest of the long ones. A long file is searchable from its first step on.
 
 use crate::crawl::{self, Found};
-use crate::embed::{Embedder, prompts};
+use crate::embed::{Embedder, Picture, prompts};
 use crate::extract::{self, Part};
 use crate::paths::ModelFiles;
-use crate::store::{Kind, Store};
+use crate::store::{Kind, Modality, Store};
+use crate::{ocr, picture};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -30,16 +31,31 @@ pub struct Sync {
     pub removed: usize,
     /// PDFs left out because poppler isn't installed.
     pub pdfs_without_tools: usize,
+    /// HEIC photos left out because nothing here converts them.
+    pub heic_without_tool: usize,
+    /// Pictures left out as icons (under 256 px) or as dataset folders.
+    pub small_pictures: usize,
+    pub dataset_files: usize,
 }
 
 /// Compares what's on disk under `roots` with the index: new and changed files become pending, gone ones go.
 pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options) -> Result<Sync> {
     let walk = crawl::walk(roots, options);
     let found = walk.found;
-    let mut summary = Sync { found: found.len(), pdfs_without_tools: walk.pdfs_without_tools, ..Default::default() };
+    let mut summary = Sync {
+        found: found.len(),
+        pdfs_without_tools: walk.pdfs_without_tools,
+        heic_without_tool: walk.heic_without_tool,
+        small_pictures: walk.small_pictures,
+        dataset_files: walk.dataset_files,
+        ..Default::default()
+    };
     let tx = store.db.unchecked_transaction()?;
     for Found { path, kind, size, mtime } in &found {
-        let unchanged = store.file(path)?.is_some_and(|f| f.size == *size && f.mtime == *mtime && f.state != "pending");
+        // Failed files are tried again: they're few, and a newer rummage may read them (scans, once it could).
+        let unchanged = store
+            .file(path)?
+            .is_some_and(|f| f.size == *size && f.mtime == *mtime && f.state != "pending" && f.state != "failed");
         if !unchanged {
             store.upsert_pending(path, *kind, *size, *mtime)?;
             summary.new_or_changed += 1;
@@ -72,6 +88,10 @@ struct Job {
     path: PathBuf,
     name: String,
     parts: Vec<Part>,
+    /// A PDF's pages without text in this step (scans): embedded as pictures, their words read by OCR.
+    scans: Vec<usize>,
+    /// A picture file (photo or screenshot): its one vector is of what it shows.
+    picture: Option<Kind>,
     /// Parts read once this job is stored, and the file's total.
     done: usize,
     total: usize,
@@ -93,7 +113,9 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
     let mut group: Vec<Job> = Vec::new();
     for (file_id, path, kind) in pending {
         match first_step(file_id, &path, kind) {
-            Ok(job) if job.parts.is_empty() && job.done >= job.total => {
+            Ok(job)
+                if job.parts.is_empty() && job.scans.is_empty() && job.picture.is_none() && job.done >= job.total =>
+            {
                 store.finish(file_id, Some(if kind == Kind::Pdf { "no text (a scan?)" } else { "no text" }))?;
                 done += 1;
                 progress(Progress::File { done, total, path: &path });
@@ -136,6 +158,8 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
                 path: path.clone(),
                 name: name.clone(),
                 parts: read.parts,
+                scans: read.blank,
+                picture: None,
                 done: range.end.min(read.total),
                 total: read.total,
             };
@@ -149,6 +173,19 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
 
 /// A file's first step: all of a short file; the start of a long one.
 fn first_step(file_id: i64, path: &Path, kind: Kind) -> Result<Job> {
+    if kind.is_picture() {
+        let name = file_name(path);
+        return Ok(Job {
+            file_id,
+            path: path.to_path_buf(),
+            name,
+            parts: Vec::new(),
+            scans: Vec::new(),
+            picture: Some(kind),
+            done: 1,
+            total: 1,
+        });
+    }
     let step = match kind {
         Kind::Pdf => {
             let pages = extract::pdf_page_count(path)?.min(extract::MAX_PAGES);
@@ -157,6 +194,7 @@ fn first_step(file_id: i64, path: &Path, kind: Kind) -> Result<Job> {
         Kind::Doc => FIRST_PASSAGES,
         // Code files are small (1 MB at most): all at once.
         Kind::Code => extract::MAX_PASSAGES,
+        Kind::Image | Kind::Screenshot => unreachable!("pictures are handled above"),
     };
     let read = extract::read_parts(path, kind, 0..step)?;
     Ok(Job {
@@ -164,6 +202,8 @@ fn first_step(file_id: i64, path: &Path, kind: Kind) -> Result<Job> {
         path: path.to_path_buf(),
         name: file_name(path),
         parts: read.parts,
+        scans: read.blank,
+        picture: None,
         done: step.min(read.total),
         total: read.total,
     })
@@ -173,7 +213,8 @@ fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// Embeds and stores the jobs' parts, records each file's progress, and returns the jobs' paths.
+/// Embeds and stores the jobs' parts (text passages and pages, scanned pages, pictures), records each file's progress,
+/// and returns the paths of the files it took. A picture waits (stays pending) while the image encoder isn't there.
 fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<PathBuf>> {
     if jobs.is_empty() {
         return Ok(Vec::new());
@@ -183,20 +224,90 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<P
         .flat_map(|job| job.parts.iter().map(|part| prompts::document(Some(&job.name), &part.text)))
         .collect();
     let vectors = embedder.embed_texts(&inputs)?;
+
+    // Pictures and scanned pages, one at a time: (job, loc, words, vector), and the pictures that failed.
+    let mut seen: Vec<(usize, f64, String, Vec<f32>)> = Vec::new();
+    let mut failed: Vec<(usize, String)> = Vec::new();
+    let mut waiting: Vec<usize> = Vec::new();
+    for (j, job) in jobs.iter().enumerate() {
+        if let Some(kind) = job.picture {
+            if !embedder.sees_images() {
+                waiting.push(j);
+                continue;
+            }
+            match embed_picture(embedder, &job.path, kind) {
+                Ok((vector, words)) => seen.push((j, 1.0, words, vector)),
+                Err(error) => failed.push((j, format!("{error:#}"))),
+            }
+        }
+        if embedder.sees_images() {
+            for &page in &job.scans {
+                match embed_scanned_page(embedder, &job.path, page) {
+                    Ok((vector, words)) => seen.push((j, page as f64, words, vector)),
+                    Err(error) => eprintln!("rummage: page {page} of {}: {error:#}", job.path.display()),
+                }
+            }
+        }
+    }
+
     let tx = store.db.unchecked_transaction()?;
     let mut next = vectors.iter();
     let mut paths = Vec::with_capacity(jobs.len());
-    for job in jobs {
+    for (j, job) in jobs.into_iter().enumerate() {
         for part in &job.parts {
             let vector = next.next().expect("one vector per part");
             let excerpt = extract::excerpt(&part.text, 200);
-            store.add_segment(job.file_id, part.loc as f64, &job.name, &part.text, &excerpt, vector)?;
+            store.add_segment(
+                job.file_id,
+                part.loc as f64,
+                &job.name,
+                &part.text,
+                &excerpt,
+                Some(vector),
+                Modality::Text,
+            )?;
         }
-        store.progress(job.file_id, job.done, job.total)?;
+        for (_, loc, words, vector) in seen.iter().filter(|s| s.0 == j) {
+            // A picture's words in full (up to 4,000 characters): its preview shows them.
+            let excerpt: String = words.chars().take(4000).collect();
+            store.add_segment(job.file_id, *loc, &job.name, words, &excerpt, Some(vector), Modality::Image)?;
+        }
+        if waiting.contains(&j) {
+            continue;
+        }
+        match failed.iter().find(|f| f.0 == j) {
+            Some((_, error)) => store.finish(job.file_id, Some(error))?,
+            None => store.progress(job.file_id, job.done, job.total)?,
+        }
         paths.push(job.path);
     }
     tx.commit()?;
     Ok(paths)
+}
+
+/// A picture's vector (photos at 140 vision tokens, screenshots at 280) and, for a screenshot, its words.
+fn embed_picture(embedder: &mut Embedder, path: &Path, kind: Kind) -> Result<(Vec<f32>, String)> {
+    let picture = if picture::stb_reads(path) {
+        Picture::File(path.to_path_buf())
+    } else {
+        Picture::Pixels(picture::decode(path)?)
+    };
+    let budget = if kind == Kind::Screenshot { picture::SCREENSHOT_BUDGET } else { picture::PHOTO_BUDGET };
+    let vector = embedder.embed_image(picture, budget)?;
+    let words =
+        if kind == Kind::Screenshot && ocr::available() { ocr::file(path).unwrap_or_default() } else { String::new() };
+    Ok((vector, words))
+}
+
+/// A scanned PDF page: rendered, embedded as a picture (280 vision tokens), and read by OCR.
+fn embed_scanned_page(embedder: &mut Embedder, path: &Path, page: usize) -> Result<(Vec<f32>, String)> {
+    // Tall enough for OCR to read body text; the encoder gets it resized to its budget.
+    let png = extract::pdf_page_png(path, page, 2000)?;
+    let rgb = image::load_from_memory(&png)?.to_rgb8();
+    let pixels = picture::Rgb { width: rgb.width() as usize, height: rgb.height() as usize, data: rgb.into_raw() };
+    let vector = embedder.embed_image(Picture::Pixels(pixels), picture::PAGE_BUDGET)?;
+    let words = if ocr::available() { ocr::png_bytes(&png).unwrap_or_default() } else { String::new() };
+    Ok((vector, words))
 }
 
 /// Seconds as "3 s" or "2 min".

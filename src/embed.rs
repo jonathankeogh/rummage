@@ -11,6 +11,14 @@ use std::ffi::{CString, c_char, c_void};
 use std::sync::Once;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// A picture for the image encoder.
+pub enum Picture {
+    /// A file llama.cpp decodes itself (see `picture::stb_reads`).
+    File(std::path::PathBuf),
+    /// Pixels decoded here.
+    Pixels(crate::picture::Rgb),
+}
+
 /// Every vector has this many numbers.
 pub const DIM: usize = 768;
 
@@ -32,6 +40,10 @@ pub struct Embedder {
     batch: *mut sys::llama_batch_ext,
     vocab: *const sys::llama_vocab,
     embedding_size: usize,
+    /// The width of the encoder's output rows, which go into the text model in place of tokens.
+    row_size: usize,
+    /// The image and audio encoders (mtmd), when loaded (not for queries).
+    media: *mut sys::mtmd_context,
     max_tokens: usize,
     sequences: i32,
     tokens: usize,
@@ -77,6 +89,8 @@ impl Embedder {
                 batch: sys::llama_batch_ext_init(context),
                 vocab: sys::llama_model_get_vocab(model),
                 embedding_size: sys::llama_model_n_embd_out(model) as usize,
+                row_size: sys::llama_model_n_embd_inp(model) as usize,
+                media: std::ptr::null_mut(),
                 max_tokens,
                 sequences: 0,
                 tokens: 0,
@@ -84,6 +98,21 @@ impl Embedder {
             };
             if embedder.embedding_size != DIM {
                 bail!("expected {DIM}-number vectors, the model makes {}", embedder.embedding_size);
+            }
+            // The image and audio encoders, for indexing (queries are text).
+            if let (false, Some(media)) = (query_only, &models.media) {
+                let path = CString::new(media.to_string_lossy().as_bytes())?;
+                let mut params = sys::mtmd_context_params_default();
+                params.use_gpu = true;
+                params.print_timings = false;
+                params.warmup = true;
+                // Never rescale: pictures arrive at their final size (`picture::target_size`).
+                params.image_min_tokens = 1;
+                params.image_max_tokens = 1120;
+                embedder.media = sys::mtmd_init_from_file(path.as_ptr(), model, params);
+                if embedder.media.is_null() {
+                    bail!("can't load {}", media.display());
+                }
             }
             // The first call builds the GPU pipelines: pay for that now.
             embedder.embed_texts(&[prompts::query("warm up")]).context("warming up the model")?;
@@ -159,8 +188,141 @@ impl Embedder {
         self.tokens = 0;
     }
 
+    /// Whether the image encoder is loaded.
+    pub fn sees_images(&self) -> bool {
+        !self.media.is_null()
+    }
+
+    /// One picture's vector at `budget` vision tokens: from a file llama.cpp decodes itself (JPEG, PNG …, exactly as
+    /// the reference), or from decoded pixels. Framed as the reference frames it: `<bos> <|image> rows <image|> <eos>`.
+    pub fn embed_image(&mut self, picture: Picture, budget: usize) -> Result<Vec<f32>> {
+        if self.media.is_null() {
+            bail!("the image encoder isn't loaded");
+        }
+        let bitmap = self.load_bitmap(picture, budget)?;
+        let result = self.embed_bitmap(bitmap);
+        unsafe { sys::mtmd_bitmap_free(bitmap) };
+        result
+    }
+
+    fn load_bitmap(&mut self, picture: Picture, budget: usize) -> Result<*mut sys::mtmd_bitmap> {
+        let bitmap = unsafe {
+            match &picture {
+                Picture::File(path) => {
+                    let name = CString::new(path.to_string_lossy().as_bytes())?;
+                    let wrapper = sys::mtmd_helper_bitmap_init_from_file(
+                        self.media,
+                        name.as_ptr(),
+                        false,
+                        sys::mtmd_helper_init_opt_default(),
+                    );
+                    if !wrapper.video_ctx.is_null() {
+                        if !wrapper.bitmap.is_null() {
+                            sys::mtmd_bitmap_free(wrapper.bitmap);
+                        }
+                        sys::mtmd_helper_video_free(wrapper.video_ctx);
+                        bail!("a video, not a picture: {}", path.display());
+                    }
+                    if wrapper.bitmap.is_null() {
+                        bail!("can't read {}", path.display());
+                    }
+                    if sys::mtmd_bitmap_is_audio(wrapper.bitmap) {
+                        sys::mtmd_bitmap_free(wrapper.bitmap);
+                        bail!("sound, not a picture: {}", path.display());
+                    }
+                    wrapper.bitmap
+                }
+                Picture::Pixels(rgb) => sys::mtmd_bitmap_init(rgb.width as u32, rgb.height as u32, rgb.data.as_ptr()),
+            }
+        };
+        if bitmap.is_null() {
+            bail!("can't make a bitmap");
+        }
+        // Resize to fill the budget, exactly as the reference does.
+        let (width, height) =
+            unsafe { (sys::mtmd_bitmap_get_nx(bitmap) as usize, sys::mtmd_bitmap_get_ny(bitmap) as usize) };
+        let Some((to_height, to_width)) = crate::picture::target_size(height, width, budget) else {
+            unsafe { sys::mtmd_bitmap_free(bitmap) };
+            bail!("too thin to embed");
+        };
+        if (to_height, to_width) == (height, width) {
+            return Ok(bitmap);
+        }
+        let pixels = unsafe { std::slice::from_raw_parts(sys::mtmd_bitmap_get_data(bitmap), width * height * 3) };
+        let resized = crate::picture::resize_bicubic(pixels, width, height, to_width, to_height);
+        unsafe { sys::mtmd_bitmap_free(bitmap) };
+        let bitmap = unsafe { sys::mtmd_bitmap_init(to_width as u32, to_height as u32, resized.as_ptr()) };
+        if bitmap.is_null() {
+            bail!("can't resize");
+        }
+        Ok(bitmap)
+    }
+
+    fn embed_bitmap(&mut self, bitmap: *mut sys::mtmd_bitmap) -> Result<Vec<f32>> {
+        unsafe {
+            let chunks = sys::mtmd_input_chunks_init();
+            let marker = std::ffi::CStr::from_ptr(sys::mtmd_default_marker());
+            let text = sys::mtmd_input_text {
+                text: marker.as_ptr(),
+                text_len: marker.to_bytes().len(),
+                add_special: true,
+                parse_special: true,
+            };
+            let bitmaps = [bitmap as *const sys::mtmd_bitmap];
+            let status = sys::mtmd_tokenize(self.media, chunks, &text, bitmaps.as_ptr(), 1);
+            let result = (|| {
+                if status != 0 {
+                    bail!("can't tokenize the picture ({status})");
+                }
+                self.reset();
+                self.begin();
+                for index in 0..sys::mtmd_input_chunks_size(chunks) {
+                    let chunk = sys::mtmd_input_chunks_get(chunks, index);
+                    if sys::mtmd_input_chunk_get_type(chunk) == sys::MTMD_INPUT_CHUNK_TYPE_TEXT {
+                        let mut count = 0usize;
+                        let tokens = sys::mtmd_input_chunk_get_tokens_text(chunk, &mut count);
+                        if tokens.is_null() {
+                            continue;
+                        }
+                        for &token in std::slice::from_raw_parts(tokens, count) {
+                            self.add_token(token)?;
+                        }
+                    } else {
+                        if sys::mtmd_encode_chunk(self.media, chunk) != 0 {
+                            bail!("the encoder failed");
+                        }
+                        let rows = sys::mtmd_get_output_embd(self.media);
+                        if rows.is_null() {
+                            bail!("the encoder gave nothing");
+                        }
+                        self.add_rows(rows, sys::mtmd_input_chunk_get_n_tokens(chunk))?;
+                    }
+                }
+                Ok(self.run()?.remove(0))
+            })();
+            sys::mtmd_input_chunks_free(chunks);
+            result
+        }
+    }
+
+    /// Encoder output rows into the batch, one position each (the batch copies them).
+    fn add_rows(&mut self, rows: *const f32, count: usize) -> Result<()> {
+        for row in 0..count {
+            let embd =
+                sys::llama_embd { data: unsafe { rows.add(row * self.row_size) }, n_rows: 1, n_embd: self.row_size };
+            let index = unsafe { sys::llama_batch_ext_add_embd(self.batch, self.sequences - 1, embd) };
+            self.place(index)?;
+        }
+        Ok(())
+    }
+
     fn add_token(&mut self, token: sys::llama_token) -> Result<()> {
         let index = unsafe { sys::llama_batch_ext_add_token(self.batch, self.sequences - 1, token) };
+        self.place(index)
+    }
+
+    /// Positions the entry the batch just took and asks for its output.
+    fn place(&mut self, index: i32) -> Result<()> {
         if index < 0 {
             bail!("batch full ({index})");
         }
@@ -204,6 +366,9 @@ impl Embedder {
 impl Drop for Embedder {
     fn drop(&mut self) {
         unsafe {
+            if !self.media.is_null() {
+                sys::mtmd_free(self.media);
+            }
             sys::llama_batch_ext_free(self.batch);
             sys::llama_free(self.context);
             sys::llama_model_free(self.model);

@@ -18,10 +18,10 @@ jobs:
           submodules: recursive
       - name: System packages (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev poppler-utils
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev poppler-utils tesseract-ocr
       - name: System packages (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake poppler
+        run: brew install cmake poppler tesseract
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build

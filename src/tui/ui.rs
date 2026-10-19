@@ -106,6 +106,8 @@ fn row_line(hit: &Hit, selected: bool, width: usize) -> Line<'static> {
         Kind::Doc => Color::Cyan,
         Kind::Pdf => Color::Magenta,
         Kind::Code => Color::Yellow,
+        Kind::Image => Color::Green,
+        Kind::Screenshot => Color::Blue,
     };
     let fixed = 2 + 5 + place.chars().count() + 1;
     let room = width.saturating_sub(fixed).max(1);
@@ -114,7 +116,7 @@ fn row_line(hit: &Hit, selected: bool, width: usize) -> Line<'static> {
     let kind_style = if selected { Style::default() } else { Style::default().fg(kind_color) };
     Line::from(vec![
         Span::raw(format!("{marker} ")),
-        Span::styled(format!("{:<5}", hit.kind.as_str()), kind_style),
+        Span::styled(format!("{:<5}", hit.kind.label()), kind_style),
         Span::raw(name),
         Span::raw(" ".repeat(pad + 1)),
         Span::raw(place),
@@ -145,7 +147,7 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
 
     let (Some(i), Some(preview)) = (app.selected_hit(), app.preview()) else { return };
     let hit = &app.hits[i];
-    let page_view = app.page_view && hit.kind == Kind::Pdf;
+    let page_view = app.shows_picture(hit.kind);
     if page_view {
         match app.page_image.borrow_mut().as_mut() {
             Some((_, Ok(protocol))) => {
@@ -202,6 +204,8 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
     let mut detail = why(hit);
     if hit.kind == Kind::Pdf {
         detail += if page_view { " · ^v text" } else { " · ^v page" };
+    } else if hit.kind.is_picture() {
+        detail += if page_view { " · ^v words" } else { " · ^v picture" };
     }
     let info = vec![
         Line::from(Span::styled(tilde(Path::new(&hit.path)), Style::default().add_modifier(Modifier::BOLD))),

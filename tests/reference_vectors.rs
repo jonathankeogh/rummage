@@ -2,10 +2,10 @@
 //! build and model files). Matching them shows the bindings, tokenizing, prompts and pooling are right, and catches a
 //! llama.cpp upgrade that quietly changes the vectors (every index would have to embed again).
 //!
-//! Needs the model files (see README); skipped without them, as on CI. The image and audio references (photo.jpg,
-//! screen.png, speech.wav) are checked once rummage embeds images and audio.
+//! Needs the model files (see README); skipped without them, as on CI. The audio reference (speech.wav) is checked
+//! once rummage embeds audio.
 
-use rummage::embed::{Embedder, prompts};
+use rummage::embed::{Embedder, Picture, prompts};
 use rummage::paths::ModelFiles;
 use std::collections::HashMap;
 
@@ -48,18 +48,45 @@ fn texts() -> Vec<(&'static str, String)> {
 
 #[test]
 fn text_vectors_match_digups() {
+    check(|embedder| {
+        let inputs = texts();
+        let made = embedder.embed_texts(&inputs.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>()).expect("embed");
+        inputs.iter().map(|(name, _)| name.to_string()).zip(made).collect()
+    });
+}
+
+#[test]
+fn image_vectors_match_digups() {
+    // A screenshot at 280 vision tokens, a photo at 140, and the photo as a video frame at 70: read by llama.cpp's
+    // own decoder and resized here exactly as the reference resizes them.
+    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference");
+    check(|embedder| {
+        if !embedder.sees_images() {
+            eprintln!("skipped: no image encoder");
+            return Vec::new();
+        }
+        [("screen-280", "screen.png", 280), ("photo-140", "photo.jpg", 140), ("frame-70", "photo.jpg", 70)]
+            .into_iter()
+            .map(|(name, file, budget)| {
+                (name.to_string(), embedder.embed_image(Picture::File(folder.join(file)), budget).expect(file))
+            })
+            .collect()
+    });
+}
+
+/// Embeds with `make` and compares each vector with its reference.
+fn check(make: impl FnOnce(&mut Embedder) -> Vec<(String, Vec<f32>)>) {
     let Ok(models) = ModelFiles::locate() else {
         eprintln!("skipped: no model files");
         return;
     };
     let reference: Reference =
         serde_json::from_str(include_str!("reference/vectors.json")).expect("tests/reference/vectors.json");
-    let inputs = texts();
     let mut embedder = Embedder::load(&models, false).expect("load the model");
-    let made = embedder.embed_texts(&inputs.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>()).expect("embed");
+    let made = make(&mut embedder);
     let mut worst = (String::new(), 1.0f32);
-    for ((name, _), vector) in inputs.iter().zip(&made) {
-        let expected = &reference.vectors[*name];
+    for (name, vector) in &made {
+        let expected = &reference.vectors[name];
         let cosine: f32 = vector.iter().zip(expected).map(|(a, b)| a * b).sum();
         eprintln!("{name:<14} cosine {cosine:.5}");
         if cosine < worst.1 {

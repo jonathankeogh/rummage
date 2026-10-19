@@ -12,6 +12,31 @@ pub enum Kind {
     /// PDFs, a page at a time.
     Pdf,
     Code,
+    /// Photos and other pictures, by what they show.
+    Image,
+    /// Screenshots: by what they show, and their words (OCR) for keyword search.
+    Screenshot,
+}
+
+/// What a passage's vector was made from. A text query sits at different similarities to text and to pictures, so
+/// each gets its own baseline when scoring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Modality {
+    Text,
+    Image,
+}
+
+impl Modality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Modality::Text => "text",
+            Modality::Image => "image",
+        }
+    }
+
+    pub fn parse(s: &str) -> Modality {
+        if s == "image" { Modality::Image } else { Modality::Text }
+    }
 }
 
 impl Kind {
@@ -20,6 +45,8 @@ impl Kind {
             Kind::Doc => "doc",
             Kind::Pdf => "pdf",
             Kind::Code => "code",
+            Kind::Image => "image",
+            Kind::Screenshot => "screenshot",
         }
     }
 
@@ -27,8 +54,23 @@ impl Kind {
     pub fn unit(self) -> &'static str {
         match self {
             Kind::Pdf => "page",
+            Kind::Image | Kind::Screenshot => "picture",
             Kind::Doc | Kind::Code => "passage",
         }
+    }
+
+    /// A short name for result lists (at most 5 characters).
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Image => "img",
+            Kind::Screenshot => "shot",
+            other => other.as_str(),
+        }
+    }
+
+    /// Pictures, shown as pictures.
+    pub fn is_picture(self) -> bool {
+        matches!(self, Kind::Image | Kind::Screenshot)
     }
 
     pub fn parse(s: &str) -> Option<Kind> {
@@ -36,6 +78,8 @@ impl Kind {
             "doc" => Some(Kind::Doc),
             "pdf" => Some(Kind::Pdf),
             "code" => Some(Kind::Code),
+            "image" => Some(Kind::Image),
+            "screenshot" => Some(Kind::Screenshot),
             _ => None,
         }
     }
@@ -83,7 +127,8 @@ impl Store {
                  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                  loc REAL,                     -- passage or page number from 1 (seconds later)
                  excerpt TEXT NOT NULL,
-                 vector BLOB NOT NULL          -- 768 little-endian f32
+                 vector BLOB NOT NULL,         -- 768 little-endian f32; empty for keyword-only text (OCR words)
+                 modality TEXT NOT NULL DEFAULT 'text'   -- text | image: what the vector was made from
              );
              CREATE INDEX IF NOT EXISTS segments_file ON segments(file_id);
              CREATE VIRTUAL TABLE IF NOT EXISTS words USING fts5(
@@ -99,6 +144,14 @@ impl Store {
             if !columns.iter().any(|c| c == column) {
                 db.execute(&format!("ALTER TABLE files ADD COLUMN {column} INTEGER"), [])?;
             }
+        }
+        // And before pictures, the modality.
+        let has_modality: bool =
+            db.query_row("SELECT COUNT(*) > 0 FROM pragma_table_info('segments') WHERE name = 'modality'", [], |r| {
+                r.get(0)
+            })?;
+        if !has_modality {
+            db.execute("ALTER TABLE segments ADD COLUMN modality TEXT NOT NULL DEFAULT 'text'", [])?;
         }
         let store = Store { db, file };
         match store.meta("fingerprint")? {
@@ -206,12 +259,14 @@ impl Store {
         name: &str,
         text: &str,
         excerpt: &str,
-        vector: &[f32],
+        vector: Option<&[f32]>,
+        modality: Modality,
     ) -> Result<()> {
-        let blob: Vec<u8> = vector.iter().flat_map(|x| x.to_le_bytes()).collect();
+        // No vector: the text is for keyword search only (a screenshot's words).
+        let blob: Vec<u8> = vector.unwrap_or_default().iter().flat_map(|x| x.to_le_bytes()).collect();
         self.db.execute(
-            "INSERT INTO segments (file_id, loc, excerpt, vector) VALUES (?, ?, ?, ?)",
-            params![file_id, loc, excerpt, blob],
+            "INSERT INTO segments (file_id, loc, excerpt, vector, modality) VALUES (?, ?, ?, ?, ?)",
+            params![file_id, loc, excerpt, blob, modality.as_str()],
         )?;
         let id = self.db.last_insert_rowid();
         self.db.execute("INSERT INTO words (rowid, name, text) VALUES (?, ?, ?)", params![id, name, text])?;

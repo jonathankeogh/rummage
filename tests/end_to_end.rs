@@ -180,3 +180,65 @@ fn service_greps_stops_and_recovers() {
     assert!(socket.exists(), "killed outright, it left its socket");
     assert!(!s.names("card declined", &[]).is_empty(), "recovered");
 }
+
+/// A white picture with "LITE" in big black block letters (5x7 glyphs of 12 px squares), as a PNG.
+fn lite_png() -> Vec<u8> {
+    let glyphs = [
+        ["#....", "#....", "#....", "#....", "#....", "#....", "#####"], // L
+        [".###.", "..#..", "..#..", "..#..", "..#..", "..#..", ".###."], // I
+        ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."], // T
+        ["#####", "#....", "#....", "####.", "#....", "#....", "#####"], // E
+    ];
+    let mut image = image::RgbImage::from_pixel(400, 300, image::Rgb([255, 255, 255]));
+    for (g, glyph) in glyphs.iter().enumerate() {
+        for (row, line) in glyph.iter().enumerate() {
+            for (col, c) in line.chars().enumerate().filter(|(_, c)| *c == '#') {
+                let _ = c;
+                for dy in 0..12 {
+                    for dx in 0..12 {
+                        image.put_pixel(
+                            40 + (g as u32 * 6 + col as u32) * 12 + dx,
+                            100 + row as u32 * 12 + dy,
+                            image::Rgb([0, 0, 0]),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let mut png = Vec::new();
+    image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    png
+}
+
+#[test]
+fn pictures_and_screenshots() {
+    if !model_present() || rummage::paths::ModelFiles::locate().is_ok_and(|m| m.media.is_none()) {
+        eprintln!("skipped: no image encoder");
+        return;
+    }
+    let s = Sandbox::new("pictures");
+    std::fs::write(s.files().join("Screenshot 2026-10-19 at 10.00.00.png"), lite_png()).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference/photo.jpg"),
+        s.files().join("holiday.jpg"),
+    )
+    .unwrap();
+    image::RgbImage::from_pixel(32, 32, image::Rgb([200, 0, 0])).save(s.files().join("icon.png")).unwrap();
+    s.write("notes.md", "Pay the electricity bill before Friday.");
+    let report = s.index();
+    assert!(report.contains("3 files"), "the 32 px icon is left out: {report}");
+
+    let hits = s.search("holiday", &["--no-serve", "--no-grep"]);
+    let photo = hits.iter().find(|(name, _)| name == "holiday.jpg").expect("the photo, by its name");
+    assert_eq!(photo.1["kind"], "image");
+    if rummage::ocr::available() {
+        // The screenshot's words are keyword-searchable.
+        let hits = s.search("LITE", &["--no-serve", "--no-grep"]);
+        let (name, hit) = hits.first().expect("found by its words");
+        assert!(name.starts_with("Screenshot"), "{name}");
+        assert_eq!(hit["kind"], "screenshot");
+        assert!(hit["excerpt"].as_str().unwrap().contains("LITE"), "{hit}");
+        assert!(hit["keyword_rank"].is_number(), "found by its words: {hit}");
+    }
+}

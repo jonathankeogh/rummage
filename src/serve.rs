@@ -161,7 +161,7 @@ impl Engine {
         let kinds: HashSet<Kind> = match (code, kinds) {
             (true, _) => [Kind::Code].into(),
             (false, Some(kinds)) if !kinds.is_empty() => kinds.iter().copied().collect(),
-            _ => [Kind::Doc, Kind::Pdf].into(),
+            _ => [Kind::Doc, Kind::Pdf, Kind::Image, Kind::Screenshot].into(),
         };
         if query.is_empty() {
             return Ok((Vec::new(), None));
@@ -170,7 +170,7 @@ impl Engine {
         let options = search::Options { kinds: Some(kinds.clone()), limit, z_gate, ..Default::default() };
         let prepared = search::prepare(&self.store, &self.vectors, query, vector.as_deref(), &options)?;
         let hits = search::rank(&self.store, &self.vectors, &prepared, &[], search::now())?;
-        // Grep reads text and code files; PDFs alone have nothing for it.
+        // Grep reads text and code files; PDFs and pictures alone have nothing for it.
         let greppable = kinds.contains(&Kind::Doc) || kinds.contains(&Kind::Code);
         let pending = (greppable && crate::grep::pattern(query).is_some()).then(|| Pending {
             prepared,

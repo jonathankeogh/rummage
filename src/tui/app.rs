@@ -109,7 +109,9 @@ impl Filter {
         match self {
             Filter::All => Filter::Only(Kind::Doc),
             Filter::Only(Kind::Doc) => Filter::Only(Kind::Pdf),
-            Filter::Only(Kind::Pdf) => Filter::Only(Kind::Code),
+            Filter::Only(Kind::Pdf) => Filter::Only(Kind::Image),
+            Filter::Only(Kind::Image) => Filter::Only(Kind::Screenshot),
+            Filter::Only(Kind::Screenshot) => Filter::Only(Kind::Code),
             Filter::Only(Kind::Code) => Filter::All,
         }
     }
@@ -334,8 +336,9 @@ impl App {
             KeyCode::Char('o') if ctrl => return selected.map_or(Action::None, Action::Reveal),
             KeyCode::Char('v') if ctrl => {
                 self.page_view = !self.page_view;
-                if self.page_view && selected.is_some_and(|i| self.hits[i].kind != Kind::Pdf) {
-                    self.notify("page view shows PDFs; other files stay as text");
+                let kind = selected.map(|i| self.hits[i].kind);
+                if kind.is_some_and(|k| k != Kind::Pdf && !k.is_picture()) {
+                    self.notify("^v switches PDFs and pictures between picture and text");
                 }
             }
             KeyCode::Char('y') if ctrl => return selected.map_or(Action::None, Action::Copy),
@@ -431,8 +434,14 @@ impl App {
     }
 
     /// Draws the selected PDF page for the preview's current size, when the page view is on and it changed.
+    /// Whether the selected hit is shown as a picture: pictures unless switched to their words, PDF pages when switched
+    /// to the page.
+    pub fn shows_picture(&self, kind: Kind) -> bool {
+        (kind.is_picture() && !self.page_view) || (kind == Kind::Pdf && self.page_view)
+    }
+
     pub fn refresh_page_image(&mut self) {
-        let Some(i) = self.selected_hit().filter(|&i| self.page_view && self.hits[i].kind == Kind::Pdf) else {
+        let Some(i) = self.selected_hit().filter(|&i| self.shows_picture(self.hits[i].kind)) else {
             return;
         };
         let picker = self.picker.get_or_insert_with(ask_terminal);
@@ -451,10 +460,17 @@ impl App {
             return;
         }
         let height_px = area.height as u32 * picker.font_size().height as u32;
-        let image = crate::extract::pdf_page_png(std::path::Path::new(&key.path), key.page, height_px)
-            .and_then(|png| Ok(image::load_from_memory(&png)?))
-            .map(|image| picker.new_resize_protocol(image))
-            .map_err(|e| format!("can't draw the page: {e:#}"));
+        let path = std::path::Path::new(&key.path);
+        let image = if hit.kind.is_picture() {
+            crate::picture::decode(path).and_then(|rgb| {
+                let buffer = image::RgbImage::from_raw(rgb.width as u32, rgb.height as u32, rgb.data)
+                    .ok_or_else(|| anyhow::anyhow!("odd picture size"))?;
+                Ok(image::DynamicImage::ImageRgb8(buffer))
+            })
+        } else {
+            crate::extract::pdf_page_png(path, key.page, height_px).and_then(|png| Ok(image::load_from_memory(&png)?))
+        };
+        let image = image.map(|image| picker.new_resize_protocol(image)).map_err(|e| format!("can't draw it: {e:#}"));
         *self.page_image.borrow_mut() = Some((key, image));
     }
 
@@ -522,15 +538,20 @@ pub(crate) mod tests {
     #[test]
     fn filter_cycles_and_limits_rows() {
         let (mut app, _rx) = app();
-        app.hits =
-            vec![hit("/a.md", Kind::Doc), hit("/b.rs", Kind::Code), hit("/c.md", Kind::Doc), hit("/d.pdf", Kind::Pdf)];
-        assert_eq!(app.visible(), vec![0, 1, 2, 3]);
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.visible(), vec![0, 2]);
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.visible(), vec![3]);
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.visible(), vec![1]);
+        app.hits = vec![
+            hit("/a.md", Kind::Doc),
+            hit("/b.rs", Kind::Code),
+            hit("/c.md", Kind::Doc),
+            hit("/d.pdf", Kind::Pdf),
+            hit("/e.jpg", Kind::Image),
+            hit("/Screenshot f.png", Kind::Screenshot),
+        ];
+        assert_eq!(app.visible(), vec![0, 1, 2, 3, 4, 5]);
+        // all → docs → PDFs → pictures → screenshots → code → all
+        for expected in [vec![0, 2], vec![3], vec![4], vec![5], vec![1]] {
+            app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            assert_eq!(app.visible(), expected);
+        }
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.filter, Filter::All);
     }

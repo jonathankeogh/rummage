@@ -6,7 +6,7 @@
 
 use crate::embed::DIM;
 use crate::grep::GrepHit;
-use crate::store::{Kind, Store};
+use crate::store::{Kind, Modality, Store};
 use anyhow::Result;
 use half::f16;
 use half::slice::HalfFloatSliceExt;
@@ -145,6 +145,8 @@ pub struct Vectors {
     matrix: Vec<f16>,
     row_segment: Vec<i64>,
     row_file: Vec<i64>,
+    /// What each row's vector was made from: pictures and text get their own baselines.
+    row_modality: Vec<Modality>,
     file_kind: HashMap<i64, Kind>,
     /// When each file last changed, and each indexed file's id by path (to join grep's hits).
     file_mtime: HashMap<i64, i64>,
@@ -163,6 +165,7 @@ impl Vectors {
             matrix: Vec::new(),
             row_segment: Vec::new(),
             row_file: Vec::new(),
+            row_modality: Vec::new(),
             file_kind: HashMap::new(),
             file_mtime: HashMap::new(),
             file_ids: HashMap::new(),
@@ -183,7 +186,7 @@ impl Vectors {
                 vectors.file_kind.insert(id, kind);
             }
         }
-        let mut statement = store.db.prepare("SELECT id, file_id, vector FROM segments ORDER BY id")?;
+        let mut statement = store.db.prepare("SELECT id, file_id, vector, modality FROM segments ORDER BY id")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let blob: Vec<u8> = row.get(2)?;
@@ -195,6 +198,7 @@ impl Vectors {
                 .extend(blob.chunks_exact(4).map(|b| f16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))));
             vectors.row_segment.push(row.get(0)?);
             vectors.row_file.push(row.get(1)?);
+            vectors.row_modality.push(Modality::parse(&row.get::<_, String>(3)?));
         }
         vectors.centrality = vec![0.0; vectors.row_segment.len()];
         Ok(vectors)
@@ -246,6 +250,31 @@ const PRIOR_SPREAD: f64 = 0.025;
 /// How many passages' worth the typical spread counts for.
 const PRIOR_WEIGHT: f64 = 50.0;
 
+/// Subtracts each modality's median from its rows' scores (modalities under 20 rows take the median of all).
+fn centre_by_modality(scores: &mut [f32], modality: &[Modality]) {
+    let median = |mut values: Vec<f32>| -> f32 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        let middle = values.len() / 2;
+        *values.select_nth_unstable_by(middle, |a, b| a.total_cmp(b)).1
+    };
+    if !modality.iter().any(|&m| m != Modality::Text) {
+        return; // all text: nothing to line up (the z-score centres it anyway)
+    }
+    let all = median(scores.to_vec());
+    let centres: HashMap<Modality, f32> = [Modality::Text, Modality::Image]
+        .into_iter()
+        .map(|m| {
+            let rows: Vec<f32> = scores.iter().zip(modality).filter(|(_, r)| **r == m).map(|(&s, _)| s).collect();
+            (m, if rows.len() >= 20 { median(rows) } else { all })
+        })
+        .collect();
+    for (score, m) in scores.iter_mut().zip(modality) {
+        *score -= centres[m];
+    }
+}
+
 fn standardize(scores: &[f32]) -> Vec<f64> {
     if scores.is_empty() {
         return Vec::new();
@@ -286,6 +315,25 @@ pub fn terms(text: &str) -> Vec<String> {
     chosen.into_iter().filter(|w| seen.insert(*w)).map(String::from).collect()
 }
 
+/// Kinds a query asks for ("a photo of …", "the screenshot with …", "… in a pdf"): a nudge, not a filter.
+pub fn kind_hints(text: &str) -> HashSet<Kind> {
+    let mut hints = HashSet::new();
+    for word in text.to_lowercase().split(|c: char| !c.is_alphanumeric()) {
+        let kind = match word {
+            "photo" | "photos" | "picture" | "pictures" | "image" | "images" | "pic" | "pics" => Kind::Image,
+            "screenshot" | "screenshots" | "screengrab" => Kind::Screenshot,
+            "pdf" | "pdfs" | "paper" | "papers" => Kind::Pdf,
+            "document" | "documents" | "note" | "notes" | "doc" | "docs" => Kind::Doc,
+            _ => continue,
+        };
+        hints.insert(kind);
+    }
+    hints
+}
+
+/// How much a kind the query asks for counts (DigUp's +1).
+const KIND_HINT_WEIGHT: f64 = 1.0;
+
 /// Every word has a digit, and letters or 4+ characters: an invoice number, an error code. Words count for more.
 fn is_lookup(terms: &[String]) -> bool {
     !terms.is_empty()
@@ -318,6 +366,8 @@ pub struct Prepared {
     /// The query's words as one FTS query (empty: none).
     any_word: String,
     kinds: Option<HashSet<Kind>>,
+    /// Kinds the query names.
+    hints: HashSet<Kind>,
     limit: usize,
 }
 
@@ -366,8 +416,11 @@ pub fn prepare(
     if let Some(query) = query.filter(|q| q.len() == DIM && !vectors.is_empty()) {
         let cosines = vectors.cosines(query);
         // Hubs lose the head start they get from being a little similar to everything.
-        let adjusted: Vec<f32> =
+        let mut adjusted: Vec<f32> =
             cosines.iter().zip(&vectors.centrality).map(|(&c, &h)| c - (options.hub_penalty as f32) * h).collect();
+        // A text query sits lower against pictures than against text: each modality measured from its own median
+        // (DigUp's per-modality means), once it has enough rows to say.
+        centre_by_modality(&mut adjusted, &vectors.row_modality);
         let z = standardize(&adjusted);
         if std::env::var_os("RUMMAGE_DEBUG").is_some() {
             eprintln!("query vagueness {:.2}", vectors.query_vagueness(query).unwrap_or(f64::NAN));
@@ -423,6 +476,7 @@ pub fn prepare(
         literal_weight,
         any_word: patterns.join(" OR "),
         kinds: options.kinds.clone(),
+        hints: kind_hints(text),
         limit: options.limit,
     })
 }
@@ -469,7 +523,9 @@ pub fn rank(store: &Store, vectors: &Vectors, prepared: &Prepared, grep: &[GrepH
             let words = p.coverage.get(&file).copied().unwrap_or(0.0).powf(1.5);
             let literal = if grep_of.contains_key(&file) { 1.0f64.max(words) } else { words };
             let mtime = vectors.file_mtime.get(&file).copied().or(grep_of.get(&file).map(|g| g.mtime)).unwrap_or(0);
-            (file, p.meaning_weight * meaning + p.literal_weight * literal + recency(mtime))
+            let kind = vectors.file_kind.get(&file).copied().or(grep_of.get(&file).map(|g| g.kind));
+            let hinted = if kind.is_some_and(|k| p.hints.contains(&k)) { KIND_HINT_WEIGHT } else { 0.0 };
+            (file, p.meaning_weight * meaning + p.literal_weight * literal + recency(mtime) + hinted)
         })
         .collect();
     let keyword_rank: HashMap<i64, (usize, i64)> =
@@ -600,6 +656,7 @@ mod tests {
             matrix,
             row_segment: vec![0; rows],
             row_file: vec![0; rows],
+            row_modality: vec![Modality::Text; rows],
             file_kind: HashMap::new(),
             file_mtime: HashMap::new(),
             file_ids: HashMap::new(),
@@ -628,6 +685,7 @@ mod tests {
             matrix: Vec::new(),
             row_segment: Vec::new(),
             row_file: Vec::new(),
+            row_modality: Vec::new(),
             file_kind: HashMap::new(),
             file_mtime: HashMap::new(),
             file_ids: HashMap::new(),

@@ -51,6 +51,13 @@ impl Preview {
     pub fn load(hit: &Hit, terms: &[String]) -> Preview {
         let path = Path::new(&hit.path);
         let loc = hit.loc.map(|l| l.round().max(1.0) as usize).unwrap_or(1);
+        if hit.kind.is_picture() {
+            return if hit.excerpt.trim().is_empty() {
+                Preview::Message("no words in this picture".into())
+            } else {
+                Preview::Text(shown(text_lines(&hit.excerpt, terms), 0))
+            };
+        }
         if hit.kind == Kind::Pdf {
             return match pdf_pages(path, loc, terms) {
                 Ok(shown) => Preview::Text(shown),

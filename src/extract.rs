@@ -30,6 +30,8 @@ pub struct Part {
 pub struct Parts {
     pub parts: Vec<Part>,
     pub total: usize,
+    /// A PDF's pages in the range with no text (scans), from 1: read as pictures (and by OCR) when they can be.
+    pub blank: Vec<usize>,
 }
 
 /// Parts `range` (from 0) of a file. A PDF's blank pages (scans, until OCR) are counted but have no part.
@@ -38,15 +40,14 @@ pub fn read_parts(path: &Path, kind: Kind, range: Range<usize>) -> Result<Parts>
         let total = pdf_page_count(path)?.min(MAX_PAGES);
         let (first, last) = (range.start + 1, range.end.min(total));
         if first > last {
-            return Ok(Parts { parts: Vec::new(), total });
+            return Ok(Parts { parts: Vec::new(), total, blank: Vec::new() });
         }
-        let parts = pdf_pages(path, first, last)?
+        let (parts, blank): (Vec<Part>, Vec<Part>) = pdf_pages(path, first, last)?
             .into_iter()
             .enumerate()
             .map(|(i, text)| Part { loc: first + i, text: text.trim().to_string() })
-            .filter(|p| !p.text.is_empty())
-            .collect();
-        return Ok(Parts { parts, total });
+            .partition(|p| !p.text.is_empty());
+        return Ok(Parts { parts, total, blank: blank.into_iter().map(|p| p.loc).collect() });
     }
     // Code is read as written (an html template keeps its markup); only notebooks are converted.
     let notebook = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ipynb"));
@@ -60,7 +61,7 @@ pub fn read_parts(path: &Path, kind: Kind, range: Range<usize>) -> Result<Parts>
         .take(range.len())
         .map(|(i, text)| Part { loc: i + 1, text })
         .collect();
-    Ok(Parts { parts, total })
+    Ok(Parts { parts, total, blank: Vec::new() })
 }
 
 /// A document's plain text, whatever its format: docx, odt and html are converted; anything else is read as text.

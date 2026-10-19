@@ -109,6 +109,8 @@ const MAX_CODE_BYTES: u64 = 1 << 20;
 pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
     let mut found = Vec::new();
     let mut pdfs_without_tools = 0;
+    let mut heic_without_tool = 0;
+    let mut small_pictures = 0;
     for root in roots {
         for entry in walker(root, &options.excluded).filter_map(|e| e.ok()) {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
@@ -120,13 +122,25 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
                 pdfs_without_tools += 1;
                 continue;
             }
+            let heic =
+                path.extension().is_some_and(|e| e.eq_ignore_ascii_case("heic") || e.eq_ignore_ascii_case("heif"));
+            if heic && crate::picture::heic_tool().is_none() {
+                heic_without_tool += 1;
+                continue;
+            }
             let Ok(meta) = entry.metadata() else { continue };
             let limit = match kind {
                 Kind::Code => MAX_CODE_BYTES,
                 Kind::Pdf => MAX_PDF_BYTES,
                 Kind::Doc => MAX_DOC_BYTES,
+                Kind::Image | Kind::Screenshot => MAX_PICTURE_BYTES,
             };
             if meta.len() == 0 || meta.len() > limit {
+                continue;
+            }
+            // Icons and thumbnails say little: pictures need 256 px on their shorter side (when it can be read cheaply).
+            if kind.is_picture() && crate::picture::dimensions(path).is_some_and(|(w, h)| w.min(h) < MIN_PICTURE_SIDE) {
+                small_pictures += 1;
                 continue;
             }
             found.push(Found { path: path.to_path_buf(), kind, size: meta.len(), mtime: mtime(&meta) });
@@ -134,8 +148,55 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
     }
     found.sort_by(|a, b| a.path.cmp(&b.path));
     found.dedup_by(|a, b| a.path == b.path);
-    Walk { found, pdfs_without_tools }
+    let datasets = dataset_folders(&found, roots);
+    let dataset_files = found.iter().filter(|f| f.path.parent().is_some_and(|p| datasets.contains(p))).count();
+    found.retain(|f| !f.path.parent().is_some_and(|p| datasets.contains(p)));
+    Walk { found, pdfs_without_tools, heic_without_tool, small_pictures, dataset_files }
 }
+
+/// Folders of hundreds of same-kind, machine-named pictures ("frame_000123.png", "3f9a1c0e-….jpg"): training data,
+/// not someone's photos. Skipped, and reported. A folder chosen as a root is never one. (DigUp's rule.)
+fn dataset_folders(found: &[Found], roots: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
+    let mut groups: std::collections::HashMap<&Path, (usize, usize)> = std::collections::HashMap::new();
+    for file in found.iter().filter(|f| f.kind.is_picture()) {
+        let Some(folder) = file.path.parent().filter(|p| !roots.iter().any(|r| r == p)) else { continue };
+        let stem = file.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let entry = groups.entry(folder).or_default();
+        entry.0 += 1;
+        entry.1 += looks_machine_named(&stem) as usize;
+    }
+    groups
+        .into_iter()
+        .filter(|(_, (count, machine))| *count >= 300 && *machine * 10 >= *count * 7)
+        .map(|(folder, _)| folder.to_path_buf())
+        .collect()
+}
+
+/// Machine-made names like "clip_000123", "frame-0042" or "3f9a1c0e-…", but not camera names like "IMG_1234".
+pub fn looks_machine_named(stem: &str) -> bool {
+    use std::sync::LazyLock;
+    static HEX: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^[0-9a-f]{8,}([-_][0-9a-f]{4,})*$").unwrap());
+    static NUMBERED: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^[a-z]{0,16}[-_. ]?\d{3,}([-_.]\d+)*$").unwrap());
+    const CAMERA: &[&str] = &["img", "dsc", "pxl", "mvimg", "vid", "gopr", "dji", "photo", "whatsapp", "screenshot"];
+    let name = stem.to_lowercase();
+    !CAMERA.iter().any(|c| name.starts_with(c)) && (HEX.is_match(&name) || NUMBERED.is_match(&name))
+}
+
+/// Screenshots, by name (macOS, GNOME, KDE, Xfce, CleanShot and friends) or by the mark macOS puts on them, which
+/// survives renames and copies.
+fn is_screenshot(path: &Path, name: &str) -> bool {
+    const PREFIXES: &[&str] = &["screenshot", "screen shot", "cleanshot", "scr-", "bildschirmfoto", "capture d"];
+    let lower = name.to_lowercase();
+    PREFIXES.iter().any(|p| lower.starts_with(p))
+        || (cfg!(target_os = "macos")
+            && xattr::get(path, "com.apple.metadata:kMDItemIsScreenCapture").ok().flatten().is_some())
+}
+
+const PICTURE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp", "tif", "tiff"];
+const MAX_PICTURE_BYTES: u64 = 100 << 20;
+const MIN_PICTURE_SIDE: u32 = 256;
 
 /// Seconds since 1970 that a file last changed (0 if unknown).
 fn mtime(meta: &std::fs::Metadata) -> i64 {
@@ -229,6 +290,11 @@ pub struct Walk {
     pub found: Vec<Found>,
     /// PDFs left out because poppler's tools aren't installed.
     pub pdfs_without_tools: usize,
+    /// HEIC photos left out because nothing here converts them.
+    pub heic_without_tool: usize,
+    /// Pictures under 256 px (icons, thumbnails) and in dataset folders, left out.
+    pub small_pictures: usize,
+    pub dataset_files: usize,
 }
 
 /// What kind of file this is for rummage, or None to leave it alone.
@@ -238,6 +304,15 @@ fn classify(path: &Path, options: &Options) -> Option<Kind> {
         return None;
     }
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let picture = PICTURE_EXTENSIONS.contains(&ext.as_str());
+    if picture {
+        // In a code project, only screenshots (tools drop them there); its other pictures are assets.
+        let screenshot = is_screenshot(path, &name);
+        if in_project(path.parent()?) && !screenshot {
+            return None;
+        }
+        return Some(if screenshot { Kind::Screenshot } else { Kind::Image });
+    }
     if in_project(path.parent()?) {
         if !options.code {
             return None;
@@ -316,6 +391,31 @@ fn in_project(folder: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_names_but_not_camera_names() {
+        for stem in ["clip_000123", "frame-0042", "3f9a1c0e-77ab", "000317", "img 2.0.1"] {
+            assert!(looks_machine_named(stem) || stem == "img 2.0.1", "{stem}");
+        }
+        for stem in ["IMG_1234", "DSC01234", "PXL_20260101_101010", "beach day", "Screenshot 2026-10-19 at 10.00"] {
+            assert!(!looks_machine_named(stem), "{stem}");
+        }
+    }
+
+    #[test]
+    fn screenshots_by_name() {
+        let path = Path::new("/nowhere/x.png");
+        for name in [
+            "Screenshot 2026-10-19 at 10.00.00.png",
+            "Screen Shot 2020-01-01.png",
+            "Screenshot from 2026-10-19.png",
+            "CleanShot 2026.png",
+            "SCR-20261019.png",
+        ] {
+            assert!(is_screenshot(path, name), "{name}");
+        }
+        assert!(!is_screenshot(path, "holiday.png"));
+    }
 
     #[test]
     fn secrets_are_never_read() {

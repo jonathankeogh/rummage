@@ -138,6 +138,38 @@ fn index_command(dir: &PathBuf, folders: Vec<PathBuf>, code: bool, exclude: Vec<
         index::duration(started)
     );
     let started = Instant::now();
+    if sync.heic_without_tool > 0 {
+        eprintln!(
+            "left out {} HEIC photos: {}, then run rummage index again",
+            sync.heic_without_tool,
+            rummage::picture::HEIC_HINT
+        );
+    }
+    if sync.small_pictures + sync.dataset_files > 0 {
+        eprintln!(
+            "left out {} icons and thumbnails (under 256 px) and {} pictures in dataset folders",
+            sync.small_pictures, sync.dataset_files
+        );
+    }
+    let pending_count = |kinds: &str| -> Result<i64> {
+        Ok(store.db.query_row(
+            &format!("SELECT COUNT(*) FROM files WHERE state = 'pending' AND kind IN ({kinds})"),
+            [],
+            |r| r.get(0),
+        )?)
+    };
+    let pictures_pending = pending_count("'image', 'screenshot'")?;
+    if pictures_pending > 0 && ModelFiles::locate().is_ok_and(|m| m.media.is_none()) {
+        eprintln!(
+            "{pictures_pending} pictures wait for the image encoder (555 MB): uvx --from huggingface_hub hf download {} {} --revision {}",
+            paths::MODEL_REPOSITORY,
+            paths::MEDIA_MODEL,
+            paths::MODEL_REVISION
+        );
+    }
+    if pending_count("'screenshot'")? > 0 && !rummage::ocr::available() {
+        eprintln!("screenshots are read by what they show only; for their words, {}", rummage::ocr::HINT);
+    }
     if sync.pdfs_without_tools > 0 {
         eprintln!(
             "left out {} PDFs: {}, then run rummage index again",
