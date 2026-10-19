@@ -2,8 +2,7 @@
 //! build and model files). Matching them shows the bindings, tokenizing, prompts and pooling are right, and catches a
 //! llama.cpp upgrade that quietly changes the vectors (every index would have to embed again).
 //!
-//! Needs the model files (see README); skipped without them, as on CI. The audio reference (speech.wav) is checked
-//! once rummage embeds audio.
+//! Needs the model files (see README); skipped without them, as on CI.
 
 use rummage::embed::{Embedder, Picture, prompts};
 use rummage::paths::ModelFiles;
@@ -71,6 +70,26 @@ fn image_vectors_match_digups() {
                 (name.to_string(), embedder.embed_image(Picture::File(folder.join(file)), budget).expect(file))
             })
             .collect()
+    });
+}
+
+#[test]
+fn audio_vector_matches_digups() {
+    // A speech clip, decoded by ffmpeg to 16 kHz mono as indexing decodes any recording.
+    let speech = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference/speech.wav");
+    check(|embedder| {
+        if !embedder.sees_images() || !rummage::media::available() {
+            eprintln!("skipped: no audio encoder or ffmpeg");
+            return Vec::new();
+        }
+        let mut windows = Vec::new();
+        rummage::media::audio_windows(&speech, |w| {
+            windows.push(w.samples);
+            Ok(())
+        })
+        .expect("decode speech.wav");
+        assert_eq!(windows.len(), 1, "a short clip is one window");
+        vec![("speech".to_string(), embedder.embed_audio(&windows[0]).expect("embed"))]
     });
 }
 

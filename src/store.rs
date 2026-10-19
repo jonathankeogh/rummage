@@ -16,6 +16,10 @@ pub enum Kind {
     Image,
     /// Screenshots: by what they show, and their words (OCR) for keyword search.
     Screenshot,
+    /// Recordings, in 30 s windows.
+    Audio,
+    /// Videos: a frame per shot, and their sound.
+    Video,
 }
 
 /// What a passage's vector was made from. A text query sits at different similarities to text and to pictures, so
@@ -24,6 +28,7 @@ pub enum Kind {
 pub enum Modality {
     Text,
     Image,
+    Audio,
 }
 
 impl Modality {
@@ -31,11 +36,16 @@ impl Modality {
         match self {
             Modality::Text => "text",
             Modality::Image => "image",
+            Modality::Audio => "audio",
         }
     }
 
     pub fn parse(s: &str) -> Modality {
-        if s == "image" { Modality::Image } else { Modality::Text }
+        match s {
+            "image" => Modality::Image,
+            "audio" => Modality::Audio,
+            _ => Modality::Text,
+        }
     }
 }
 
@@ -47,7 +57,14 @@ impl Kind {
             Kind::Code => "code",
             Kind::Image => "image",
             Kind::Screenshot => "screenshot",
+            Kind::Audio => "audio",
+            Kind::Video => "video",
         }
+    }
+
+    /// Sound or video: `loc` is a moment, in seconds.
+    pub fn is_timed(self) -> bool {
+        matches!(self, Kind::Audio | Kind::Video)
     }
 
     /// What `loc` counts for this kind.
@@ -55,6 +72,7 @@ impl Kind {
         match self {
             Kind::Pdf => "page",
             Kind::Image | Kind::Screenshot => "picture",
+            Kind::Audio | Kind::Video => "second",
             Kind::Doc | Kind::Code => "passage",
         }
     }
@@ -64,6 +82,7 @@ impl Kind {
         match self {
             Kind::Image => "img",
             Kind::Screenshot => "shot",
+            Kind::Video => "video",
             other => other.as_str(),
         }
     }
@@ -80,6 +99,8 @@ impl Kind {
             "code" => Some(Kind::Code),
             "image" => Some(Kind::Image),
             "screenshot" => Some(Kind::Screenshot),
+            "audio" => Some(Kind::Audio),
+            "video" => Some(Kind::Video),
             _ => None,
         }
     }
@@ -128,7 +149,8 @@ impl Store {
                  loc REAL,                     -- passage or page number from 1 (seconds later)
                  excerpt TEXT NOT NULL,
                  vector BLOB NOT NULL,         -- 768 little-endian f32; empty for keyword-only text (OCR words)
-                 modality TEXT NOT NULL DEFAULT 'text'   -- text | image: what the vector was made from
+                 modality TEXT NOT NULL DEFAULT 'text',  -- text | image | audio: what the vector was made from
+                 loc_end REAL                  -- where a stretch of sound or video ends, in seconds
              );
              CREATE INDEX IF NOT EXISTS segments_file ON segments(file_id);
              CREATE VIRTUAL TABLE IF NOT EXISTS words USING fts5(
@@ -152,6 +174,14 @@ impl Store {
             })?;
         if !has_modality {
             db.execute("ALTER TABLE segments ADD COLUMN modality TEXT NOT NULL DEFAULT 'text'", [])?;
+        }
+        // And before sound and video, where a stretch ends.
+        let has_end: bool =
+            db.query_row("SELECT COUNT(*) > 0 FROM pragma_table_info('segments') WHERE name = 'loc_end'", [], |r| {
+                r.get(0)
+            })?;
+        if !has_end {
+            db.execute("ALTER TABLE segments ADD COLUMN loc_end REAL", [])?;
         }
         let store = Store { db, file };
         match store.meta("fingerprint")? {
@@ -262,11 +292,27 @@ impl Store {
         vector: Option<&[f32]>,
         modality: Modality,
     ) -> Result<()> {
+        self.add_stretch(file_id, loc, None, name, text, excerpt, vector, modality)
+    }
+
+    /// A passage that covers a stretch of time, from `loc` to `loc_end` seconds (sound, video).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_stretch(
+        &self,
+        file_id: i64,
+        loc: f64,
+        loc_end: Option<f64>,
+        name: &str,
+        text: &str,
+        excerpt: &str,
+        vector: Option<&[f32]>,
+        modality: Modality,
+    ) -> Result<()> {
         // No vector: the text is for keyword search only (a screenshot's words).
         let blob: Vec<u8> = vector.unwrap_or_default().iter().flat_map(|x| x.to_le_bytes()).collect();
         self.db.execute(
-            "INSERT INTO segments (file_id, loc, excerpt, vector, modality) VALUES (?, ?, ?, ?, ?)",
-            params![file_id, loc, excerpt, blob, modality.as_str()],
+            "INSERT INTO segments (file_id, loc, loc_end, excerpt, vector, modality) VALUES (?, ?, ?, ?, ?, ?)",
+            params![file_id, loc, loc_end, excerpt, blob, modality.as_str()],
         )?;
         let id = self.db.last_insert_rowid();
         self.db.execute("INSERT INTO words (rowid, name, text) VALUES (?, ?, ?)", params![id, name, text])?;

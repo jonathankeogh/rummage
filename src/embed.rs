@@ -205,6 +205,21 @@ impl Embedder {
         result
     }
 
+    /// A stretch of sound's vector: 16 kHz mono samples (−1 to 1); the model hears at most 30 s of it.
+    pub fn embed_audio(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
+        if self.media.is_null() {
+            bail!("the audio encoder isn't loaded");
+        }
+        let limit = samples.len().min(30 * crate::media::SAMPLE_RATE);
+        let bitmap = unsafe { sys::mtmd_bitmap_init_from_audio(limit, samples.as_ptr()) };
+        if bitmap.is_null() {
+            bail!("can't make an audio bitmap");
+        }
+        let result = self.embed_bitmap(bitmap);
+        unsafe { sys::mtmd_bitmap_free(bitmap) };
+        result
+    }
+
     fn load_bitmap(&mut self, picture: Picture, budget: usize) -> Result<*mut sys::mtmd_bitmap> {
         let bitmap = unsafe {
             match &picture {

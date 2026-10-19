@@ -23,8 +23,11 @@ pub struct Hit {
     pub cosine: Option<f64>,
     /// 1-based rank among keyword matches.
     pub keyword_rank: Option<usize>,
-    /// Passage or page number from 1.
+    /// Passage or page number from 1; for sound and video, the moment in seconds.
     pub loc: Option<f64>,
+    /// Where that stretch of sound or video ends, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loc_end: Option<f64>,
     /// The line grep matched, from 1, when that's where the hit points (no passage stood out).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
@@ -263,7 +266,7 @@ fn centre_by_modality(scores: &mut [f32], modality: &[Modality]) {
         return; // all text: nothing to line up (the z-score centres it anyway)
     }
     let all = median(scores.to_vec());
-    let centres: HashMap<Modality, f32> = [Modality::Text, Modality::Image]
+    let centres: HashMap<Modality, f32> = [Modality::Text, Modality::Image, Modality::Audio]
         .into_iter()
         .map(|m| {
             let rows: Vec<f32> = scores.iter().zip(modality).filter(|(_, r)| **r == m).map(|(&s, _)| s).collect();
@@ -324,6 +327,8 @@ pub fn kind_hints(text: &str) -> HashSet<Kind> {
             "screenshot" | "screenshots" | "screengrab" => Kind::Screenshot,
             "pdf" | "pdfs" | "paper" | "papers" => Kind::Pdf,
             "document" | "documents" | "note" | "notes" | "doc" | "docs" => Kind::Doc,
+            "video" | "videos" | "clip" | "clips" | "movie" | "film" | "footage" => Kind::Video,
+            "audio" | "podcast" | "recording" | "recordings" | "song" | "voice" | "sound" => Kind::Audio,
             _ => continue,
         };
         hints.insert(kind);
@@ -540,7 +545,7 @@ pub fn rank(store: &Store, vectors: &Vectors, prepared: &Prepared, grep: &[GrepH
         Ok(!p.any_word.is_empty() && word_check.exists(params![p.any_word, segment])?)
     };
     let mut statement = store.db.prepare(
-        "SELECT f.path, f.kind, s.loc, s.excerpt FROM segments s JOIN files f ON f.id = s.file_id WHERE s.id = ?",
+        "SELECT f.path, f.kind, s.loc, s.excerpt, s.loc_end FROM segments s JOIN files f ON f.id = s.file_id WHERE s.id = ?",
     )?;
     for (file, score) in scored.into_iter().take(p.limit) {
         let meaning = p.best.get(&file);
@@ -566,6 +571,7 @@ pub fn rank(store: &Store, vectors: &Vectors, prepared: &Prepared, grep: &[GrepH
                         r.get::<_, String>(1)?,
                         r.get::<_, Option<f64>>(2)?,
                         r.get::<_, String>(3)?,
+                        r.get::<_, Option<f64>>(4)?,
                     ))
                 })?;
                 Hit {
@@ -576,6 +582,7 @@ pub fn rank(store: &Store, vectors: &Vectors, prepared: &Prepared, grep: &[GrepH
                     cosine: meaning.map(|m| m.1),
                     keyword_rank: words.map(|w| w.0),
                     loc: row.2,
+                    loc_end: row.4,
                     line: None,
                     grep: grepped.is_some(),
                     excerpt: row.3,
@@ -589,6 +596,7 @@ pub fn rank(store: &Store, vectors: &Vectors, prepared: &Prepared, grep: &[GrepH
                 cosine: meaning.map(|m| m.1),
                 keyword_rank: None,
                 loc: None,
+                loc_end: None,
                 line: Some(g.line),
                 grep: true,
                 excerpt: g.text.clone(),

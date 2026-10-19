@@ -4,17 +4,18 @@ Instant multimodal semantic file search for the Unix terminal. Describe what you
 by meaning and by exact words, locally, on any GPU or CPU. Type `rummage` for a yazi-style interface, or use it inside
 yazi with the plugin.
 
-**Status: milestones 1–6 of 10.** Search works end to end over text, Markdown, PDFs (page by page), Word
+**Status: milestones 1–7 of 10.** Search works end to end over text, Markdown, PDFs (page by page), Word
 (docx), OpenDocument (odt) and HTML files, and, with `--code`, source code, through a background service that keeps
 searches instant, with a search-as-you-type interface and live grep beside meaning search. Photos and screenshots
-are found by what they show (and screenshots and scanned pages by their words, through OCR). Audio, video and the
-yazi plugin are coming.
+are found by what they show (and screenshots and scanned pages by their words, through OCR); recordings and videos
+by what's said and shown, landing on the moment. The yazi plugin is coming.
 
 ## Build
 
 You need Rust, CMake, git and a C++ compiler (Xcode Command Line Tools on macOS, `build-essential` and `clang` on
 Linux). For PDFs, install poppler (`brew install poppler`, `apt install poppler-utils`, `dnf install poppler-utils`);
-for the words in screenshots and scans, tesseract (`brew install tesseract`, `apt install tesseract-ocr`); for iPhone
+for recordings and videos, ffmpeg (`brew install ffmpeg`, `apt install ffmpeg`); for the words in screenshots and
+scans, tesseract (`brew install tesseract`, `apt install tesseract-ocr`); for iPhone
 HEIC photos on Linux, libheif (`apt install libheif-examples`). Without them those parts are left out, and
 `rummage index` says so.
 
@@ -24,7 +25,7 @@ cargo build --release                    # macOS: Metal. Linux: CPU, or add --fe
 ```
 
 The model is [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache 2.0). Download it once: 310 MB
-for text, and 555 MB more for pictures (without it, pictures wait):
+for text, and 555 MB more for pictures, sound and video (without it, those wait):
 
 ```sh
 uvx --from huggingface_hub hf download ggml-org/embeddinggemma-2-GGUF embeddinggemma-2-Q8_0.gguf \
@@ -59,7 +60,9 @@ the model files instead of the Hugging Face cache.
 
 Text and Markdown, PDFs a page at a time (scanned pages as pictures, read by OCR), docx, odt and html, photos and
 screenshots (JPEG, PNG, HEIC, WebP, GIF, BMP, TIFF; icons under 256 px and dataset folders of machine-named pictures
-are left out), and with `--code` source code and notebooks, in projects and as loose scripts. Long files go in two
+are left out), recordings of any length (MP3, M4A, WAV, FLAC, Ogg, Opus …, in overlapping 30 s windows; silence
+skipped) and videos (MP4, MOV, MKV, WebM, AVI, MPEG-TS …: a frame per shot plus the sound; a TypeScript .ts stays
+code), and with `--code` source code and notebooks, in projects and as loose scripts. Long files go in two
 passes: the first 30 pages of a big PDF or 40 passages of a long document right away, the rest once everything else
 is in, so a 500-page PDF can't hold up the first pass. Scanned PDFs (no text) wait for OCR.
 

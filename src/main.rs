@@ -138,6 +138,13 @@ fn index_command(dir: &PathBuf, folders: Vec<PathBuf>, code: bool, exclude: Vec<
         index::duration(started)
     );
     let started = Instant::now();
+    if sync.media_without_ffmpeg > 0 {
+        eprintln!(
+            "left out {} recordings and videos: {}, then run rummage index again",
+            sync.media_without_ffmpeg,
+            rummage::media::HINT
+        );
+    }
     if sync.heic_without_tool > 0 {
         eprintln!(
             "left out {} HEIC photos: {}, then run rummage index again",
@@ -158,10 +165,10 @@ fn index_command(dir: &PathBuf, folders: Vec<PathBuf>, code: bool, exclude: Vec<
             |r| r.get(0),
         )?)
     };
-    let pictures_pending = pending_count("'image', 'screenshot'")?;
+    let pictures_pending = pending_count("'image', 'screenshot', 'audio', 'video'")?;
     if pictures_pending > 0 && ModelFiles::locate().is_ok_and(|m| m.media.is_none()) {
         eprintln!(
-            "{pictures_pending} pictures wait for the image encoder (555 MB): uvx --from huggingface_hub hf download {} {} --revision {}",
+            "{pictures_pending} pictures, recordings and videos wait for the image and audio encoder (555 MB): uvx --from huggingface_hub hf download {} {} --revision {}",
             paths::MODEL_REPOSITORY,
             paths::MEDIA_MODEL,
             paths::MODEL_REVISION
@@ -262,6 +269,7 @@ fn search_command(
         let place = match (hit.kind, hit.loc) {
             _ if hit.line.is_some() => format!("  [line {}]", hit.line.unwrap_or(0)),
             (Kind::Pdf, Some(loc)) => format!("  [page {loc:.0}]"),
+            (kind, Some(loc)) if kind.is_timed() => format!("  [@{}]", rummage::media::clock(loc)),
             (_, Some(loc)) if loc > 1.0 => format!("  [passage {loc:.0}]"),
             _ => String::new(),
         };

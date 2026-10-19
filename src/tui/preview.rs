@@ -51,6 +51,10 @@ impl Preview {
     pub fn load(hit: &Hit, terms: &[String]) -> Preview {
         let path = Path::new(&hit.path);
         let loc = hit.loc.map(|l| l.round().max(1.0) as usize).unwrap_or(1);
+        if hit.kind.is_timed() {
+            let what = if hit.kind == Kind::Video { "the frame and sound around" } else { "the sound around" };
+            return Preview::Message(format!("{}\n\nmatched {what} this moment", hit.excerpt));
+        }
         if hit.kind.is_picture() {
             return if hit.excerpt.trim().is_empty() {
                 Preview::Message("no words in this picture".into())
@@ -448,6 +452,7 @@ mod tests {
             cosine: None,
             keyword_rank: Some(2),
             loc: None,
+            loc_end: None,
             line: None,
             grep: false,
             excerpt: String::new(),

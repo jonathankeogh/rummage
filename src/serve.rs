@@ -161,7 +161,7 @@ impl Engine {
         let kinds: HashSet<Kind> = match (code, kinds) {
             (true, _) => [Kind::Code].into(),
             (false, Some(kinds)) if !kinds.is_empty() => kinds.iter().copied().collect(),
-            _ => [Kind::Doc, Kind::Pdf, Kind::Image, Kind::Screenshot].into(),
+            _ => [Kind::Doc, Kind::Pdf, Kind::Image, Kind::Screenshot, Kind::Audio, Kind::Video].into(),
         };
         if query.is_empty() {
             return Ok((Vec::new(), None));

@@ -107,6 +107,7 @@ impl Backend for SampleBackend {
                     cosine: Some(0.3 + 0.05 * score),
                     keyword_rank,
                     loc: Some(1.0),
+                    loc_end: None,
                     line: None,
                     grep: false,
                     excerpt: text.chars().take(200).collect(),

@@ -76,8 +76,9 @@ fn event_loop(terminal: &mut Term, app: &mut App, responses: &std::sync::mpsc::R
             Action::Open(i) => {
                 let hit = &app.hits[i];
                 let page = (hit.kind == crate::store::Kind::Pdf).then(|| hit.loc.map_or(1, |l| l.round() as usize));
+                let moment = hit.kind.is_timed().then(|| hit.loc.unwrap_or(0.0));
                 let (path, code) = (hit.path.clone(), hit.kind == crate::store::Kind::Code);
-                if let Err(e) = open(terminal, &path, code, page) {
+                if let Err(e) = open(terminal, &path, code, page, moment) {
                     app.notify(format!("can't open: {e:#}"));
                 }
             }
@@ -103,7 +104,7 @@ fn opener() -> &'static str {
 }
 
 /// Open a file: code in `$EDITOR` if set (the interface steps aside while it runs), anything else with the desktop.
-fn open(terminal: &mut Term, path: &str, code: bool, page: Option<usize>) -> Result<()> {
+fn open(terminal: &mut Term, path: &str, code: bool, page: Option<usize>, moment: Option<f64>) -> Result<()> {
     let editor = std::env::var("EDITOR").ok().filter(|e| code && !e.trim().is_empty());
     if let Some(editor) = editor {
         let mut words = editor.split_whitespace();
@@ -121,7 +122,22 @@ fn open(terminal: &mut Term, path: &str, code: bool, page: Option<usize>) -> Res
             return detached(viewer, &args.iter().map(String::as_str).chain([path]).collect::<Vec<_>>());
         }
     }
+    if let Some(seconds) = moment {
+        if let Some((player, args)) = player_at(seconds) {
+            return detached(player, &args.iter().map(String::as_str).chain([path]).collect::<Vec<_>>());
+        }
+    }
     detached(opener(), &[path])
+}
+
+/// A media player on PATH that can start at a moment, with the arguments that do it; without one, the file opens
+/// from its start with the desktop's player.
+fn player_at(seconds: f64) -> Option<(&'static str, Vec<String>)> {
+    let at = format!("{:.0}", seconds.max(0.0).floor());
+    let players: [(&str, Vec<String>); 2] =
+        [("mpv", vec![format!("--start={at}"), "--force-window".into()]), ("vlc", vec![format!("--start-time={at}")])];
+    let path = std::env::var_os("PATH")?;
+    players.into_iter().find(|(name, _)| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
 }
 
 /// A PDF viewer on PATH that can open at a page, with the arguments that do it. macOS's `open` can't, so there the

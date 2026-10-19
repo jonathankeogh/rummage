@@ -98,6 +98,7 @@ fn row_line(hit: &Hit, selected: bool, width: usize) -> Line<'static> {
     let name = Path::new(&hit.path).file_name().map_or(hit.path.clone(), |n| n.to_string_lossy().into_owned());
     let place = match (hit.kind, hit.loc) {
         (Kind::Pdf, Some(loc)) => format!("p{}", loc.round() as i64),
+        (kind, Some(loc)) if kind.is_timed() => format!("@{}", crate::media::clock(loc)),
         (_, Some(loc)) if loc > 1.0 => format!("#{}", loc.round() as i64),
         _ => String::new(),
     };
@@ -108,15 +109,17 @@ fn row_line(hit: &Hit, selected: bool, width: usize) -> Line<'static> {
         Kind::Code => Color::Yellow,
         Kind::Image => Color::Green,
         Kind::Screenshot => Color::Blue,
+        Kind::Audio => Color::LightRed,
+        Kind::Video => Color::LightMagenta,
     };
-    let fixed = 2 + 5 + place.chars().count() + 1;
+    let fixed = 2 + 6 + place.chars().count() + 1;
     let room = width.saturating_sub(fixed).max(1);
     let name = truncate(&name, room);
     let pad = room.saturating_sub(name.chars().count());
     let kind_style = if selected { Style::default() } else { Style::default().fg(kind_color) };
     Line::from(vec![
         Span::raw(format!("{marker} ")),
-        Span::styled(format!("{:<5}", hit.kind.label()), kind_style),
+        Span::styled(format!("{:<6}", hit.kind.label()), kind_style),
         Span::raw(name),
         Span::raw(" ".repeat(pad + 1)),
         Span::raw(place),
@@ -206,6 +209,8 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
         detail += if page_view { " · ^v text" } else { " · ^v page" };
     } else if hit.kind.is_picture() {
         detail += if page_view { " · ^v words" } else { " · ^v picture" };
+    } else if hit.kind.is_timed() {
+        detail += " · ⏎ plays from here";
     }
     let info = vec![
         Line::from(Span::styled(tilde(Path::new(&hit.path)), Style::default().add_modifier(Modifier::BOLD))),
@@ -286,9 +291,9 @@ mod tests {
     fn results_and_preview() {
         let screen = draw(&mut with_hits(), 140, 14);
         assert!(screen.contains("rummage ─ dog on the beach█"), "{screen}");
-        assert!(screen.contains("▸ doc  beach-trip.md"), "{screen}");
+        assert!(screen.contains("▸ doc   beach-trip.md"), "{screen}");
         assert!(screen.contains("lease.txt") && screen.contains("#3"));
-        assert!(screen.contains("code retry.rs"));
+        assert!(screen.contains("code  retry.rs"));
         assert!(screen.contains("We took the Dog to the beach"), "{screen}");
         assert!(screen.contains("beach-trip.md") && screen.contains("meaning z 3.1 · words #2"));
     }

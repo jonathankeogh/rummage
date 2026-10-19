@@ -33,6 +33,8 @@ pub struct Sync {
     pub pdfs_without_tools: usize,
     /// HEIC photos left out because nothing here converts them.
     pub heic_without_tool: usize,
+    /// Sound and video left out because ffmpeg isn't installed.
+    pub media_without_ffmpeg: usize,
     /// Pictures left out as icons (under 256 px) or as dataset folders.
     pub small_pictures: usize,
     pub dataset_files: usize,
@@ -46,6 +48,7 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options) -> Resul
         found: found.len(),
         pdfs_without_tools: walk.pdfs_without_tools,
         heic_without_tool: walk.heic_without_tool,
+        media_without_ffmpeg: walk.media_without_ffmpeg,
         small_pictures: walk.small_pictures,
         dataset_files: walk.dataset_files,
         ..Default::default()
@@ -90,7 +93,7 @@ struct Job {
     parts: Vec<Part>,
     /// A PDF's pages without text in this step (scans): embedded as pictures, their words read by OCR.
     scans: Vec<usize>,
-    /// A picture file (photo or screenshot): its one vector is of what it shows.
+    /// A picture, sound or video file: embedded by what it shows or sounds like (see `embed`).
     picture: Option<Kind>,
     /// Parts read once this job is stored, and the file's total.
     done: usize,
@@ -173,7 +176,7 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
 
 /// A file's first step: all of a short file; the start of a long one.
 fn first_step(file_id: i64, path: &Path, kind: Kind) -> Result<Job> {
-    if kind.is_picture() {
+    if kind.is_picture() || kind.is_timed() {
         let name = file_name(path);
         return Ok(Job {
             file_id,
@@ -194,7 +197,7 @@ fn first_step(file_id: i64, path: &Path, kind: Kind) -> Result<Job> {
         Kind::Doc => FIRST_PASSAGES,
         // Code files are small (1 MB at most): all at once.
         Kind::Code => extract::MAX_PASSAGES,
-        Kind::Image | Kind::Screenshot => unreachable!("pictures are handled above"),
+        Kind::Image | Kind::Screenshot | Kind::Audio | Kind::Video => unreachable!("handled above"),
     };
     let read = extract::read_parts(path, kind, 0..step)?;
     Ok(Job {
@@ -225,8 +228,8 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<P
         .collect();
     let vectors = embedder.embed_texts(&inputs)?;
 
-    // Pictures and scanned pages, one at a time: (job, loc, words, vector), and the pictures that failed.
-    let mut seen: Vec<(usize, f64, String, Vec<f32>)> = Vec::new();
+    // Pictures, scanned pages, sound and video, one at a time, and the files that failed.
+    let mut seen: Vec<Seen> = Vec::new();
     let mut failed: Vec<(usize, String)> = Vec::new();
     let mut waiting: Vec<usize> = Vec::new();
     for (j, job) in jobs.iter().enumerate() {
@@ -235,15 +238,32 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<P
                 waiting.push(j);
                 continue;
             }
-            match embed_picture(embedder, &job.path, kind) {
-                Ok((vector, words)) => seen.push((j, 1.0, words, vector)),
-                Err(error) => failed.push((j, format!("{error:#}"))),
+            let result = if kind.is_timed() {
+                embed_timed(embedder, &job.path, kind).map(|stretches| {
+                    for (start, end, vector, modality) in stretches {
+                        seen.push(Seen { job: j, loc: start, end: Some(end), words: String::new(), vector, modality });
+                    }
+                })
+            } else {
+                embed_picture(embedder, &job.path, kind).map(|(vector, words)| {
+                    seen.push(Seen { job: j, loc: 1.0, end: None, words, vector, modality: Modality::Image })
+                })
+            };
+            if let Err(error) = result {
+                failed.push((j, format!("{error:#}")));
             }
         }
         if embedder.sees_images() {
             for &page in &job.scans {
                 match embed_scanned_page(embedder, &job.path, page) {
-                    Ok((vector, words)) => seen.push((j, page as f64, words, vector)),
+                    Ok((vector, words)) => seen.push(Seen {
+                        job: j,
+                        loc: page as f64,
+                        end: None,
+                        words,
+                        vector,
+                        modality: Modality::Image,
+                    }),
                     Err(error) => eprintln!("rummage: page {page} of {}: {error:#}", job.path.display()),
                 }
             }
@@ -267,10 +287,19 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<P
                 Modality::Text,
             )?;
         }
-        for (_, loc, words, vector) in seen.iter().filter(|s| s.0 == j) {
-            // A picture's words in full (up to 4,000 characters): its preview shows them.
-            let excerpt: String = words.chars().take(4000).collect();
-            store.add_segment(job.file_id, *loc, &job.name, words, &excerpt, Some(vector), Modality::Image)?;
+        for s in seen.iter().filter(|s| s.job == j) {
+            // A picture's words in full (up to 4,000 characters): its preview shows them. A stretch of sound or video
+            // says where it is.
+            let excerpt: String = match s.end {
+                Some(end) => format!(
+                    "{} {}–{}",
+                    if s.modality == Modality::Image { "frame" } else { "sound" },
+                    crate::media::clock(s.loc),
+                    crate::media::clock(end)
+                ),
+                None => s.words.chars().take(4000).collect(),
+            };
+            store.add_stretch(job.file_id, s.loc, s.end, &job.name, &s.words, &excerpt, Some(&s.vector), s.modality)?;
         }
         if waiting.contains(&j) {
             continue;
@@ -283,6 +312,52 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<P
     }
     tx.commit()?;
     Ok(paths)
+}
+
+/// A vector of part of a file that isn't text: a picture, a scanned page, a video frame, a stretch of sound.
+struct Seen {
+    job: usize,
+    /// Page, or start in seconds; for a stretch, where it ends.
+    loc: f64,
+    end: Option<f64>,
+    words: String,
+    vector: Vec<f32>,
+    modality: Modality,
+}
+
+/// A recording's or a video's vectors: (start, end, vector, modality). A video gives a frame per shot (70 vision
+/// tokens) and its sound; a recording its sound, in 30 s windows.
+fn embed_timed(embedder: &mut Embedder, path: &Path, kind: Kind) -> Result<Vec<(f64, f64, Vec<f32>, Modality)>> {
+    let mut out = Vec::new();
+    let (has_audio, has_video) = crate::media::streams(path);
+    if kind == Kind::Video && has_video {
+        let folder = std::env::temp_dir().join(format!("rummage-frames-{}-{}", std::process::id(), now_nanos()));
+        let frames = crate::media::keyframes(path, &folder);
+        let result = frames.and_then(|frames| {
+            for frame in frames {
+                let vector = embedder.embed_image(Picture::File(frame.path.clone()), crate::media::FRAME_BUDGET)?;
+                out.push((frame.start, frame.end, vector, Modality::Image));
+            }
+            Ok(())
+        });
+        let _ = std::fs::remove_dir_all(&folder);
+        result?;
+    }
+    if has_audio {
+        crate::media::audio_windows(path, |window| {
+            let vector = embedder.embed_audio(&window.samples)?;
+            out.push((window.start, window.end, vector, Modality::Audio));
+            Ok(())
+        })?;
+    }
+    if out.is_empty() && !has_audio && !has_video {
+        anyhow::bail!("no sound or picture in it");
+    }
+    Ok(out)
+}
+
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
 }
 
 /// A picture's vector (photos at 140 vision tokens, screenshots at 280) and, for a screenshot, its words.

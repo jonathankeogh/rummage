@@ -242,3 +242,79 @@ fn pictures_and_screenshots() {
         assert!(hit["keyword_rank"].is_number(), "found by its words: {hit}");
     }
 }
+
+#[test]
+fn sound_and_video() {
+    if !model_present()
+        || rummage::paths::ModelFiles::locate().is_ok_and(|m| m.media.is_none())
+        || !rummage::media::available()
+    {
+        eprintln!("skipped: no media encoder or ffmpeg");
+        return;
+    }
+    let s = Sandbox::new("media");
+    let photo = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference/photo.jpg");
+    // 12 s: the photo for 6 s, then black for 6 s, over a tone; and a 40 s recording (two windows).
+    let video = s.files().join("beach-holiday.mp4");
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-loop", "1", "-t", "6", "-i"])
+        .arg(&photo)
+        .args([
+            "-f",
+            "lavfi",
+            "-t",
+            "6",
+            "-i",
+            "color=c=black:s=1024x768:r=24",
+            "-f",
+            "lavfi",
+            "-t",
+            "12",
+            "-i",
+            "sine=frequency=330:sample_rate=16000",
+            "-filter_complex",
+            "[0:v]scale=1024:768,setsar=1,fps=24[a];[1:v]setsar=1[b];[a][b]concat=n=2:v=1:a=0,format=yuv420p[v]",
+            "-map",
+            "[v]",
+            "-map",
+            "2:a",
+            "-shortest",
+        ])
+        .arg(&video)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let recording = s.files().join("meeting-recording.wav");
+    assert!(
+        Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=500:duration=40",
+                "-ac",
+                "1",
+                "-ar",
+                "16000"
+            ])
+            .arg(&recording)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // TypeScript with a video's extension isn't a video.
+    s.write("app.ts", "export const greet = (name: string) => `hello ${name}`;");
+    let report = s.index();
+    assert!(report.contains("2 files"), "{report}");
+
+    let hits = s.search("beach holiday", &["--no-serve", "--no-grep"]);
+    let (_, hit) = hits.iter().find(|(name, _)| name == "beach-holiday.mp4").expect("the video, by its name");
+    assert_eq!(hit["kind"], "video");
+    assert!(hit["loc"].is_number() && hit["loc_end"].is_number(), "a moment, and where it ends: {hit}");
+    let hits = s.search("meeting recording", &["--no-serve", "--no-grep"]);
+    let (_, hit) = hits.iter().find(|(name, _)| name == "meeting-recording.wav").expect("the recording");
+    assert_eq!(hit["kind"], "audio");
+}

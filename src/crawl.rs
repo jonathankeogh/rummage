@@ -110,6 +110,7 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
     let mut found = Vec::new();
     let mut pdfs_without_tools = 0;
     let mut heic_without_tool = 0;
+    let mut media_without_ffmpeg = 0;
     let mut small_pictures = 0;
     for root in roots {
         for entry in walker(root, &options.excluded).filter_map(|e| e.ok()) {
@@ -120,6 +121,10 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
             let Some(kind) = classify(path, options) else { continue };
             if kind == Kind::Pdf && !crate::extract::pdf_tools() {
                 pdfs_without_tools += 1;
+                continue;
+            }
+            if kind.is_timed() && !crate::media::available() {
+                media_without_ffmpeg += 1;
                 continue;
             }
             let heic =
@@ -134,6 +139,7 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
                 Kind::Pdf => MAX_PDF_BYTES,
                 Kind::Doc => MAX_DOC_BYTES,
                 Kind::Image | Kind::Screenshot => MAX_PICTURE_BYTES,
+                Kind::Audio | Kind::Video => u64::MAX,
             };
             if meta.len() == 0 || meta.len() > limit {
                 continue;
@@ -151,24 +157,25 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
     let datasets = dataset_folders(&found, roots);
     let dataset_files = found.iter().filter(|f| f.path.parent().is_some_and(|p| datasets.contains(p))).count();
     found.retain(|f| !f.path.parent().is_some_and(|p| datasets.contains(p)));
-    Walk { found, pdfs_without_tools, heic_without_tool, small_pictures, dataset_files }
+    Walk { found, pdfs_without_tools, heic_without_tool, media_without_ffmpeg, small_pictures, dataset_files }
 }
 
-/// Folders of hundreds of same-kind, machine-named pictures ("frame_000123.png", "3f9a1c0e-….jpg"): training data,
-/// not someone's photos. Skipped, and reported. A folder chosen as a root is never one. (DigUp's rule.)
+/// Folders of hundreds of same-kind, machine-named pictures, clips or videos ("frame_000123.png", "clip_0042.wav",
+/// "3f9a1c0e-….jpg"): training data, not someone's files. Skipped, and reported. A folder chosen as a root is never
+/// one. (DigUp's rule.)
 fn dataset_folders(found: &[Found], roots: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
-    let mut groups: std::collections::HashMap<&Path, (usize, usize)> = std::collections::HashMap::new();
-    for file in found.iter().filter(|f| f.kind.is_picture()) {
+    let mut groups: std::collections::HashMap<(&Path, Kind), (usize, usize)> = std::collections::HashMap::new();
+    for file in found.iter().filter(|f| f.kind.is_picture() || f.kind.is_timed()) {
         let Some(folder) = file.path.parent().filter(|p| !roots.iter().any(|r| r == p)) else { continue };
         let stem = file.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let entry = groups.entry(folder).or_default();
+        let entry = groups.entry((folder, file.kind)).or_default();
         entry.0 += 1;
         entry.1 += looks_machine_named(&stem) as usize;
     }
     groups
         .into_iter()
         .filter(|(_, (count, machine))| *count >= 300 && *machine * 10 >= *count * 7)
-        .map(|(folder, _)| folder.to_path_buf())
+        .map(|((folder, _), _)| folder.to_path_buf())
         .collect()
 }
 
@@ -193,6 +200,12 @@ fn is_screenshot(path: &Path, name: &str) -> bool {
         || (cfg!(target_os = "macos")
             && xattr::get(path, "com.apple.metadata:kMDItemIsScreenCapture").ok().flatten().is_some())
 }
+
+const AUDIO_EXTENSIONS: &[&str] =
+    &["mp3", "m4a", "aac", "wav", "flac", "ogg", "oga", "opus", "wma", "aiff", "aif", "caf"];
+/// .ts / .mts / .m2ts count only when the bytes say MPEG transport stream (else they're TypeScript).
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "avi", "wmv", "flv", "3gp", "mpg", "mpeg"];
+const TRANSPORT_EXTENSIONS: &[&str] = &["ts", "mts", "m2ts"];
 
 const PICTURE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp", "tif", "tiff"];
 const MAX_PICTURE_BYTES: u64 = 100 << 20;
@@ -292,6 +305,8 @@ pub struct Walk {
     pub pdfs_without_tools: usize,
     /// HEIC photos left out because nothing here converts them.
     pub heic_without_tool: usize,
+    /// Sound and video left out because ffmpeg isn't installed.
+    pub media_without_ffmpeg: usize,
     /// Pictures under 256 px (icons, thumbnails) and in dataset folders, left out.
     pub small_pictures: usize,
     pub dataset_files: usize,
@@ -304,6 +319,19 @@ fn classify(path: &Path, options: &Options) -> Option<Kind> {
         return None;
     }
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    // Sound and video, anywhere but inside code projects (there they're assets or fixtures).
+    let timed = if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
+        Some(Kind::Audio)
+    } else if VIDEO_EXTENSIONS.contains(&ext.as_str())
+        || (TRANSPORT_EXTENSIONS.contains(&ext.as_str()) && crate::media::is_mpeg_transport_stream(path))
+    {
+        Some(Kind::Video)
+    } else {
+        None
+    };
+    if let Some(kind) = timed {
+        return (!in_project(path.parent()?)).then_some(kind);
+    }
     let picture = PICTURE_EXTENSIONS.contains(&ext.as_str());
     if picture {
         // In a code project, only screenshots (tools drop them there); its other pictures are assets.

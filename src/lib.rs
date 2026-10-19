@@ -5,6 +5,7 @@ pub mod embed;
 pub mod extract;
 pub mod grep;
 pub mod index;
+pub mod media;
 pub mod ocr;
 pub mod paths;
 pub mod picture;

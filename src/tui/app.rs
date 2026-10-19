@@ -111,7 +111,9 @@ impl Filter {
             Filter::Only(Kind::Doc) => Filter::Only(Kind::Pdf),
             Filter::Only(Kind::Pdf) => Filter::Only(Kind::Image),
             Filter::Only(Kind::Image) => Filter::Only(Kind::Screenshot),
-            Filter::Only(Kind::Screenshot) => Filter::Only(Kind::Code),
+            Filter::Only(Kind::Screenshot) => Filter::Only(Kind::Audio),
+            Filter::Only(Kind::Audio) => Filter::Only(Kind::Video),
+            Filter::Only(Kind::Video) => Filter::Only(Kind::Code),
             Filter::Only(Kind::Code) => Filter::All,
         }
     }
@@ -437,7 +439,7 @@ impl App {
     /// Whether the selected hit is shown as a picture: pictures unless switched to their words, PDF pages when switched
     /// to the page.
     pub fn shows_picture(&self, kind: Kind) -> bool {
-        (kind.is_picture() && !self.page_view) || (kind == Kind::Pdf && self.page_view)
+        ((kind.is_picture() || kind == Kind::Video) && !self.page_view) || (kind == Kind::Pdf && self.page_view)
     }
 
     pub fn refresh_page_image(&mut self) {
@@ -452,7 +454,10 @@ impl App {
         let hit = &self.hits[i];
         let key = PageKey {
             path: hit.path.clone(),
-            page: hit.loc.map_or(1, |l| l.round().max(1.0) as usize),
+            // A page number, or a video's moment in tenths of a second.
+            page: hit
+                .loc
+                .map_or(1, |l| if hit.kind == Kind::Video { (l * 10.0) as usize } else { l.round().max(1.0) as usize }),
             width: area.width,
             height: area.height,
         };
@@ -461,7 +466,9 @@ impl App {
         }
         let height_px = area.height as u32 * picker.font_size().height as u32;
         let path = std::path::Path::new(&key.path);
-        let image = if hit.kind.is_picture() {
+        let image = if hit.kind == Kind::Video {
+            crate::media::frame_at(path, hit.loc.unwrap_or(0.0), height_px.max(240))
+        } else if hit.kind.is_picture() {
             crate::picture::decode(path).and_then(|rgb| {
                 let buffer = image::RgbImage::from_raw(rgb.width as u32, rgb.height as u32, rgb.data)
                     .ok_or_else(|| anyhow::anyhow!("odd picture size"))?;
@@ -493,6 +500,7 @@ pub(crate) mod tests {
             cosine: None,
             keyword_rank: Some(2),
             loc: Some(1.0),
+            loc_end: None,
             line: None,
             grep: false,
             excerpt: String::new(),
@@ -545,10 +553,12 @@ pub(crate) mod tests {
             hit("/d.pdf", Kind::Pdf),
             hit("/e.jpg", Kind::Image),
             hit("/Screenshot f.png", Kind::Screenshot),
+            hit("/g.mp3", Kind::Audio),
+            hit("/h.mp4", Kind::Video),
         ];
-        assert_eq!(app.visible(), vec![0, 1, 2, 3, 4, 5]);
-        // all → docs → PDFs → pictures → screenshots → code → all
-        for expected in [vec![0, 2], vec![3], vec![4], vec![5], vec![1]] {
+        assert_eq!(app.visible(), vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        // all → docs → PDFs → pictures → screenshots → audio → video → code → all
+        for expected in [vec![0, 2], vec![3], vec![4], vec![5], vec![6], vec![7], vec![1]] {
             app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
             assert_eq!(app.visible(), expected);
         }
