@@ -163,8 +163,10 @@ pub fn grep_files(roots: &[PathBuf], code: bool) -> Vec<(PathBuf, Kind, i64)> {
     files
 }
 
-/// Plain-text documents grep reads (rich formats need converting, and their text is in the index).
-const GREP_DOC_EXTENSIONS: &[&str] = &["txt", "text", "md", "markdown", "rst", "org", "adoc", "log", "csv", "tsv"];
+/// Documents grep reads as they are: plain text, and HTML raw, markup and all (its converted text, minus the menus,
+/// is in the index; grep is how to find a tag or a class name). Other rich formats need converting first.
+const GREP_DOC_EXTENSIONS: &[&str] =
+    &["txt", "text", "md", "markdown", "rst", "org", "adoc", "log", "csv", "tsv", "html", "htm", "xhtml"];
 
 fn grep_kind(path: &Path, code: bool) -> Option<Kind> {
     let name = path.file_name()?.to_string_lossy();

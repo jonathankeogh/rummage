@@ -23,6 +23,7 @@ ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 rummage-llama-sys = { path = "crates/llama-sys" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+scraper = { version = "0.27.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }

@@ -71,8 +71,9 @@ pub fn document_text(path: &Path) -> Result<String> {
         "ipynb" => notebook_text(path),
         "odt" => office_text(path, "content.xml", Office::OpenDocument),
         "html" | "htm" | "xhtml" => {
-            let bytes = std::fs::read(path)?;
-            Ok(html2text::config::plain_no_decorate().string_from_read(&bytes[..], 100_000)?)
+            let html = String::from_utf8_lossy(&std::fs::read(path)?).into_owned();
+            let content = main_content(&html);
+            Ok(html2text::config::plain_no_decorate().string_from_read(content.as_bytes(), 100_000)?)
         }
         _ => read_text(path),
     }
@@ -98,6 +99,55 @@ fn notebook_text(path: &Path) -> Result<String> {
         out += "\n\n";
     }
     Ok(out)
+}
+
+/// A page's own content, without the site around it: the `<main>` element, or else the largest `<article>`, or
+/// else the `<body>`; minus navigation, headers, footers, sidebars and forms inside it. A saved page (GitHub,
+/// Wikipedia, a news site) then reads as its text, not its menus. A page with none of these is kept whole.
+pub fn main_content(html: &str) -> String {
+    use scraper::{Html, Selector};
+    let page = Html::parse_document(html);
+    let select = |css: &str| Selector::parse(css).expect("a valid selector");
+    // Visible text only: pages carry data and code in <script> (GitHub embeds kilobytes of JSON).
+    let text_len = |e: &scraper::ElementRef| -> usize {
+        e.descendants()
+            .filter_map(|node| match node.value() {
+                scraper::Node::Text(text) => {
+                    let hidden = node
+                        .ancestors()
+                        .filter_map(scraper::ElementRef::wrap)
+                        .any(|a| matches!(a.value().name(), "script" | "style" | "template" | "noscript"));
+                    (!hidden).then(|| text.len())
+                }
+                _ => None,
+            })
+            .sum()
+    };
+    let articles = select("article");
+    let main = page.select(&select("main")).next();
+    // Inside <main>, its largest <article> when that holds a fair share of the text: sites like GitHub build their
+    // toolbars and file lists from plain <div>s inside <main>, around the article that's the content (the README).
+    let main =
+        main.map(|m| m.select(&articles).max_by_key(text_len).filter(|a| text_len(a) * 4 >= text_len(&m)).unwrap_or(m));
+    let article = page.select(&select("article")).max_by_key(text_len);
+    let Some(root) = main.or(article).or_else(|| page.select(&select("body")).next()) else {
+        return html.to_string();
+    };
+    let mut content = root.html();
+    // The outermost clutter elements inside the content, each cut out by its own markup.
+    let clutter = select("nav, header, footer, aside, form, [role=navigation], [role=banner], [role=contentinfo]");
+    let inside_clutter = |e: &scraper::ElementRef| {
+        e.ancestors()
+            .filter_map(scraper::ElementRef::wrap)
+            .take_while(|a| a.id() != root.id())
+            .any(|a| clutter.matches(&a))
+    };
+    for element in root.select(&clutter) {
+        if !inside_clutter(&element) {
+            content = content.replacen(&element.html(), "", 1);
+        }
+    }
+    content
 }
 
 enum Office {
@@ -347,6 +397,41 @@ mod tests {
         // Code passages of a notebook are its cells, not its JSON.
         let read = read_parts(&path, Kind::Code, 0..10).unwrap();
         assert!(read.parts[0].text.contains("value_counts") && !read.parts[0].text.contains("iVBOR"));
+    }
+
+    #[test]
+    fn saved_pages_keep_their_content_not_their_menus() {
+        let github = r#"<html><body>
+            <header><nav><a>Pull requests</a><a>Issues</a></nav></header>
+            <div class="repo-head">0 forks · 0 watching · 1 branch</div>
+            <main>
+              <nav aria-label="file tree"><a>Go to file</a><a>Add file</a></nav>
+              <article><h1>arena-ml-notes</h1><p>Notes I wrote while learning <b>PyTorch</b>.</p></article>
+              <aside>Releases: none</aside>
+            </main>
+            <footer>© GitHub</footer></body></html>"#;
+        let content = main_content(github);
+        for kept in ["arena-ml-notes", "Notes I wrote while learning", "PyTorch"] {
+            assert!(content.contains(kept), "{kept}: {content}");
+        }
+        for gone in ["Pull requests", "0 forks", "Go to file", "Releases", "© GitHub"] {
+            assert!(!content.contains(gone), "{gone}: {content}");
+        }
+        // Inside <main>, the article that holds a fair share of the visible text wins over the toolbars around it,
+        // however much script data the page carries.
+        let react = format!(
+            "<body><main><div>Go to file · Add file · Code · 3 commits · watching</div><script>{}</script>
+             <article><p>The README: how to set up the course notebooks and run them.</p></article></main></body>",
+            "x".repeat(20_000)
+        );
+        let content = main_content(&react);
+        assert!(content.contains("The README") && !content.contains("Go to file"), "{content}");
+        // No <main>: the largest article; nothing marked: the whole body.
+        let blog = "<body><nav>Home</nav><article><p>short</p></article><article><p>the long post body here</p></article></body>";
+        assert!(main_content(blog).contains("the long post") && !main_content(blog).contains("Home"));
+        let plain = "<body><p>Just a page.</p><div>More.</div></body>";
+        let kept = main_content(plain);
+        assert!(kept.contains("Just a page.") && kept.contains("More."), "{kept}");
     }
 
     #[test]
