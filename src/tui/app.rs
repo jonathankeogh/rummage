@@ -157,8 +157,10 @@ pub struct App {
     /// The results list's scroll position, kept between draws.
     pub list: RefCell<ListState>,
     last_click: Option<(Instant, usize)>,
-    /// Show PDF pages as pictures rather than text (Ctrl-v).
-    pub page_view: bool,
+    /// Ctrl-v's choices, kept apart so one kind's doesn't flip the other's: PDFs as their pages rather than text,
+    /// and pictures and video as their words (OCR, the moment) rather than the picture.
+    pub pdf_pages: bool,
+    pub pictures_as_text: bool,
     /// How this terminal draws pictures (kitty, iTerm2, sixel, or half-blocks anywhere).
     pub picker: Option<Picker>,
     /// The selected PDF page, drawn for the preview's size: what it was made for, and the picture or why not.
@@ -230,7 +232,8 @@ impl App {
             areas: Cell::new(Areas::default()),
             list: RefCell::new(ListState::default()),
             last_click: None,
-            page_view: false,
+            pdf_pages: false,
+            pictures_as_text: false,
             picker: None,
             page_image: RefCell::new(None),
         }
@@ -336,13 +339,13 @@ impl App {
             }
             KeyCode::Enter => return selected.map_or(Action::None, Action::Open),
             KeyCode::Char('o') if ctrl => return selected.map_or(Action::None, Action::Reveal),
-            KeyCode::Char('v') if ctrl => {
-                self.page_view = !self.page_view;
-                let kind = selected.map(|i| self.hits[i].kind);
-                if kind.is_some_and(|k| k != Kind::Pdf && !k.is_picture()) {
-                    self.notify("^v switches PDFs and pictures between picture and text");
+            KeyCode::Char('v') if ctrl => match selected.map(|i| self.hits[i].kind) {
+                Some(Kind::Pdf) => self.pdf_pages = !self.pdf_pages,
+                Some(kind) if kind.is_picture() || kind == Kind::Video => {
+                    self.pictures_as_text = !self.pictures_as_text
                 }
-            }
+                _ => self.notify("^v switches PDFs and pictures between picture and text"),
+            },
             KeyCode::Char('y') if ctrl => return selected.map_or(Action::None, Action::Copy),
             KeyCode::Char('u') if ctrl => {
                 self.query.clear();
@@ -439,7 +442,7 @@ impl App {
     /// Whether the selected hit is shown as a picture: pictures unless switched to their words, PDF pages when switched
     /// to the page.
     pub fn shows_picture(&self, kind: Kind) -> bool {
-        ((kind.is_picture() || kind == Kind::Video) && !self.page_view) || (kind == Kind::Pdf && self.page_view)
+        ((kind.is_picture() || kind == Kind::Video) && !self.pictures_as_text) || (kind == Kind::Pdf && self.pdf_pages)
     }
 
     pub fn refresh_page_image(&mut self) {
@@ -531,6 +534,21 @@ pub(crate) mod tests {
         assert!(app.apply_response(Response { id: 2, result: Ok(vec![hit("/b", Kind::Doc)]), done: true }));
         assert_eq!(app.hits[0].path, "/b");
         assert!(!app.searching());
+    }
+
+    #[test]
+    fn ctrl_v_switches_only_the_kind_it_was_pressed_on() {
+        let (mut app, _rx) = app();
+        app.hits = vec![hit("/lease.pdf", Kind::Pdf), hit("/dog.jpg", Kind::Image), hit("/trip.mp4", Kind::Video)];
+        let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert!(!app.shows_picture(Kind::Pdf) && app.shows_picture(Kind::Image));
+        app.on_key(ctrl_v);
+        assert!(app.shows_picture(Kind::Pdf), "the PDF shows its page");
+        assert!(app.shows_picture(Kind::Image) && app.shows_picture(Kind::Video), "pictures still show pictures");
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(ctrl_v);
+        assert!(!app.shows_picture(Kind::Image) && !app.shows_picture(Kind::Video), "now the words");
+        assert!(app.shows_picture(Kind::Pdf), "and PDFs keep their pages");
     }
 
     #[test]

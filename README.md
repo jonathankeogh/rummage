@@ -4,7 +4,9 @@ Instant multimodal semantic file search for the Unix terminal. Describe what you
 by meaning and by exact words, locally, on any GPU or CPU. Type `rummage` for a yazi-style interface, or use it inside
 yazi with the plugin.
 
-**Status: milestones 1–7 of 10.** Search works end to end over text, Markdown, PDFs (page by page), Word
+<p align="center"><img src="docs/demo.gif" width="900" alt="rummage in a terminal: a photo of a dog on a beach, the late-fee clause on page 4 of a lease PDF, the moment in a podcast about caffeine, a screenshot of a declined card, the moment in a video of a snowy cabin, a sleeping cat found in French, and a bread recipe found by meaning."></p>
+
+**Status: milestones 1–8 of 10.** Search works end to end over text, Markdown, PDFs (page by page), Word
 (docx), OpenDocument (odt) and HTML files, and, with `--code`, source code, through a background service that keeps
 searches instant, with a search-as-you-type interface and live grep beside meaning search. Photos and screenshots
 are found by what they show (and screenshots and scanned pages by their words, through OCR); recordings and videos
@@ -97,6 +99,9 @@ query's words.
 somewhere outside a code project (e.g. `~/.cache/rummage-eval`) and see the script's header. `scripts/sweep.py` runs
 every eval set with one ranking weight changed at a time (each weight can be overridden by `RUMMAGE_<NAME>`, e.g.
 `RUMMAGE_WORD_WEIGHT=1.5`).
+
+`sh demo/record.sh` films the demo above again on macOS, from files it makes or that are public domain
+(`demo/photos`).
 
 ## License
 

@@ -30,3 +30,16 @@ SOFTWARE.
 ```
 
 llama.cpp (vendor/llama.cpp) is MIT licensed by the ggml authors; see vendor/llama.cpp/LICENSE.
+
+## Demo photos
+
+The photos in `demo/photos` (shown in `docs/demo.gif`) come from Wikimedia Commons, released into the public
+domain or under CC0 by their authors. Resized; the names are made up.
+
+- `IMG_4412.jpg`: [Josie swims in Valois Bay.jpg](https://commons.wikimedia.org/wiki/File:Josie_swims_in_Valois_Bay.jpg), Carocaropilates, CC0
+- `IMG_2207.jpg`: [Moraine Lake 17092005.jpg](https://commons.wikimedia.org/wiki/File:Moraine_Lake_17092005.jpg), Gorgo, Public domain
+- `IMG_3518.jpg`: [Bike on a snowy street in Quebec City at night.jpg](https://commons.wikimedia.org/wiki/File:Bike_on_a_snowy_street_in_Quebec_City_at_night.jpg), Wilfredor, CC0
+- `IMG_1093.jpg`: [Lighthouse Chania evening sun.jpg](https://commons.wikimedia.org/wiki/File:Lighthouse_Chania_evening_sun.jpg), Jebulon, CC0
+- `IMG_5861.jpg`: [Cat Sleeping on Keyboard.jpg](https://commons.wikimedia.org/wiki/File:Cat_Sleeping_on_Keyboard.jpg), Panini!, CC0
+- `IMG_6024.jpg`: [Birthday Cake Bloomsburg, Pennsylvania.jpg](https://commons.wikimedia.org/wiki/File:Birthday_Cake_Bloomsburg,_Pennsylvania.jpg), Tim-desser, CC0
+- `cabin.jpg`: [A wood cabin in the snow (Unsplash).jpg](https://commons.wikimedia.org/wiki/File:A_wood_cabin_in_the_snow_(Unsplash).jpg), Patrick Tomasso impatrickt, CC0
