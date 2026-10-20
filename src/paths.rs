@@ -77,6 +77,16 @@ fn huggingface_snapshot() -> PathBuf {
 }
 
 /// `~/x/y` for display.
+/// A file's name for result lists: a Photos library original is "Photos Library › 4F2A…E1.heic" (its own name is a
+/// code, and its folder is deep inside the library).
+pub fn display_name(path: &std::path::Path) -> String {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    match crate::crawl::photos_library(path).and_then(|l| l.file_stem()) {
+        Some(library) => format!("{} › {name}", library.to_string_lossy()),
+        None => name,
+    }
+}
+
 pub fn tilde(path: &std::path::Path) -> String {
     let home = home();
     match path.strip_prefix(&home) {

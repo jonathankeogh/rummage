@@ -42,6 +42,8 @@ pub struct Sync {
     pub cloud_only: usize,
     /// Network and cloud mounts inside the folders, left out.
     pub remote_folders: Vec<PathBuf>,
+    /// Photos libraries macOS didn't let it read (Full Disk Access).
+    pub photos_refused: Vec<PathBuf>,
 }
 
 /// Compares what's on disk under `roots` with the index: new and changed files become pending, gone ones go.
@@ -57,6 +59,7 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options) -> Resul
         dataset_files: walk.dataset_files,
         cloud_only: walk.placeholders,
         remote_folders: walk.remote_folders,
+        photos_refused: walk.refused,
         ..Default::default()
     };
     let tx = store.db.unchecked_transaction()?;

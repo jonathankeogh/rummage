@@ -117,11 +117,24 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
     let mut cloud = Vec::new();
     let placeholders = Arc::new(AtomicUsize::new(0));
     let mut remote_folders = Vec::new();
+    let mut refused: Vec<PathBuf> = Vec::new();
     for root in roots {
         let remote = remote_mounts_below(root, &remote_mounts());
         remote_folders.extend(remote.iter().cloned());
         let walk = walker(root, &options.excluded, &remote, Some(placeholders.clone()));
-        for entry in walk.filter_map(|e| e.ok()) {
+        for entry in walk {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    // macOS keeps the Photos library private until the terminal has Full Disk Access.
+                    if let Some(library) = refused_library(&error)
+                        && !refused.contains(&library)
+                    {
+                        refused.push(library);
+                    }
+                    continue;
+                }
+            };
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -130,7 +143,12 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
             let Ok(meta) = entry.metadata() else { continue };
             if in_cloud_only(&meta) {
                 if indexable_name(path) {
-                    cloud.push(Found { path: path.to_path_buf(), kind: Kind::Doc, size: meta.len(), mtime: mtime(&meta) });
+                    cloud.push(Found {
+                        path: path.to_path_buf(),
+                        kind: Kind::Doc,
+                        size: meta.len(),
+                        mtime: mtime(&meta),
+                    });
                 }
                 continue;
             }
@@ -182,6 +200,31 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
         cloud,
         placeholders: placeholders.load(Ordering::Relaxed),
         remote_folders,
+        refused,
+    }
+}
+
+/// The Apple Photos library a path is in, if any ("~/Pictures/Photos Library.photoslibrary").
+pub fn photos_library(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|a| a.extension().is_some_and(|e| e == "photoslibrary"))
+}
+
+/// Inside a Photos library only its originals are read ("originals/", or "Masters/" in libraries before 2019): the
+/// rest is thumbnails, edited copies and its database.
+const PHOTOS_ORIGINALS: &[&str] = &["originals", "Masters"];
+
+/// The Photos library a walk wasn't allowed into (or into part of).
+fn refused_library(error: &ignore::Error) -> Option<PathBuf> {
+    if !error.io_error().is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) {
+        return None;
+    }
+    let mut error = error;
+    loop {
+        match error {
+            ignore::Error::WithPath { path, .. } => return photos_library(path).map(Path::to_path_buf),
+            ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => error = err,
+            _ => return None,
+        }
     }
 }
 
@@ -283,7 +326,9 @@ fn remote_mounts_below(root: &Path, mounts: &[PathBuf]) -> Vec<PathBuf> {
 /// one. (DigUp's rule.)
 fn dataset_folders(found: &[Found], roots: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
     let mut groups: std::collections::HashMap<(&Path, Kind), (usize, usize)> = std::collections::HashMap::new();
-    for file in found.iter().filter(|f| f.kind.is_picture() || f.kind.is_timed()) {
+    // A Photos library names its originals by code, but they're someone's photos.
+    for file in found.iter().filter(|f| (f.kind.is_picture() || f.kind.is_timed()) && photos_library(&f.path).is_none())
+    {
         let Some(folder) = file.path.parent().filter(|p| !roots.iter().any(|r| r == p)) else { continue };
         let stem = file.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let entry = groups.entry((folder, file.kind)).or_default();
@@ -407,16 +452,23 @@ fn walker(
                 return true;
             }
             let name = entry.file_name().to_string_lossy();
+            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+            if path.parent().is_some_and(|p| p.extension().is_some_and(|e| e == "photoslibrary")) {
+                return is_dir && PHOTOS_ORIGINALS.contains(&name.as_ref());
+            }
             if name.starts_with('.') {
-                if name.ends_with(".icloud") && let Some(count) = &placeholders {
+                if name.ends_with(".icloud")
+                    && let Some(count) = &placeholders
+                {
                     count.fetch_add(1, Ordering::Relaxed);
                 }
                 return false;
             }
-            if !entry.file_type().is_some_and(|t| t.is_dir()) {
+            if !is_dir {
                 return true;
             }
-            if remote.iter().any(|m| path == m) {
+            // Lightroom's previews: copies of photos that are indexed where they are.
+            if remote.iter().any(|m| path == m) || name.ends_with(".lrdata") {
                 return false;
             }
             if SKIPPED_FOLDERS.contains(&name.as_ref()) || name.ends_with(".noindex") {
@@ -455,6 +507,8 @@ pub struct Walk {
     pub placeholders: usize,
     /// Network and cloud mounts inside the folders, left out.
     pub remote_folders: Vec<PathBuf>,
+    /// Photos libraries macOS didn't let it read.
+    pub refused: Vec<PathBuf>,
 }
 
 /// What kind of file this is for rummage, or None to leave it alone.
@@ -621,6 +675,23 @@ mod tests {
         );
         assert!(remote_mounts_below(Path::new("/home/sam/Drive"), &mounts).is_empty());
         assert!(remote_mounts_below(Path::new("/home/sam/Drive/Work"), &mounts).is_empty());
+    }
+
+    #[test]
+    fn photos_library_originals_are_not_a_dataset() {
+        let found = |folder: &str| -> Vec<Found> {
+            (0..400)
+                .map(|i| Found {
+                    path: PathBuf::from(format!("{folder}/{i:08X}-0B7D-4E5A-9C3B-2D1E0F4A5B6C.jpeg").to_lowercase()),
+                    kind: Kind::Image,
+                    size: 1,
+                    mtime: 0,
+                })
+                .collect()
+        };
+        let roots = [PathBuf::from("/home")];
+        assert_eq!(dataset_folders(&found("/home/training/frames"), &roots).len(), 1);
+        assert!(dataset_folders(&found("/home/Pictures/Photos Library.photoslibrary/originals/4"), &roots).is_empty());
     }
 
     #[test]

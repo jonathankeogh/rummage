@@ -193,6 +193,13 @@ fn index_command(
     if sync.cloud_only > 0 {
         eprintln!("{}", cloud_only_note(sync.cloud_only));
     }
+    for library in &sync.photos_refused {
+        eprintln!(
+            "can't read {}: macOS keeps it private. To index your photos, give your terminal app Full Disk Access \
+             (System Settings › Privacy & Security › Full Disk Access), then run rummage index again",
+            tilde(library)
+        );
+    }
     for folder in &sync.remote_folders {
         eprintln!(
             "left out {} (a network or cloud drive: reading it downloads it); to index it, add it as its own folder: \
@@ -336,7 +343,7 @@ fn search_command(
     }
     for (rank, hit) in hits.iter().enumerate() {
         let path = PathBuf::from(&hit.path);
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = paths::display_name(&path);
         let place = match (hit.kind, hit.loc) {
             _ if hit.line.is_some() => format!("  [line {}]", hit.line.unwrap_or(0)),
             (Kind::Pdf, Some(loc)) => format!("  [page {loc:.0}]"),

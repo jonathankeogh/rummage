@@ -42,6 +42,7 @@ def check(ok: bool, what: str):
 def fresh(name: str) -> pathlib.Path:
     folder = EDGE / name
     if folder.exists():
+        subprocess.run(["chmod", "-R", "u+rwx", str(folder)], check=True)  # a case may have locked a folder
         shutil.rmtree(folder)
     (folder / "files").mkdir(parents=True)
     return folder
@@ -213,6 +214,47 @@ def retries():
         c.execute("UPDATE files SET failed_by = '0.0.0' WHERE state = 'failed'")
     said, _ = index(folder)
     check(changed(said) == 2, f"after an update: {changed(said)} failed files read again")
+
+
+@case
+def photos():
+    """Fix 2: inside a Photos library only the originals are read; Lightroom previews are skipped; a library macOS
+    won't open gives the Full Disk Access message."""
+    folder = fresh("photos")
+    photos = sorted((REPO / "demo/photos").glob("*.jpg"))[:3]
+    library = folder / "files/Pictures/Photos Library.photoslibrary"
+    codes = ["4F2A9C1E-0B7D-4E5A-9C3B-2D1E0F4A5B6C", "8B3D2E7F-1C4A-4B9E-8D2F-3E4A5B6C7D8E", "C1D2E3F4-A5B6-4C7D-8E9F-0A1B2C3D4E5F"]
+    for code, photo in zip(codes, photos):
+        original = library / "originals" / code[0] / f"{code}.jpeg"
+        original.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(photo, original)
+        for copy in [f"resources/derivatives/{code[0]}/{code}_1_105_c.jpeg", f"resources/renders/{code[0]}/{code}_1_201_a.jpeg"]:
+            (library / copy).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(photo, library / copy)
+    (library / "database").mkdir()
+    (library / "database/Photos.sqlite").write_bytes(b"SQLite format 3\0")
+    previews = folder / "files/Pictures/Lightroom/Catalog Previews.lrdata/0/0A1B"
+    previews.mkdir(parents=True)
+    shutil.copy(photos[0], previews / "preview.jpg")
+    shutil.copy(photos[1], folder / "files/Pictures/beach.jpg")
+    locked = folder / "files/Pictures/Old Library.photoslibrary"
+    (locked / "originals/0").mkdir(parents=True)
+    shutil.copy(photos[2], locked / "originals/0/0A0B0C0D.jpeg")
+    locked.chmod(0)
+
+    said, _ = index(folder)
+    with db(folder) as c:
+        paths = [r[0] for r in c.execute("SELECT path FROM files WHERE state = 'done'")]
+    in_library = [p for p in paths if ".photoslibrary/" in p]
+    check(len(in_library) == 3 and all("/originals/" in p for p in in_library), f"only the originals: {in_library}")
+    check(not any(".lrdata" in p for p in paths), "Lightroom previews skipped")
+    check(any(p.endswith("beach.jpg") for p in paths), "an ordinary photo next to them is read")
+    check("Full Disk Access" in said and "Old Library.photoslibrary" in said, "a locked library gives the message")
+    shown = subprocess.run(
+        [str(RUMMAGE), "--index", str(folder / "index"), "search", "--no-serve", "--zgate=-9", "picture"],
+        capture_output=True, text=True,
+    ).stdout  # fmt: skip
+    check("Photos Library › " in shown, "results name them Photos Library › …")
 
 
 SF_DATALESS = 0x40000000

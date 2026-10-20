@@ -104,7 +104,7 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
 
 /// One result row: marker, kind, file name, and the passage number at the right edge.
 fn row_line(hit: &Hit, selected: bool, width: usize) -> Line<'static> {
-    let name = Path::new(&hit.path).file_name().map_or(hit.path.clone(), |n| n.to_string_lossy().into_owned());
+    let name = crate::paths::display_name(Path::new(&hit.path));
     let place = match (hit.kind, hit.loc) {
         (Kind::Pdf, Some(loc)) => format!("p{}", loc.round() as i64),
         (kind, Some(loc)) if kind.is_timed() => format!("@{}", crate::media::clock(loc)),
