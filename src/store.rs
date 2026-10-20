@@ -132,6 +132,10 @@ pub struct FileRow {
     pub failed_by: Option<String>,
     /// The date the last sweep saw on disk, when that's newer than `mtime` (a busy file not read again yet).
     pub seen_mtime: Option<i64>,
+    /// Its content's BLAKE3 (32 hex digits); None in an index from before content hashes, until a sweep hashes it.
+    pub hash: Option<String>,
+    /// For a copy (state `copy`), the file that holds its content: the passages and vectors are that file's.
+    pub copy_of: Option<i64>,
 }
 
 impl FileRow {
@@ -213,6 +217,25 @@ impl Store {
         if !columns.iter().any(|c| c == "seen_mtime") {
             db.execute("ALTER TABLE files ADD COLUMN seen_mtime INTEGER", [])?;
         }
+        // And before content hashes: a file's content, and for a copy, the file that holds it. A segment with a
+        // copy_id holds just that file's name, for the word index (a copy's, or a renamed file's).
+        for column in ["hash TEXT", "copy_of INTEGER"] {
+            if !columns.iter().any(|c| Some(c.as_str()) == column.split(' ').next()) {
+                db.execute(&format!("ALTER TABLE files ADD COLUMN {column}"), [])?;
+            }
+        }
+        let has_copy_id: bool =
+            db.query_row("SELECT COUNT(*) > 0 FROM pragma_table_info('segments') WHERE name = 'copy_id'", [], |r| {
+                r.get(0)
+            })?;
+        if !has_copy_id {
+            db.execute("ALTER TABLE segments ADD COLUMN copy_id INTEGER", [])?;
+        }
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS files_hash ON files(hash);
+             CREATE INDEX IF NOT EXISTS files_copy_of ON files(copy_of);
+             CREATE INDEX IF NOT EXISTS segments_copy ON segments(copy_id);",
+        )?;
         let store = Store { db, file };
         match store.meta("fingerprint")? {
             None => store.set_meta("fingerprint", FINGERPRINT)?,
@@ -262,7 +285,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT id, size, mtime, state, failed_by, seen_mtime FROM files WHERE path = ?",
+                "SELECT id, size, mtime, state, failed_by, seen_mtime, hash, copy_of FROM files WHERE path = ?",
                 [path.to_string_lossy()],
                 |r| {
                     Ok(FileRow {
@@ -272,19 +295,22 @@ impl Store {
                         state: r.get(3)?,
                         failed_by: r.get(4)?,
                         seen_mtime: r.get(5)?,
+                        hash: r.get(6)?,
+                        copy_of: r.get(7)?,
                     })
                 },
             )
             .optional()?)
     }
 
-    /// Adds a file, or marks a changed one pending again (its old passages go).
+    /// Adds a file, or marks a changed one pending again (its old passages go; a copy's content stays with the file
+    /// that holds it, and a file's copies get what it held).
     pub fn upsert_pending(&self, path: &Path, kind: Kind, size: u64, mtime: i64) -> Result<i64> {
         if let Some(existing) = self.file(path)? {
-            self.clear_segments(existing.id)?;
+            self.leave_content(existing.id)?;
             self.db.execute(
                 "UPDATE files SET kind = ?, size = ?, mtime = ?, state = 'pending', error = NULL, parts_done = NULL,
-                 parts_total = NULL, seen_mtime = NULL WHERE id = ?",
+                 parts_total = NULL, seen_mtime = NULL, hash = NULL, copy_of = NULL WHERE id = ?",
                 params![kind.as_str(), size as i64, mtime, existing.id],
             )?;
             return Ok(existing.id);
@@ -294,6 +320,122 @@ impl Store {
             params![path.to_string_lossy(), kind.as_str(), size as i64, mtime],
         )?;
         Ok(self.db.last_insert_rowid())
+    }
+
+    pub fn set_hash(&self, file_id: i64, hash: &str) -> Result<()> {
+        self.db.execute("UPDATE files SET hash = ? WHERE id = ?", params![hash, file_id])?;
+        Ok(())
+    }
+
+    /// A file whose date changed but not its content: nothing to read again.
+    pub fn touched(&self, file_id: i64, size: u64, mtime: i64) -> Result<()> {
+        self.db.execute(
+            "UPDATE files SET size = ?, mtime = ?, seen_mtime = NULL WHERE id = ?",
+            params![size as i64, mtime, file_id],
+        )?;
+        Ok(())
+    }
+
+    /// The file holding the content with this hash, other than `not`: its id, path and state.
+    pub fn holder(&self, hash: &str, not: i64) -> Result<Option<(i64, PathBuf, String)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id, path, state FROM files WHERE hash = ? AND copy_of IS NULL AND id != ? ORDER BY id LIMIT 1",
+                params![hash, not],
+                |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?), r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// A new file with content already in: it points to the file holding it, and its name goes in the word index.
+    pub fn add_copy(&self, path: &Path, kind: Kind, size: u64, mtime: i64, hash: &str, holder: i64) -> Result<i64> {
+        self.db.execute(
+            "INSERT INTO files (path, kind, size, mtime, state, hash, copy_of) VALUES (?, ?, ?, ?, 'copy', ?, ?)",
+            params![path.to_string_lossy(), kind.as_str(), size as i64, mtime, hash, holder],
+        )?;
+        let id = self.db.last_insert_rowid();
+        self.add_name(holder, id, path)?;
+        Ok(id)
+    }
+
+    /// A file already in whose content is now another's: it becomes a copy of `holder` (what it held goes to its own
+    /// copies, if it had any).
+    pub fn make_copy(&self, file_id: i64, kind: Kind, size: u64, mtime: i64, hash: &str, holder: i64) -> Result<()> {
+        self.leave_content(file_id)?;
+        let path: String = self.db.query_row("SELECT path FROM files WHERE id = ?", [file_id], |r| r.get(0))?;
+        self.db.execute(
+            "UPDATE files SET kind = ?, size = ?, mtime = ?, state = 'copy', error = NULL, parts_done = NULL,
+             parts_total = NULL, seen_mtime = NULL, hash = ?, copy_of = ? WHERE id = ?",
+            params![kind.as_str(), size as i64, mtime, hash, holder, file_id],
+        )?;
+        self.add_name(holder, file_id, Path::new(&path))
+    }
+
+    /// A file moved or renamed: its row, and what it holds or points to, go to `path`. A new name goes in the word
+    /// index (the old one stays: the word index can't take a name back out of passages already in).
+    pub fn moved(&self, file_id: i64, path: &Path, kind: Kind, size: u64, mtime: i64) -> Result<()> {
+        let (old, copy_of): (String, Option<i64>) =
+            self.db.query_row("SELECT path, copy_of FROM files WHERE id = ?", [file_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        self.db.execute(
+            "UPDATE files SET path = ?, kind = ?, size = ?, mtime = ?, seen_mtime = NULL WHERE id = ?",
+            params![path.to_string_lossy(), kind.as_str(), size as i64, mtime, file_id],
+        )?;
+        if Path::new(&old).file_name() != path.file_name() {
+            self.drop_names(file_id)?;
+            self.add_name(copy_of.unwrap_or(file_id), file_id, path)?;
+        }
+        Ok(())
+    }
+
+    /// Puts `path`'s name in the word index as part of `holder`'s content, for `file_id` (a copy, or a renamed file).
+    fn add_name(&self, holder: i64, file_id: i64, path: &Path) -> Result<()> {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.db.execute(
+            "INSERT INTO segments (file_id, loc, excerpt, vector, modality, copy_id) VALUES (?, NULL, '', x'', 'text', ?)",
+            params![holder, file_id],
+        )?;
+        let id = self.db.last_insert_rowid();
+        self.db.execute("INSERT INTO words (rowid, name, text) VALUES (?, ?, '')", params![id, name])?;
+        Ok(())
+    }
+
+    /// Takes `file_id`'s names (as a copy or a renamed file) out of the word index.
+    fn drop_names(&self, file_id: i64) -> Result<()> {
+        self.db.execute("DELETE FROM words WHERE rowid IN (SELECT id FROM segments WHERE copy_id = ?)", [file_id])?;
+        self.db.execute("DELETE FROM segments WHERE copy_id = ?", [file_id])?;
+        Ok(())
+    }
+
+    /// Ends `file_id`'s part in its content, before it changes or goes: a copy just lets go; a file holding content
+    /// hands it, with its other copies, to its newest copy; one with no copies loses it.
+    fn leave_content(&self, file_id: i64) -> Result<()> {
+        self.drop_names(file_id)?;
+        let copy_of: Option<i64> = self.db.query_row("SELECT copy_of FROM files WHERE id = ?", [file_id], |r| r.get(0))?;
+        if copy_of.is_some() {
+            return Ok(());
+        }
+        let heir: Option<i64> = self
+            .db
+            .query_row("SELECT id FROM files WHERE copy_of = ? ORDER BY mtime DESC, id LIMIT 1", [file_id], |r| r.get(0))
+            .optional()?;
+        match heir {
+            Some(heir) => {
+                self.db.execute("UPDATE segments SET file_id = ? WHERE file_id = ?", params![heir, file_id])?;
+                self.db.execute(
+                    "UPDATE files SET copy_of = ? WHERE copy_of = ? AND id != ?",
+                    params![heir, file_id, heir],
+                )?;
+                self.db.execute(
+                    "UPDATE files SET (state, error, failed_by, parts_done, parts_total) =
+                     (SELECT state, error, failed_by, parts_done, parts_total FROM files WHERE id = ?1), copy_of = NULL
+                     WHERE id = ?2",
+                    params![file_id, heir],
+                )?;
+            }
+            None => self.clear_segments(file_id)?,
+        }
+        Ok(())
     }
 
     /// Records the date a sweep saw on a busy file it left as it was.
@@ -415,7 +557,12 @@ impl Store {
                 self.db.execute("UPDATE files SET state = 'done', error = NULL WHERE id = ?", [file_id])?;
             }
             Some(error) => {
-                self.clear_segments(file_id)?;
+                // Its copies' names stay (they point here, failed too).
+                self.db.execute(
+                    "DELETE FROM words WHERE rowid IN (SELECT id FROM segments WHERE file_id = ? AND copy_id IS NULL)",
+                    [file_id],
+                )?;
+                self.db.execute("DELETE FROM segments WHERE file_id = ? AND copy_id IS NULL", [file_id])?;
                 self.db.execute(
                     "UPDATE files SET state = 'failed', error = ?, failed_by = ?, parts_done = NULL, parts_total = NULL
                      WHERE id = ?",
@@ -432,8 +579,9 @@ impl Store {
         Ok(())
     }
 
+    /// A file gone: a copy just goes; what a file held goes to its newest copy, or with it when it was the last.
     pub fn remove_file(&self, file_id: i64) -> Result<()> {
-        self.clear_segments(file_id)?;
+        self.leave_content(file_id)?;
         self.db.execute("DELETE FROM files WHERE id = ?", [file_id])?;
         Ok(())
     }
@@ -446,13 +594,22 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).map(|(id, p)| (id, PathBuf::from(p))).collect())
     }
 
-    /// Drops every vector so everything embeds again (after a model change).
+    /// Drops every vector so everything embeds again (after a model change). Copies stay copies.
     pub fn reset_vectors(&self) -> Result<()> {
         self.db.execute_batch(
             "DROP TABLE IF EXISTS words; DELETE FROM segments;
-             UPDATE files SET state = 'pending', error = NULL, parts_done = NULL, parts_total = NULL;",
+             UPDATE files SET state = 'pending', error = NULL, parts_done = NULL, parts_total = NULL
+             WHERE copy_of IS NULL;",
         )?;
         self.db.execute_batch(WORDS_TABLE)?;
+        let copies: Vec<(i64, i64, String)> = self
+            .db
+            .prepare("SELECT id, copy_of, path FROM files WHERE copy_of IS NOT NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        for (id, holder, path) in copies {
+            self.add_name(holder, id, Path::new(&path))?;
+        }
         self.set_meta("fingerprint", FINGERPRINT)
     }
 }

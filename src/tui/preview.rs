@@ -511,6 +511,7 @@ mod tests {
             line: None,
             grep: false,
             excerpt: String::new(),
+            also_in: Vec::new(),
         };
         assert_eq!(why(&hit), "meaning z 3.1 · words #2");
         assert_eq!(why(&Hit { z: None, keyword_rank: None, ..hit }), "");

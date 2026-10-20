@@ -236,7 +236,7 @@ def photos():
     previews = folder / "files/Pictures/Lightroom/Catalog Previews.lrdata/0/0A1B"
     previews.mkdir(parents=True)
     shutil.copy(photos[0], previews / "preview.jpg")
-    shutil.copy(photos[1], folder / "files/Pictures/beach.jpg")
+    shutil.copy(sorted((REPO / "demo/photos").glob("*.jpg"))[4], folder / "files/Pictures/beach.jpg")
     locked = folder / "files/Pictures/Old Library.photoslibrary"
     (locked / "originals/0").mkdir(parents=True)
     shutil.copy(photos[2], locked / "originals/0/0A0B0C0D.jpeg")
@@ -405,6 +405,66 @@ def numbers():
             capture_output=True, text=True,
         ).stdout  # fmt: skip
         check(name in found.split("\n")[0], f"{number} deep inside is found: {found.splitlines()[:1]}")
+
+
+@case
+def hashes():
+    """Fix 9: the same photo and PDF in two folders are read once and found as one result listing both places; renamed
+    folders read nothing again; content goes with its last copy."""
+    folder = fresh("hashes")
+    files = folder / "files"
+    for name in ["home", "backup"]:
+        (files / name).mkdir()
+    photo = sorted((REPO / "demo/photos").glob("*.jpg"))[0]
+    shutil.copy(photo, files / "home/harbour.jpg")
+    shutil.copy(photo, files / "backup/harbour copy.jpg")
+    shutil.copy(photo, files / "home/zebra crossing.jpg")
+    write_pdf(files / "home/lease.pdf", ["The lease for the flat on Quay Street runs to March, rent 1,200 a month."])
+    shutil.copy(files / "home/lease.pdf", files / "backup/lease (2).pdf")
+    os.utime(files / "backup/lease (2).pdf", (time.time() + 60, time.time() + 60))  # the newer copy
+    (files / "home/note.md").write_text("A note about the boiler service in March.")
+
+    def vectors():
+        """Vector segments' ids, and which files hold them."""
+        with db(folder) as c:
+            return c.execute("SELECT s.id, f.path FROM segments s JOIN files f ON f.id = s.file_id "
+                             "WHERE length(s.vector) > 0 ORDER BY s.id").fetchall()  # fmt: skip
+
+    def search(*words):
+        return subprocess.run([str(RUMMAGE), "--index", str(folder / "index"), "search", "--no-serve", *words],
+                              capture_output=True, text=True).stdout  # fmt: skip
+
+    said, _ = index(folder)
+    before = vectors()
+    holders = sorted(pathlib.Path(p).suffix for _, p in {(0, p) for _, p in before})
+    check(holders == [".jpg", ".md", ".pdf"], f"each content read once: {sorted({p for _, p in before})}")
+    check("3 copies of files already in" in said, "three copies linked")
+    found = search("lease", "Quay", "Street")
+    check(found.count("lease") >= 1 and "also in" in found and found.split("\n")[0].find("lease (2).pdf") > 0,
+          f"one result, the newest copy, listing the other: {found.splitlines()[:4]}")  # fmt: skip
+    first = search("zebra").split("\n")[0]
+    check(".jpg" in first, f"a copy's own name finds the content: {first}")
+
+    (files / "home").rename(files / "house")
+    (files / "backup").rename(files / "old backup")
+    said, _ = index(folder)
+    after = vectors()
+    check(changed(said) == 0 and "indexed" not in said, f"renamed folders: nothing read ({changed(said)} new or changed)")
+    check([i for i, _ in after] == [i for i, _ in before], "the same vectors, kept")
+    check(all("/house/" in p or "/old backup/" in p for _, p in after), "now at the new places")
+
+    (files / "house/harbour.jpg").unlink()
+    (files / "house/zebra crossing.jpg").unlink()
+    index(folder)
+    left = {p for _, p in vectors() if p.endswith(".jpg")}
+    check(left == {str(files / "old backup/harbour copy.jpg")}, f"one copy gone, the other holds it: {left}")
+    (files / "old backup/harbour copy.jpg").unlink()
+    index(folder)
+    with db(folder) as c:
+        jpgs = c.execute("SELECT COUNT(*) FROM files WHERE path LIKE '%.jpg'").fetchone()[0]
+        orphans = c.execute("SELECT COUNT(*) FROM segments WHERE file_id NOT IN (SELECT id FROM files)").fetchone()[0]
+    check(jpgs == 0 and not any(p.endswith(".jpg") for _, p in vectors()) and orphans == 0,
+          "content gone with its last copy")  # fmt: skip
 
 
 SF_DATALESS = 0x40000000

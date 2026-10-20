@@ -35,6 +35,9 @@ pub struct Hit {
     #[serde(default)]
     pub grep: bool,
     pub excerpt: String,
+    /// Other copies of the same content (`path` is the newest one).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_in: Vec<String>,
 }
 
 pub struct Options {
@@ -172,9 +175,12 @@ pub struct Vectors {
     /// What each row's vector was made from: pictures and text get their own baselines.
     row_modality: Vec<Modality>,
     file_kind: HashMap<i64, Kind>,
-    /// When each file last changed, and each indexed file's id by path (to join grep's hits).
+    /// When each file last changed (its newest copy), and each indexed file's id by path (to join grep's hits; a
+    /// copy's path gives the file holding its content).
     file_mtime: HashMap<i64, i64>,
     file_ids: HashMap<String, i64>,
+    /// For content in more than one file, every file's path and date, by the id of the file that holds it.
+    copies: HashMap<i64, Vec<(String, i64)>>,
     /// Where typical queries sit, once known (see `set_query_centre`).
     query_centre: Option<QueryCentre>,
     /// Each row's closeness to where typical queries sit: its average similarity to typical queries. A passage with
@@ -193,17 +199,34 @@ impl Vectors {
             file_kind: HashMap::new(),
             file_mtime: HashMap::new(),
             file_ids: HashMap::new(),
+            copies: HashMap::new(),
             query_centre: None,
             centrality: Vec::new(),
         };
-        let mut statement = store.db.prepare("SELECT id, kind, mtime, path FROM files")?;
-        for row in
-            statement.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?)))?
-        {
-            let (id, mtime, path) = row?;
-            vectors.file_mtime.insert(id, mtime);
-            vectors.file_ids.insert(path, id);
+        let mut statement = store.db.prepare("SELECT id, mtime, path, copy_of FROM files ORDER BY copy_of IS NOT NULL")?;
+        let rows = statement.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?))
+        })?;
+        // Holders come first, so a copy finds its holder's path and date.
+        let mut own: HashMap<i64, (String, i64)> = HashMap::new();
+        for row in rows {
+            let (id, mtime, path, copy_of) = row?;
+            let holder = copy_of.unwrap_or(id);
+            let newest = vectors.file_mtime.entry(holder).or_insert(mtime);
+            *newest = (*newest).max(mtime);
+            vectors.file_ids.insert(path.clone(), holder);
+            match copy_of {
+                None => _ = own.insert(id, (path, mtime)),
+                Some(holder) => {
+                    let group = vectors.copies.entry(holder).or_default();
+                    if group.is_empty() {
+                        group.extend(own.get(&holder).cloned());
+                    }
+                    group.push((path, mtime));
+                }
+            }
         }
+        let mut statement = store.db.prepare("SELECT id, kind FROM files WHERE copy_of IS NULL")?;
         for row in statement.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
             let (id, kind) = row?;
             if let Some(kind) = Kind::parse(&kind) {
@@ -239,6 +262,15 @@ impl Vectors {
     pub fn query_vagueness(&self, query: &[f32]) -> Option<f64> {
         let centre = self.query_centre.as_ref()?;
         Some((dot(query, &centre.centre) as f64 - centre.mean) / centre.spread)
+    }
+
+    /// Where a result for `file`'s content points: its newest copy, and the others (`path` alone, without copies).
+    fn places(&self, file: i64, path: String) -> (String, Vec<String>) {
+        let Some(group) = self.copies.get(&file) else { return (path, Vec::new()) };
+        let mut all = group.clone();
+        all.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let newest = all.remove(0).0;
+        (newest, all.into_iter().map(|(p, _)| p).collect())
     }
 
     pub fn len(&self) -> usize {
@@ -652,8 +684,10 @@ pub fn rank(store: &Store, vectors: &Vectors, prepared: &Prepared, grep: &[GrepH
                         r.get::<_, Option<f64>>(4)?,
                     ))
                 })?;
+                let (path, also_in) = vectors.places(file, row.0);
                 Hit {
-                    path: row.0,
+                    path,
+                    also_in,
                     kind: Kind::parse(&row.1).unwrap_or(Kind::Doc),
                     score,
                     z: meaning.map(|m| m.0),
@@ -667,6 +701,7 @@ pub fn rank(store: &Store, vectors: &Vectors, prepared: &Prepared, grep: &[GrepH
                 }
             }
             (None, Some(g)) => Hit {
+                also_in: vectors.places(file, g.path.to_string_lossy().into_owned()).1,
                 path: g.path.to_string_lossy().into_owned(),
                 kind: g.kind,
                 score,
@@ -783,6 +818,7 @@ mod tests {
             file_kind: HashMap::new(),
             file_mtime: HashMap::new(),
             file_ids: HashMap::new(),
+            copies: HashMap::new(),
             query_centre: None,
             centrality: Vec::new(),
         };
@@ -812,6 +848,7 @@ mod tests {
             file_kind: HashMap::new(),
             file_mtime: HashMap::new(),
             file_ids: HashMap::new(),
+            copies: HashMap::new(),
             query_centre: None,
             centrality: Vec::new(),
         };

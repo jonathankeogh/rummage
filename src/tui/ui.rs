@@ -251,6 +251,9 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect) {
     } else if hit.kind.is_timed() {
         detail += " · ⏎ your player";
     }
+    if !hit.also_in.is_empty() {
+        detail += &format!(" · also in {}", crate::paths::folders(&hit.also_in));
+    }
     let info = vec![
         Line::from(Span::styled(tilde(Path::new(&hit.path)), Style::default().add_modifier(Modifier::BOLD))),
         Line::from(Span::styled(detail, Style::default().fg(Color::DarkGray))),

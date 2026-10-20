@@ -66,6 +66,11 @@ pub struct Sync {
     pub photos_refused: Vec<PathBuf>,
     /// Files changing often, left as they were read until they're still (see `is_busy`).
     pub busy: usize,
+    /// New files whose content was already in (copies), and files moved or renamed: none read again.
+    pub copies: usize,
+    pub moved: usize,
+    /// Files from before content hashes, hashed once.
+    pub hashed: usize,
 }
 
 /// Compares what's on disk under `roots` with the index: new and changed files become pending, gone ones go. In the
@@ -98,13 +103,32 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options, backgrou
     let (now, busy) = (now_seconds(), busy_seconds());
     // When the first busy file is due, for the service's timer.
     let mut busy_until: Option<i64> = None;
+    let on_disk: std::collections::HashSet<&Path> = found.iter().map(|f| f.path.as_path()).chain(kept).collect();
+    // A folder missing altogether (an unplugged drive) keeps its files until it's back.
+    let missing: Vec<&PathBuf> = roots.iter().filter(|root| !root.exists()).collect();
+    let gone = |path: &Path| !on_disk.contains(path) && !missing.iter().any(|root| path.starts_with(root));
     for Found { path, kind, size, mtime } in &found {
         let known = store.file(path)?;
         // A failed file is tried again when it changes, or by a newer rummage (it may read it now); not at every sweep.
-        if known.as_ref().is_some_and(|f| f.size == *size && f.mtime == *mtime && f.settled()) {
+        if let Some(f) = known.as_ref().filter(|f| f.size == *size && f.mtime == *mtime && f.settled()) {
+            // Read before content hashes: hashed once, and a duplicate read twice becomes a copy.
+            if f.hash.is_none()
+                && f.copy_of.is_none()
+                && let Ok(hash) = content_hash(path)
+            {
+                store.set_hash(f.id, &hash)?;
+                summary.hashed += 1;
+                if let Some((holder, at, state)) = store.holder(&hash, f.id)?
+                    && f.state == "done"
+                    && state == "done"
+                    && !gone(&at)
+                {
+                    store.make_copy(f.id, *kind, *size, *mtime, &hash, holder)?;
+                }
+            }
             continue;
         }
-        if let Some(f) = known.filter(|f| {
+        if let Some(f) = known.as_ref().filter(|f| {
             let last_seen = f.seen_mtime.unwrap_or(f.mtime).max(f.mtime);
             background && f.state != "pending" && f.mtime != *mtime && is_busy(last_seen, *mtime, now, busy)
         }) {
@@ -113,16 +137,44 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options, backgrou
             busy_until = Some(busy_until.unwrap_or(i64::MAX).min(mtime + busy));
             continue;
         }
-        store.upsert_pending(path, *kind, *size, *mtime)?;
+        // New or changed: its content decides. (A file that can't be read for its hash is read as new, and fails
+        // with the reason.)
+        let hash = content_hash(path).ok();
+        if let (Some(f), Some(hash)) = (&known, &hash)
+            && f.hash.as_deref() == Some(hash.as_str())
+            && f.state != "failed"
+            && f.state != "pending"
+        {
+            store.touched(f.id, *size, *mtime)?; // its date changed, not its content
+            continue;
+        }
+        let holder = match &hash {
+            Some(hash) => store.holder(hash, known.as_ref().map_or(-1, |f| f.id))?,
+            None => None,
+        };
+        if let (Some(hash), Some((holder, at, _))) = (&hash, holder) {
+            if known.is_none() && gone(&at) {
+                store.moved(holder, path, *kind, *size, *mtime)?;
+                summary.moved += 1;
+            } else {
+                match &known {
+                    Some(f) => store.make_copy(f.id, *kind, *size, *mtime, hash, holder)?,
+                    None => _ = store.add_copy(path, *kind, *size, *mtime, hash, holder)?,
+                }
+                summary.copies += 1;
+            }
+            continue;
+        }
+        let id = store.upsert_pending(path, *kind, *size, *mtime)?;
+        if let Some(hash) = &hash {
+            store.set_hash(id, hash)?;
+        }
         summary.new_or_changed += 1;
     }
     store.set_meta("busy_until", &busy_until.map_or(String::new(), |t| t.to_string()))?;
-    let on_disk: std::collections::HashSet<&Path> = found.iter().map(|f| f.path.as_path()).chain(kept).collect();
-    // Gone: deleted, excluded, or under no indexed folder any more. A folder missing altogether (an unplugged drive)
-    // keeps its files until it's back.
-    let missing: Vec<&PathBuf> = roots.iter().filter(|root| !root.exists()).collect();
+    // Gone: deleted, excluded, or under no indexed folder any more (moved ones have their new place already).
     for (id, path) in store.files_under(Path::new("/"))? {
-        if !on_disk.contains(path.as_path()) && !missing.iter().any(|root| path.starts_with(root)) {
+        if gone(&path) {
             store.remove_file(id)?;
             summary.removed += 1;
         }
@@ -501,6 +553,14 @@ fn embed_timed(
     Ok(out)
 }
 
+/// A file's content as 32 hex digits of its BLAKE3: the same for every copy, whatever its name, place or date.
+/// Reading costs about a minute per 100 GB on an SSD, and happens only when a file is new or changed.
+pub fn content_hash(path: &Path) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(std::fs::File::open(path)?)?;
+    Ok(hasher.finalize().to_hex()[..32].to_string())
+}
+
 fn now_seconds() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
@@ -558,12 +618,45 @@ mod tests {
     }
 
     #[test]
+    fn an_index_from_before_content_hashes_hashes_once_and_merges_duplicates() {
+        let dir = std::env::temp_dir().join(format!("rummage-hashes-{}", std::process::id()));
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        let text = "Notes on the allotment: beans by the fence, potatoes in the far bed.";
+        let store = Store::open(&dir.join("index")).unwrap();
+        // Both read and embedded, as before hashes.
+        for folder in [&a, &b] {
+            std::fs::create_dir_all(folder).unwrap();
+            let path = folder.join("allotment.md");
+            std::fs::write(&path, text).unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            let mtime = meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            let id = store.upsert_pending(&path, Kind::Doc, meta.len(), mtime).unwrap();
+            store.add_segment(id, 1.0, "allotment.md", text, text, Some(&[0.1; 768]), Modality::Text).unwrap();
+            store.progress(id, 1, 1).unwrap();
+        }
+        let options = crawl::Options { code: false, excluded: Vec::new() };
+        let summary = sync(&store, &[a.clone(), b.clone()], &options, false).unwrap();
+        assert_eq!((summary.hashed, summary.new_or_changed), (2, 0));
+        let holders: i64 = store
+            .db
+            .query_row("SELECT COUNT(DISTINCT file_id) FROM segments WHERE length(vector) > 0", [], |r| r.get(0))
+            .unwrap();
+        let copies: i64 =
+            store.db.query_row("SELECT COUNT(*) FROM files WHERE state = 'copy'", [], |r| r.get(0)).unwrap();
+        assert_eq!((holders, copies), (1, 1));
+        // Hashed once: the next sweep has nothing to do.
+        assert_eq!(sync(&store, &[a, b], &options, false).unwrap().hashed, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn files_leave_with_their_folder_but_not_with_an_unplugged_drive() {
         let dir = std::env::temp_dir().join(format!("rummage-sync-{}", std::process::id()));
         let (a, b) = (dir.join("a"), dir.join("b"));
         for folder in [&a, &b] {
             std::fs::create_dir_all(folder).unwrap();
-            std::fs::write(folder.join("note.md"), "A note about the garden and what to plant in spring.").unwrap();
+            let text = format!("A note about the garden in {}: what to plant in spring.", folder.display());
+            std::fs::write(folder.join("note.md"), text).unwrap();
         }
         let store = Store::open(&dir.join("index")).unwrap();
         let options = crawl::Options { code: false, excluded: Vec::new() };

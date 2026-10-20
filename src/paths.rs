@@ -87,6 +87,19 @@ pub fn display_name(path: &std::path::Path) -> String {
     }
 }
 
+/// Where other copies are, by folder: "~/Downloads, ~/Backup".
+pub fn folders(paths: &[String]) -> String {
+    let mut folders: Vec<String> = Vec::new();
+    for path in paths {
+        let path = std::path::Path::new(path);
+        let folder = tilde(path.parent().unwrap_or(path));
+        if !folders.contains(&folder) {
+            folders.push(folder);
+        }
+    }
+    folders.join(", ")
+}
+
 pub fn tilde(path: &std::path::Path) -> String {
     let home = home();
     match path.strip_prefix(&home) {

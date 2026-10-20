@@ -690,6 +690,7 @@ pub(crate) mod tests {
             line: None,
             grep: false,
             excerpt: String::new(),
+            also_in: Vec::new(),
         }
     }
 

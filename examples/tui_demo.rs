@@ -111,6 +111,7 @@ impl Backend for SampleBackend {
                     line: None,
                     grep: false,
                     excerpt: text.chars().take(200).collect(),
+                    also_in: Vec::new(),
                 })
             })
             .collect();

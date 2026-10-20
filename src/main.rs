@@ -190,6 +190,15 @@ fn index_command(
         index::duration(started)
     );
     let started = Instant::now();
+    if sync.copies + sync.moved > 0 {
+        eprintln!(
+            "{} copies of files already in and {} moved or renamed: nothing to read again",
+            sync.copies, sync.moved
+        );
+    }
+    if sync.hashed > 0 {
+        eprintln!("hashed {} files once, to tell copies, moves and renames", sync.hashed);
+    }
     if sync.busy > 0 {
         let files = if sync.busy == 1 { "file changes" } else { "files change" };
         let still = index::busy_seconds();
@@ -372,6 +381,9 @@ fn search_command(
         .join(", ");
         println!("{:>2}. {:<5} {name}{place}   ({why})", rank + 1, hit.kind.as_str());
         println!("      {}", tilde(path.parent().unwrap_or(&path)));
+        if !hit.also_in.is_empty() {
+            println!("      also in {}", paths::folders(&hit.also_in));
+        }
         println!("      “{}”", hit.excerpt.chars().take(160).collect::<String>());
     }
     eprintln!("({timing})");
