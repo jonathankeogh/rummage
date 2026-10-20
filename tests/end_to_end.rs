@@ -168,7 +168,8 @@ fn service_greps_stops_and_recovers() {
         .spawn()
         .unwrap();
     let socket = rummage::serve::socket_path(&s.root.join("index"));
-    for _ in 0..200 {
+    // Up to two minutes: on a slow CPU (CI) loading the model takes a while.
+    for _ in 0..2400 {
         if socket.exists() {
             break;
         }

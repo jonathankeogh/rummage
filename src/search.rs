@@ -124,7 +124,7 @@ pub const TYPICAL_QUERIES: &[&str] = &[
 ];
 
 /// Where typical queries sit (the mean of `TYPICAL_QUERIES`' vectors) and how spread out they are around it.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct QueryCentre {
     pub centre: Vec<f32>,
     /// Mean and spread of the typical queries' own closeness to the centre.

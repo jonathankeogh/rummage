@@ -143,8 +143,17 @@ impl Engine {
         let store = Store::open(dir)?;
         let mut vectors = Vectors::load(&store)?;
         let mut embedder = Embedder::load(&ModelFiles::locate()?, true)?;
-        let typical: Vec<String> = search::TYPICAL_QUERIES.iter().map(|q| prompts::query(q)).collect();
-        let query_centre = search::QueryCentre::from_vectors(&embedder.embed_texts(&typical)?);
+        // Where typical queries sit depends only on the model and the list: worked out once, then kept in the index
+        // (40 queries take a while on a slow CPU).
+        let query_centre = match store.meta(&QUERY_CENTRE)?.and_then(|json| serde_json::from_str(&json).ok()) {
+            Some(centre) => centre,
+            None => {
+                let typical: Vec<String> = search::TYPICAL_QUERIES.iter().map(|q| prompts::query(q)).collect();
+                let centre = search::QueryCentre::from_vectors(&embedder.embed_texts(&typical)?);
+                store.set_meta(&QUERY_CENTRE, &serde_json::to_string(&centre)?)?;
+                centre
+            }
+        };
         vectors.set_query_centre(query_centre.clone());
         let data_version = data_version(&store)?;
         Ok(Engine { store, vectors, embedder, data_version, query_centre, generation: 0, loaded: Instant::now() })
@@ -225,6 +234,13 @@ impl Engine {
         Ok(Some(search::rank(&self.store, &self.vectors, &pending.prepared, grepped, search::now())?))
     }
 }
+
+/// The index's note of where typical queries sit, named for the model and the list of queries it was made from.
+static QUERY_CENTRE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let list = search::TYPICAL_QUERIES.join("\n");
+    let hash = list.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    format!("query_centre {} {hash:016x}", crate::store::FINGERPRINT)
+});
 
 /// How often the vectors may be reloaded while the index changes.
 const RELOAD_EVERY: Duration = Duration::from_secs(1);
@@ -518,9 +534,12 @@ pub struct Client {
     last_id: u64,
 }
 
-/// How long a client waits for a service it started: loading the model takes under a second, but the first run on a
-/// GPU compiles its kernels (about 15 s with Metal).
-const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a client waits for a service it started that's still starting: loading the model takes under a second on
+/// a GPU (the first run compiles its kernels, about 15 s with Metal), much longer on a slow CPU. A service that stops
+/// is noticed at once, so this is only a last resort.
+const START_TIMEOUT: Duration = Duration::from_secs(600);
+/// After this long, the client says what it's waiting for.
+const START_NOTE: Duration = Duration::from_secs(3);
 
 impl Client {
     /// Connects to this index's service, starting it in the background first when it isn't running.
@@ -530,8 +549,14 @@ impl Client {
         }
         let log_start = std::fs::metadata(log_path(dir)).map_or(0, |m| m.len());
         let mut service = start_in_background(dir)?;
-        let deadline = Instant::now() + START_TIMEOUT;
+        let started = Instant::now();
+        let deadline = started + START_TIMEOUT;
+        let mut noted = false;
         loop {
+            if !noted && started.elapsed() >= START_NOTE {
+                noted = true;
+                eprintln!("starting the search service (loading the model)…");
+            }
             if let Ok(mut client) = Client::connect(dir) {
                 if client.request(&Request::Ping).is_ok_and(|r| r.ok) {
                     return Ok(client);
