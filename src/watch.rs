@@ -144,6 +144,8 @@ pub fn watch(dir: &Path, indexer: Arc<Indexer>) -> Result<Arc<Watching>> {
         let mut watched: Vec<PathBuf> = Vec::new();
         let mut tried: Vec<PathBuf> = Vec::new();
         let mut look_for_roots = Instant::now() - ROOTS_EVERY;
+        // The busy file's time the timer last ran the indexer for.
+        let mut swept_for: Option<i64> = None;
         loop {
             if look_for_roots.elapsed() >= ROOTS_EVERY {
                 look_for_roots = Instant::now();
@@ -162,8 +164,22 @@ pub fn watch(dir: &Path, indexer: Arc<Indexer>) -> Result<Arc<Watching>> {
                 }
                 state.folders.store(watched.len(), Ordering::Relaxed);
             }
+            // A file left alone for changing often is due: sweep, even if nothing else has changed since.
+            let due = store.meta("busy_until").ok().flatten().and_then(|t| t.parse::<i64>().ok());
+            let wait = match due {
+                Some(due) if swept_for != Some(due) => {
+                    let left = due - unix_now();
+                    if left <= 0 {
+                        swept_for = Some(due);
+                        indexer.run();
+                        continue;
+                    }
+                    ROOTS_EVERY.min(Duration::from_secs(left as u64 + 1))
+                }
+                _ => ROOTS_EVERY,
+            };
             // Wait for a change that matters, then for the folders to settle.
-            let Ok(event) = rx.recv_timeout(ROOTS_EVERY) else { continue };
+            let Ok(event) = rx.recv_timeout(wait) else { continue };
             if !matters(&event, &watched, &index_dir) {
                 continue;
             }
@@ -195,10 +211,19 @@ fn matters(event: &notify::Result<notify::Event>, roots: &[PathBuf], index_dir: 
         let below = roots.iter().find_map(|root| path.strip_prefix(root).ok()).unwrap_or(path);
         let hidden = below.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
         let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let unfinished = [".part", ".crdownload", ".download", ".tmp", ".swp", "~"].iter().any(|e| name.ends_with(e))
-            || name.starts_with("~$");
-        !hidden && !unfinished
+        let unfinished = UNFINISHED.iter().any(|e| name.ends_with(e)) || name.starts_with("~$");
+        // Safari downloads into a "….download" folder.
+        let in_download = below.components().any(|c| c.as_os_str().to_string_lossy().ends_with(".download"));
+        !hidden && !unfinished && !in_download
     })
+}
+
+/// Endings of files still being downloaded or written: browsers', qBittorrent's, editors'. (`~$` starts Office's lock
+/// files.)
+const UNFINISHED: &[&str] = &[".part", ".crdownload", ".download", ".opdownload", ".!qb", ".tmp", ".swp", "~"];
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
 fn watch_problem(root: &Path, error: &notify::Error) -> String {
@@ -341,6 +366,12 @@ mod tests {
         );
         assert!(!matters(&event(create, "/home/a/.cache/notes/.git/index"), &roots, index), "hidden below it isn't");
         assert!(!matters(&event(create, "/home/a/.cache/notes/film.mp4.part"), &roots, index), "still downloading");
+        assert!(!matters(&event(create, "/home/a/.cache/notes/film.mkv.!qB"), &roots, index), "qBittorrent's");
+        assert!(
+            !matters(&event(create, "/home/a/.cache/notes/report.pdf.download/report.pdf"), &roots, index),
+            "Safari's"
+        );
+        assert!(!matters(&event(create, "/home/a/.cache/notes/~$budget.xlsx"), &roots, index), "Office's lock");
         assert!(!matters(&event(create, "/home/a/.local/share/rummage/index.sqlite-wal"), &roots, index), "the index");
         let read = EventKind::Access(notify::event::AccessKind::Read);
         assert!(!matters(&event(read, "/home/a/.cache/notes/trip.md"), &roots, index), "a read changes nothing");

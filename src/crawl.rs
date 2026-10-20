@@ -468,7 +468,8 @@ fn walker(
                 return true;
             }
             // Lightroom's previews: copies of photos that are indexed where they are.
-            if remote.iter().any(|m| path == m) || name.ends_with(".lrdata") {
+            // And Safari's downloads still coming in.
+            if remote.iter().any(|m| path == m) || name.ends_with(".lrdata") || name.ends_with(".download") {
                 return false;
             }
             if SKIPPED_FOLDERS.contains(&name.as_ref()) || name.ends_with(".noindex") {

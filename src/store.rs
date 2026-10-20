@@ -130,6 +130,8 @@ pub struct FileRow {
     pub state: String,
     /// For a failed file, the rummage that failed it.
     pub failed_by: Option<String>,
+    /// The date the last sweep saw on disk, when that's newer than `mtime` (a busy file not read again yet).
+    pub seen_mtime: Option<i64>,
 }
 
 impl FileRow {
@@ -207,6 +209,10 @@ impl Store {
         if !columns.iter().any(|c| c == "failed_by") {
             db.execute("ALTER TABLE files ADD COLUMN failed_by TEXT", [])?;
         }
+        // And before files that keep changing waited, the date a sweep last saw.
+        if !columns.iter().any(|c| c == "seen_mtime") {
+            db.execute("ALTER TABLE files ADD COLUMN seen_mtime INTEGER", [])?;
+        }
         let store = Store { db, file };
         match store.meta("fingerprint")? {
             None => store.set_meta("fingerprint", FINGERPRINT)?,
@@ -256,7 +262,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT id, size, mtime, state, failed_by FROM files WHERE path = ?",
+                "SELECT id, size, mtime, state, failed_by, seen_mtime FROM files WHERE path = ?",
                 [path.to_string_lossy()],
                 |r| {
                     Ok(FileRow {
@@ -265,6 +271,7 @@ impl Store {
                         mtime: r.get(2)?,
                         state: r.get(3)?,
                         failed_by: r.get(4)?,
+                        seen_mtime: r.get(5)?,
                     })
                 },
             )
@@ -277,7 +284,7 @@ impl Store {
             self.clear_segments(existing.id)?;
             self.db.execute(
                 "UPDATE files SET kind = ?, size = ?, mtime = ?, state = 'pending', error = NULL, parts_done = NULL,
-                 parts_total = NULL WHERE id = ?",
+                 parts_total = NULL, seen_mtime = NULL WHERE id = ?",
                 params![kind.as_str(), size as i64, mtime, existing.id],
             )?;
             return Ok(existing.id);
@@ -287,6 +294,12 @@ impl Store {
             params![path.to_string_lossy(), kind.as_str(), size as i64, mtime],
         )?;
         Ok(self.db.last_insert_rowid())
+    }
+
+    /// Records the date a sweep saw on a busy file it left as it was.
+    pub fn saw(&self, file_id: i64, mtime: i64) -> Result<()> {
+        self.db.execute("UPDATE files SET seen_mtime = ? WHERE id = ?", params![mtime, file_id])?;
+        Ok(())
     }
 
     pub fn pending(&self) -> Result<Vec<(i64, PathBuf, Kind)>> {

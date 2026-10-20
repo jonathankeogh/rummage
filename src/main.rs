@@ -179,7 +179,7 @@ fn index_command(
     let options =
         crawl::Options { code: code || store.meta("code")?.as_deref() == Some("1"), excluded: store.excluded()? };
     let started = Instant::now();
-    let sync = index::sync(&store, &roots, &options)?;
+    let sync = index::sync(&store, &roots, &options, background)?;
     eprintln!(
         "{} files in {} folder{}: {} new or changed, {} gone ({})",
         sync.found,
@@ -190,6 +190,12 @@ fn index_command(
         index::duration(started)
     );
     let started = Instant::now();
+    if sync.busy > 0 {
+        let files = if sync.busy == 1 { "file changes" } else { "files change" };
+        let still = index::busy_seconds();
+        let still = if still >= 120 { format!("{} minutes", still / 60) } else { format!("{still} s") };
+        eprintln!("{} {files} often: read once still for {still}", sync.busy);
+    }
     if sync.cloud_only > 0 {
         eprintln!("{}", cloud_only_note(sync.cloud_only));
     }

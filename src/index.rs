@@ -24,6 +24,18 @@ const LATER_STEP: usize = 200;
 /// Small files are grouped so the GPU gets full batches.
 const GROUP_PARTS: usize = 32;
 
+/// A file changed twice within this many seconds is busy (a log, a download, a document being worked on): it's read
+/// once it has been still this long. RUMMAGE_BUSY_SECONDS shortens it for tests.
+pub fn busy_seconds() -> i64 {
+    std::env::var("RUMMAGE_BUSY_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(300)
+}
+
+/// Whether a changed file waits: its date moved less than `busy` seconds past the one a sweep last saw (or it was
+/// read at), and it's still less than `busy` seconds old. A file that appears and stays still is read at once.
+fn is_busy(last_seen: i64, now_dated: i64, now: i64, busy: i64) -> bool {
+    last_seen > 0 && now_dated - last_seen < busy && now - now_dated < busy
+}
+
 #[derive(Default, Debug)]
 pub struct Sync {
     pub found: usize,
@@ -44,10 +56,13 @@ pub struct Sync {
     pub remote_folders: Vec<PathBuf>,
     /// Photos libraries macOS didn't let it read (Full Disk Access).
     pub photos_refused: Vec<PathBuf>,
+    /// Files changing often, left as they were read until they're still (see `is_busy`).
+    pub busy: usize,
 }
 
-/// Compares what's on disk under `roots` with the index: new and changed files become pending, gone ones go.
-pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options) -> Result<Sync> {
+/// Compares what's on disk under `roots` with the index: new and changed files become pending, gone ones go. In the
+/// service's runs (`background`), files that keep changing wait until they're still; yours read every change.
+pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options, background: bool) -> Result<Sync> {
     let walk = crawl::walk(roots, options);
     let found = walk.found;
     let mut summary = Sync {
@@ -72,14 +87,28 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options) -> Resul
             _ => summary.cloud_only += 1,
         }
     }
+    let (now, busy) = (now_seconds(), busy_seconds());
+    // When the first busy file is due, for the service's timer.
+    let mut busy_until: Option<i64> = None;
     for Found { path, kind, size, mtime } in &found {
+        let known = store.file(path)?;
         // A failed file is tried again when it changes, or by a newer rummage (it may read it now); not at every sweep.
-        let unchanged = store.file(path)?.is_some_and(|f| f.size == *size && f.mtime == *mtime && f.settled());
-        if !unchanged {
-            store.upsert_pending(path, *kind, *size, *mtime)?;
-            summary.new_or_changed += 1;
+        if known.as_ref().is_some_and(|f| f.size == *size && f.mtime == *mtime && f.settled()) {
+            continue;
         }
+        if let Some(f) = known.filter(|f| {
+            let last_seen = f.seen_mtime.unwrap_or(f.mtime).max(f.mtime);
+            background && f.state != "pending" && f.mtime != *mtime && is_busy(last_seen, *mtime, now, busy)
+        }) {
+            store.saw(f.id, *mtime)?;
+            summary.busy += 1;
+            busy_until = Some(busy_until.unwrap_or(i64::MAX).min(mtime + busy));
+            continue;
+        }
+        store.upsert_pending(path, *kind, *size, *mtime)?;
+        summary.new_or_changed += 1;
     }
+    store.set_meta("busy_until", &busy_until.map_or(String::new(), |t| t.to_string()))?;
     let on_disk: std::collections::HashSet<&Path> = found.iter().map(|f| f.path.as_path()).chain(kept).collect();
     // Gone: deleted, excluded, or under no indexed folder any more. A folder missing altogether (an unplugged drive)
     // keeps its files until it's back.
@@ -382,6 +411,10 @@ fn embed_timed(embedder: &mut Embedder, path: &Path, kind: Kind) -> Result<Vec<(
     Ok(out)
 }
 
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
 fn now_nanos() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
 }
@@ -422,6 +455,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_file_changing_twice_in_five_minutes_waits_until_still() {
+        let (now, busy) = (1_000_000, 300);
+        // New: read at once.
+        assert!(!is_busy(0, now - 1, now, busy));
+        // Changed long after it was read: at once.
+        assert!(!is_busy(now - 3600, now - 1, now, busy));
+        // Changed a minute after it was read, a few seconds ago: waits…
+        assert!(is_busy(now - 60, now - 5, now, busy));
+        // …until its date is five minutes old.
+        assert!(!is_busy(now - 400, now - 300, now, busy));
+    }
+
+    #[test]
     fn files_leave_with_their_folder_but_not_with_an_unplugged_drive() {
         let dir = std::env::temp_dir().join(format!("rummage-sync-{}", std::process::id()));
         let (a, b) = (dir.join("a"), dir.join("b"));
@@ -431,13 +477,13 @@ mod tests {
         }
         let store = Store::open(&dir.join("index")).unwrap();
         let options = crawl::Options { code: false, excluded: Vec::new() };
-        assert_eq!(sync(&store, &[a.clone(), b.clone()], &options).unwrap().new_or_changed, 2);
+        assert_eq!(sync(&store, &[a.clone(), b.clone()], &options, false).unwrap().new_or_changed, 2);
         // b is no longer indexed: its file goes.
-        assert_eq!(sync(&store, std::slice::from_ref(&a), &options).unwrap().removed, 1);
+        assert_eq!(sync(&store, std::slice::from_ref(&a), &options, false).unwrap().removed, 1);
         // a is missing altogether, as an unplugged drive would be: its file stays.
         let moved = dir.join("a-away");
         std::fs::rename(&a, &moved).unwrap();
-        assert_eq!(sync(&store, std::slice::from_ref(&a), &options).unwrap().removed, 0);
+        assert_eq!(sync(&store, std::slice::from_ref(&a), &options, false).unwrap().removed, 0);
         assert_eq!(store.files_under(&a).unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }

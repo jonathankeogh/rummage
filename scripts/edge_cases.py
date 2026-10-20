@@ -257,6 +257,63 @@ def photos():
     check("Photos Library › " in shown, "results name them Photos Library › …")
 
 
+@case
+def busy():
+    """Fix 5: a file written every 2 s isn't read again and again while it changes, but once it's still; a new note
+    meanwhile is read in seconds. (The service watches; "still" is cut from 5 minutes to 45 s.)"""
+    folder = fresh("busy")
+    files = folder / "files"
+    (files / "old note.md").write_text("A note from before: the car goes in for its service next week.")
+    index(folder)
+    BUSY = 45  # over the watcher's 30 s sweep of a folder that never goes quiet
+    service = subprocess.Popen(
+        [str(RUMMAGE), "--index", str(folder / "index"), "watch"],
+        env={**os.environ, "RUMMAGE_BUSY_SECONDS": str(BUSY)},
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=open(folder / "service.log", "w"),
+    )  # fmt: skip
+
+    def stored(name):
+        with db(folder) as c:
+            return c.execute("SELECT state, mtime FROM files WHERE path LIKE ?", (f"%/{name}",)).fetchone()
+
+    try:
+        time.sleep(5)
+        log = files / "readings.txt"
+        reads = set()  # the dates it was read at
+        note_written = note_read = None
+        started = time.time()
+        while time.time() - started < 60:
+            with open(log, "a") as out:
+                out.write(f"{time.strftime('%H:%M:%S')} the pump ran, pressure steady at the north tank\n")
+            if note_written is None and time.time() - started > 10:
+                (files / "new note.md").write_text("A new note: ask the neighbours about the hedge on Sunday.")
+                note_written = time.time()
+            row = stored("new note.md")
+            if note_written and note_read is None and row and row[0] == "done":
+                note_read = time.time()
+            row = stored("readings.txt")
+            if row and row[0] == "done":
+                reads.add(row[1])
+            time.sleep(2)
+        last_write = int(os.stat(log).st_mtime)
+        while time.time() - last_write < BUSY + 45:
+            row = stored("readings.txt")
+            if row and row[0] == "done":
+                reads.add(row[1])
+                if row[1] == last_write:
+                    break
+            time.sleep(1)
+        final_at = time.time()
+    finally:
+        service.terminate()
+        service.wait()
+    check(len(reads) <= 2, f"read {len(reads)} times over 60 s of writes (first sight, then once still)")
+    check(last_write in reads, "read once still, as last written")
+    check(final_at - last_write >= BUSY - 2, f"…after it was still ({final_at - last_write:.0f} s after the last write)")
+    took = (note_read or 1e9) - (note_written or 0)
+    check(took < 45, f"a new note meanwhile read in {took:.0f} s")
+
+
 SF_DATALESS = 0x40000000
 
 
