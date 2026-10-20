@@ -416,8 +416,12 @@ struct Seen {
     modality: Modality,
 }
 
+/// Videos shorter than this are one picture, their middle frame, without their sound (a Live Photo's clip, a GIF-like
+/// loop, a recording started by accident): about a photo's cost instead of ten times more.
+const CLIP_SECONDS: f64 = 5.0;
+
 /// A recording's or a video's vectors: (start, end, vector, modality). A video gives a frame per shot (70 vision
-/// tokens) and its sound; a recording its sound, in 30 s windows.
+/// tokens) and its sound; a recording its sound, in 30 s windows; a clip under 5 s its middle frame as a photo.
 fn embed_timed(
     embedder: &mut Embedder,
     path: &Path,
@@ -426,6 +430,18 @@ fn embed_timed(
 ) -> Result<Vec<(f64, f64, Vec<f32>, Modality)>> {
     let mut out = Vec::new();
     let (has_audio, has_video) = crate::media::streams(path);
+    if kind == Kind::Video
+        && has_video
+        && span.is_none()
+        && let Some(length) = crate::media::duration(path).filter(|d| *d < CLIP_SECONDS)
+    {
+        // The stretch starts at the frame, so the preview shows it.
+        let middle = length / 2.0;
+        let rgb = crate::media::frame_at(path, middle, 1024)?.to_rgb8();
+        let pixels = picture::Rgb { width: rgb.width() as usize, height: rgb.height() as usize, data: rgb.into_raw() };
+        let vector = embedder.embed_image(Picture::Pixels(pixels), picture::PHOTO_BUDGET)?;
+        return Ok(vec![(middle, length, vector, Modality::Image)]);
+    }
     if kind == Kind::Video && has_video {
         let folder = std::env::temp_dir().join(format!("rummage-frames-{}-{}", std::process::id(), now_nanos()));
         let frames = crate::media::keyframes(path, &folder, span);

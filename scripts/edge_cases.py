@@ -353,6 +353,27 @@ def long_media():
     print(f"  ({took:.0f} s in all)")
 
 
+@case
+def clips():
+    """Fix 7: a 3-second clip is one picture, its middle frame, with no sound windows; a 10-second one is a video as
+    before."""
+    folder = fresh("clips")
+    video(folder / "files/live photo.mov", 3)
+    video(folder / "files/ten seconds.mp4", 10)
+    said, _ = index(folder)
+    with db(folder) as c:
+        def segments(name):
+            return c.execute(
+                "SELECT s.modality, s.loc, f.kind FROM segments s JOIN files f ON f.id = s.file_id WHERE f.path LIKE ?",
+                (f"%/{name}",)).fetchall()  # fmt: skip
+        clip = segments("live photo.mov")
+        check(len(clip) == 1 and clip[0][0] == "image" and abs(clip[0][1] - 1.5) < 0.1 and clip[0][2] == "video",
+              f"the clip: one picture vector at its middle, still a video: {clip}")  # fmt: skip
+        ten = segments("ten seconds.mp4")
+        kinds = {m for m, _, _ in ten}
+        check(kinds == {"image", "audio"} and len(ten) > 2, f"the 10-second one: frames and sound ({len(ten)} vectors)")
+
+
 SF_DATALESS = 0x40000000
 
 
