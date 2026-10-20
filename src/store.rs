@@ -1,6 +1,6 @@
 //! The index: one SQLite file with the files, a vector per passage, and a keyword index (FTS5) over names and text.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
@@ -191,13 +191,29 @@ impl Store {
         match store.meta("fingerprint")? {
             None => store.set_meta("fingerprint", FINGERPRINT)?,
             Some(f) if f == FINGERPRINT => {}
-            Some(f) => bail!("this index was made by another model or pipeline ({f}): run `rummage index --reindex`"),
+            Some(f) => return Err(StaleIndex { made_by: f }.into()),
         }
         Ok(store)
     }
 
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
         Ok(self.db.query_row("SELECT value FROM meta WHERE key = ?", [key], |r| r.get(0)).optional()?)
+    }
+
+    /// Folders `rummage index --exclude` left out, kept for later runs (and the service's).
+    pub fn excluded(&self) -> Result<Vec<PathBuf>> {
+        Ok(self.meta("excluded")?.map(|v| v.lines().map(PathBuf::from).collect()).unwrap_or_default())
+    }
+
+    pub fn add_excluded(&self, folders: &[PathBuf]) -> Result<()> {
+        let mut all = self.excluded()?;
+        for folder in folders {
+            if !all.contains(folder) {
+                all.push(folder.clone());
+            }
+        }
+        let joined: Vec<String> = all.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        self.set_meta("excluded", &joined.join("\n"))
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
@@ -359,6 +375,25 @@ impl Store {
         self.set_meta("fingerprint", FINGERPRINT)
     }
 }
+
+/// An index made by another model or pipeline: its vectors and words can't be used, only rebuilt.
+#[derive(Debug)]
+pub struct StaleIndex {
+    pub made_by: String,
+}
+
+impl std::fmt::Display for StaleIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "this index was made by another model or pipeline ({}): the search service rebuilds it when it starts \
+             (any search starts it), or run `rummage index --reindex`",
+            self.made_by
+        )
+    }
+}
+
+impl std::error::Error for StaleIndex {}
 
 /// Opens an index whose fingerprint may be stale, for `--reindex`.
 pub fn open_for_reindex(dir: &Path) -> Result<Store> {

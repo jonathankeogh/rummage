@@ -24,6 +24,18 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Open the interface and run until the user quits.
 pub fn run<B: Backend>(backend: B) -> Result<()> {
+    // Asked every so often, on its own thread, how indexing is going (a connection that fails just says nothing).
+    let (progress_tx, progress) = std::sync::mpsc::channel();
+    if let Some(mut probe) = backend.indexing_probe() {
+        std::thread::spawn(move || {
+            loop {
+                if progress_tx.send(probe()).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+        });
+    }
     let (requests, responses) = app::spawn_worker(backend);
     let mut app = App::new(requests);
 
@@ -34,7 +46,7 @@ pub fn run<B: Backend>(backend: B) -> Result<()> {
         default_hook(info);
     }));
     let mut terminal = enter().context("can't start the terminal interface")?;
-    let result = event_loop(&mut terminal, &mut app, &responses);
+    let result = event_loop(&mut terminal, &mut app, &responses, &progress);
     let _ = leave();
     result
 }
@@ -53,10 +65,18 @@ fn leave() -> Result<()> {
     Ok(())
 }
 
-fn event_loop(terminal: &mut Term, app: &mut App, responses: &std::sync::mpsc::Receiver<app::Response>) -> Result<()> {
+fn event_loop(
+    terminal: &mut Term,
+    app: &mut App,
+    responses: &std::sync::mpsc::Receiver<app::Response>,
+    progress: &std::sync::mpsc::Receiver<Option<usize>>,
+) -> Result<()> {
     loop {
         while let Ok(response) = responses.try_recv() {
             app.apply_response(response);
+        }
+        while let Ok(left) = progress.try_recv() {
+            app.set_indexing(left);
         }
         app.refresh_preview();
         app.refresh_page_image();

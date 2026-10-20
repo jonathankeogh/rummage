@@ -8,12 +8,15 @@
 //! ```
 //!
 //! One service per index. `rummage search` (and the interface) start it when it isn't running; it quits after
-//! `linger` without a request. It notices when `rummage index` changes the index and reloads the vectors.
+//! `linger` without a request. It keeps the index up to date while it runs (see `watch`): it catches up when it
+//! starts, indexes new and changed files as they land, and rebuilds an index made by another version. It reloads the
+//! vectors as the index changes.
 
 use crate::embed::{Embedder, prompts};
 use crate::paths::ModelFiles;
 use crate::search::{self, Hit, Vectors};
-use crate::store::{Kind, Store};
+use crate::store::{Kind, StaleIndex, Store};
+use crate::watch::{Indexer, Watching};
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -84,12 +87,31 @@ pub struct Response {
     /// Time spent on the request inside the service.
     #[serde(default)]
     pub millis: f64,
+    /// Files still to read while the index is being brought up to date (a ping's answer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexing: Option<usize>,
+    /// Folders watched for changes, and why some can't be (a ping's answer).
+    #[serde(default)]
+    pub watching: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_problem: Option<String>,
 }
 
 impl Default for Response {
     /// Not ok, and final: every response but a search's first is its last.
     fn default() -> Response {
-        Response { ok: false, id: 0, done: true, error: None, hits: Vec::new(), vectors: 0, millis: 0.0 }
+        Response {
+            ok: false,
+            id: 0,
+            done: true,
+            error: None,
+            hits: Vec::new(),
+            vectors: 0,
+            millis: 0.0,
+            indexing: None,
+            watching: 0,
+            watch_problem: None,
+        }
     }
 }
 
@@ -103,6 +125,7 @@ pub struct Engine {
     query_centre: search::QueryCentre,
     /// Moves on every reload of the vectors: a search's second phase only runs on the vectors of its first.
     generation: u64,
+    loaded: Instant,
 }
 
 /// What a search's second phase needs: the first phase's evidence, and what to grep.
@@ -124,7 +147,7 @@ impl Engine {
         let query_centre = search::QueryCentre::from_vectors(&embedder.embed_texts(&typical)?);
         vectors.set_query_centre(query_centre.clone());
         let data_version = data_version(&store)?;
-        Ok(Engine { store, vectors, embedder, data_version, query_centre, generation: 0 })
+        Ok(Engine { store, vectors, embedder, data_version, query_centre, generation: 0, loaded: Instant::now() })
     }
 
     pub fn vector_count(&self) -> usize {
@@ -134,7 +157,9 @@ impl Engine {
     /// Reloads the vectors when another process (`rummage index`) has changed the index since the last look.
     fn refresh(&mut self) -> Result<()> {
         let version = data_version(&self.store)?;
-        if version != self.data_version {
+        // At most once a second: while the index fills in, it changes with every file.
+        if version != self.data_version && self.loaded.elapsed() >= RELOAD_EVERY {
+            self.loaded = Instant::now();
             self.vectors = Vectors::load(&self.store)?;
             self.vectors.set_query_centre(self.query_centre.clone());
             self.generation += 1;
@@ -201,6 +226,16 @@ impl Engine {
     }
 }
 
+/// How often the vectors may be reloaded while the index changes.
+const RELOAD_EVERY: Duration = Duration::from_secs(1);
+
+/// Files not yet fully read.
+fn files_left(store: &Store) -> Result<usize> {
+    let left: i64 =
+        store.db.query_row("SELECT COUNT(*) FROM files WHERE state IN ('pending', 'partial')", [], |r| r.get(0))?;
+    Ok(left as usize)
+}
+
 /// SQLite's counter that moves whenever another connection commits to the file.
 fn data_version(store: &Store) -> Result<i64> {
     Ok(store.db.query_row("PRAGMA data_version", [], |r| r.get(0))?)
@@ -228,7 +263,39 @@ pub fn serve(dir: &Path, linger: Option<Duration>) -> Result<()> {
         return Ok(());
     }
     let started = Instant::now();
-    let engine = Engine::open(dir)?;
+    let indexer = Indexer::new(dir);
+    let engine = match Engine::open(dir) {
+        Ok(engine) => {
+            // Catch up with what changed while the service wasn't running.
+            if !engine.store.roots()?.is_empty() {
+                indexer.run();
+            }
+            engine
+        }
+        Err(error) if error.is::<StaleIndex>() => {
+            // Made by another version: start it over from its folders, and search what's done as it fills in.
+            let made_by = error.downcast_ref::<StaleIndex>().map_or("", |s| s.made_by.as_str());
+            eprintln!("rummage serve: the index was made by another version ({made_by}); rebuilding it");
+            indexer.rebuild();
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                std::thread::sleep(Duration::from_millis(300));
+                match Engine::open(dir) {
+                    Ok(engine) => break engine,
+                    Err(e) if e.is::<StaleIndex>() && Instant::now() < deadline => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    let watching = match crate::watch::watch(dir, indexer.clone()) {
+        Ok(watching) => watching,
+        Err(error) => {
+            eprintln!("rummage serve: can't watch the folders: {error:#}; changes are picked up when it starts");
+            Arc::new(Watching::default())
+        }
+    };
     // Bind only once the model is loaded: a client that can connect gets an answer.
     std::fs::remove_file(&socket).ok();
     let listener = UnixListener::bind(&socket).with_context(|| format!("can't listen on {}", socket.display()))?;
@@ -255,12 +322,13 @@ pub fn serve(dir: &Path, linger: Option<Duration>) -> Result<()> {
             }
         });
     }
+    let keeping = Arc::new(Keeping { indexer, watching });
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let (engine, files, last_request, socket) =
-            (engine.clone(), files.clone(), last_request.clone(), socket.clone());
+        let (engine, files, last_request, socket, keeping) =
+            (engine.clone(), files.clone(), last_request.clone(), socket.clone(), keeping.clone());
         std::thread::spawn(move || {
-            if let Err(error) = handle(stream, &engine, &files, &last_request, &socket) {
+            if let Err(error) = handle(stream, &engine, &files, &last_request, &socket, &keeping) {
                 eprintln!("rummage serve: {error:#}");
             }
         });
@@ -294,12 +362,19 @@ impl GrepFiles {
     }
 }
 
+/// How the service keeps the index up to date: the indexing runs and the folder watcher.
+struct Keeping {
+    indexer: Arc<Indexer>,
+    watching: Arc<Watching>,
+}
+
 fn handle(
     stream: UnixStream,
     engine: &Mutex<Engine>,
     files: &Arc<GrepFiles>,
     last_request: &AtomicU64,
     socket: &Path,
+    keeping: &Keeping,
 ) -> Result<()> {
     let mut writer = stream.try_clone()?;
     // Requests are read on their own thread, so a newer one can cancel a grep still running.
@@ -342,8 +417,19 @@ fn handle(
                 quit(socket);
             }
             Request::Ping => {
-                let vectors = engine.lock().unwrap().vector_count();
-                send(&Response { ok: true, vectors, ..Default::default() })?;
+                let (vectors, indexing) = {
+                    let engine = engine.lock().unwrap();
+                    let indexing = keeping.indexer.running().then(|| files_left(&engine.store).ok()).flatten();
+                    (engine.vector_count(), indexing)
+                };
+                send(&Response {
+                    ok: true,
+                    vectors,
+                    indexing,
+                    watching: keeping.watching.folders.load(Ordering::Relaxed),
+                    watch_problem: keeping.watching.problem.lock().unwrap().clone(),
+                    ..Default::default()
+                })?;
             }
             Request::Search { id, query, limit, grep, kinds, zgate, typing } => {
                 let started_search =
@@ -589,6 +675,11 @@ impl crate::tui::backend::Backend for ServiceBackend {
                 self.search_once(query, limit, first)
             }
         }
+    }
+
+    fn indexing_probe(&self) -> Option<Box<dyn FnMut() -> Option<usize> + Send>> {
+        let dir = self.dir.clone();
+        Some(Box::new(move || Client::connect(&dir).ok()?.request(&Request::Ping).ok()?.indexing))
     }
 }
 

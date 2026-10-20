@@ -186,6 +186,8 @@ pub struct App {
     pub wave: Option<(String, WaveState)>,
     /// Listening to the selected recording or video (Ctrl-s).
     pub player: Option<Player>,
+    /// Files left while the service brings the index up to date.
+    pub indexing: Option<usize>,
 }
 
 /// A stretch of sound drawn as a waveform: `from`..`to` seconds of the file, `levels` loud from 0 to 1.
@@ -276,6 +278,16 @@ impl App {
             last_flip: None,
             wave: None,
             player: None,
+            indexing: None,
+        }
+    }
+
+    /// The service's indexing progress: when it finishes, the search runs again to take in what it added.
+    pub fn set_indexing(&mut self, left: Option<usize>) {
+        let finished = self.indexing.is_some() && left.is_none();
+        self.indexing = left;
+        if finished && !self.query.is_empty() {
+            self.query_changed();
         }
     }
 

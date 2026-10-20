@@ -36,6 +36,9 @@ enum Command {
         /// Drop every vector and embed everything again
         #[arg(long)]
         reindex: bool,
+        /// Run for the search service: summary lines only, no progress counter
+        #[arg(long, hide = true)]
+        background: bool,
     },
     /// Search by meaning and words. Start with "code:" to search code
     Search {
@@ -68,6 +71,16 @@ enum Command {
     },
     /// Stop the background service
     Stop,
+    /// Keep the index up to date at all times: the search service, never quitting (it indexes new and changed files
+    /// whenever it runs; this keeps it running)
+    Watch {
+        /// Start it at login (launchd on macOS, a systemd user service on Linux)
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Stop starting it at login
+        #[arg(long)]
+        uninstall: bool,
+    },
 }
 
 /// `rummage search … | head` stops quietly when `head` has read enough, as other Unix tools do (Rust otherwise ignores
@@ -96,8 +109,8 @@ fn run() -> Result<()> {
     }
     let dir = cli.index.clone().unwrap_or_else(paths::index_dir);
     match cli.command {
-        Some(Command::Index { folders, code, exclude, reindex }) => {
-            index_command(&dir, folders, code, exclude, reindex)
+        Some(Command::Index { folders, code, exclude, reindex, background }) => {
+            index_command(&dir, folders, code, exclude, reindex, background)
         }
         Some(Command::Search { words, limit, kind, zgate, json, no_serve, no_grep }) => {
             search_command(&dir, words, limit, kind, zgate, json, no_serve, no_grep)
@@ -117,11 +130,35 @@ fn run() -> Result<()> {
                 Ok(())
             }
         },
+        Some(Command::Watch { install: true, .. }) => rummage::watch::install(&dir),
+        Some(Command::Watch { uninstall: true, .. }) => rummage::watch::uninstall(),
+        Some(Command::Watch { .. }) => {
+            // A service a search started quits when idle: this one takes its place and stays.
+            if let Ok(mut client) = serve::Client::connect(&dir) {
+                client.request(&serve::Request::Quit).ok();
+                for _ in 0..50 {
+                    if serve::Client::connect(&dir).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            serve::serve(&dir, None)
+        }
         None => interface(&dir),
     }
 }
 
-fn index_command(dir: &PathBuf, folders: Vec<PathBuf>, code: bool, exclude: Vec<PathBuf>, reindex: bool) -> Result<()> {
+fn index_command(
+    dir: &PathBuf,
+    folders: Vec<PathBuf>,
+    code: bool,
+    exclude: Vec<PathBuf>,
+    reindex: bool,
+    background: bool,
+) -> Result<()> {
+    // One indexing run at a time: yours, or the search service's keeping up with changes.
+    let _lock = rummage::watch::lock_index(dir, background)?;
     let store = if reindex { store::open_for_reindex(dir)? } else { Store::open(dir)? };
     for folder in &folders {
         let folder = folder.canonicalize().with_context(|| format!("no folder {}", folder.display()))?;
@@ -137,10 +174,10 @@ fn index_command(dir: &PathBuf, folders: Vec<PathBuf>, code: bool, exclude: Vec<
     if roots.is_empty() {
         bail!("no folders yet: rummage index <folder>...");
     }
-    let options = crawl::Options {
-        code: code || store.meta("code")?.as_deref() == Some("1"),
-        excluded: exclude.iter().filter_map(|e| e.canonicalize().ok()).collect(),
-    };
+    // Left out for good: later runs (and the service's) leave them out too.
+    store.add_excluded(&exclude.iter().filter_map(|e| e.canonicalize().ok()).collect::<Vec<_>>())?;
+    let options =
+        crawl::Options { code: code || store.meta("code")?.as_deref() == Some("1"), excluded: store.excluded()? };
     let started = Instant::now();
     let sync = index::sync(&store, &roots, &options)?;
     eprintln!(
@@ -201,6 +238,13 @@ fn index_command(dir: &PathBuf, folders: Vec<PathBuf>, code: bool, exclude: Vec<
     }
     let mut first_pass_over = false;
     let done = index::embed_pending(&store, |progress| {
+        if background {
+            // The service's log gets the summary, not a counter redrawn in place.
+            if let index::Progress::Later { .. } = progress {
+                first_pass_over = true;
+            }
+            return;
+        }
         // Just the name: a full path wraps in a narrow terminal and the line can't be redrawn.
         let short = |path: &std::path::Path| -> String {
             path.file_name().map(|n| n.to_string_lossy().chars().take(60).collect()).unwrap_or_default()
@@ -310,11 +354,15 @@ fn interface(dir: &PathBuf) -> Result<()> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         bail!("the interface needs a terminal; for scripts use `rummage search … --json`");
     }
-    let store = Store::open(dir)?;
-    if store.roots()?.is_empty() {
-        bail!("nothing indexed yet: rummage index <folder>... (rummage --help for more)");
+    match Store::open(dir) {
+        Ok(store) if store.roots()?.is_empty() => {
+            bail!("nothing indexed yet: rummage index <folder>... (rummage --help for more)")
+        }
+        Ok(_) => {}
+        // Made by another version: the service rebuilds it, and the interface shows how far it's got.
+        Err(error) if error.is::<store::StaleIndex>() => {}
+        Err(error) => return Err(error),
     }
-    drop(store);
     rummage::tui::run(serve::ServiceBackend::connect(dir)?)
 }
 
@@ -374,8 +422,18 @@ fn index_status(dir: &PathBuf, store: &Store) -> Result<()> {
     let size = std::fs::metadata(&store.file).map(|m| m.len()).unwrap_or(0);
     println!("size: {:.1} MB", size as f64 / 1e6);
     match serve::Client::connect(dir).and_then(|mut c| c.request(&serve::Request::Ping)) {
-        Ok(_) => println!("search service: running"),
-        Err(_) => println!("search service: not running (a search starts it)"),
+        Ok(ping) => {
+            let folders = if ping.watching == 1 { "folder" } else { "folders" };
+            print!("search service: running, watching {} {folders} for changes", ping.watching);
+            match ping.indexing {
+                Some(left) => println!("; indexing, {left} files to go"),
+                None => println!(),
+            }
+            if let Some(problem) = ping.watch_problem {
+                println!("  {problem}");
+            }
+        }
+        Err(_) => println!("search service: not running (a search starts it, and it catches up with changes then)"),
     }
     Ok(())
 }

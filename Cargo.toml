@@ -18,6 +18,7 @@ half = "2.7.1"
 html2text = "=0.17.1"
 ignore = "0.4.33"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "tiff", "gif", "bmp"] }
+notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 quick-xml = "0.42.0"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }

@@ -17,4 +17,9 @@ pub trait Backend: Send + 'static {
     ) -> anyhow::Result<Option<Vec<Hit>>> {
         self.search(query, limit).map(Some)
     }
+
+    /// A way to ask, from another thread, how many files are left while the index is being brought up to date.
+    fn indexing_probe(&self) -> Option<Box<dyn FnMut() -> Option<usize> + Send>> {
+        None
+    }
 }

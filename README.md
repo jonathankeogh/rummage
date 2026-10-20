@@ -41,7 +41,7 @@ rummage                                  # the interface: type to search, ↑↓
                                          #   (^v on a PDF shows the page itself, ←→ turn pages; ^s listens to a
                                          #    recording or video from its moment; RUMMAGE_PICTURES=halfblocks if
                                          #    your terminal doesn't answer its graphics query)
-rummage index ~/Documents ~/notes        # add folders and index them (later: `rummage index` alone re-syncs)
+rummage index ~/Documents ~/notes        # add folders and index them (afterwards the service keeps up with them)
 rummage search "the clause about pets in the lease"
 rummage search INV20931                  # exact words count too
 rummage search "/INV\d{5}/"              # a regex: grep runs over text and code files beside meaning search
@@ -51,9 +51,12 @@ rummage status                           # the index, and which optional tools a
 ```
 
 Searches go through a small background service that keeps the model loaded, so after the first one they take about
-10 ms. The first search starts it; it quits after 15 idle minutes and picks up re-indexing on its own. `rummage serve`
-runs it in the foreground (`--linger 0` never quits), `rummage stop` stops it, and `rummage search --no-serve` skips
-it. Its log is `serve.log` in the index folder.
+10 ms. The first search starts it, and it quits after 15 idle minutes. While it runs it keeps the index up to date:
+it catches up with what changed while it was off, indexes new and changed files a few seconds after they land (and
+drops deleted ones), and rebuilds an index made by an older rummage, searching what's done meanwhile. The interface
+shows "indexing · N files to go" while it works. `rummage watch` keeps it running for good, and `rummage watch
+--install` starts it at login (launchd on macOS, a systemd user service on Linux). `rummage stop` stops it, and
+`rummage search --no-serve` skips it. Its log is `serve.log` in the index folder.
 
 Recordings and videos show their sound as a waveform, the matched stretch marked; ^s plays it from there through mpv
 (or ffmpeg's ffplay), and ⏎ opens it in mpv or VLC at the moment.
