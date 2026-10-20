@@ -38,20 +38,34 @@ pub struct ModelFiles {
 }
 
 impl ModelFiles {
-    /// `$RUMMAGE_MODELS` (and only there, when set), else the pinned revision in the Hugging Face cache.
+    /// `$RUMMAGE_MODELS` (and only there, when set); else the pinned revision in the Hugging Face cache, where
+    /// Hugging Face's own tool puts it, then rummage's download folder (`download_folder`).
     pub fn locate() -> Result<ModelFiles> {
-        let folder = env_path("RUMMAGE_MODELS").unwrap_or_else(huggingface_snapshot);
+        let folders = match env_path("RUMMAGE_MODELS") {
+            Some(folder) => vec![folder],
+            None => vec![huggingface_snapshot(), download_folder()],
+        };
+        let Some(folder) = folders.iter().find(|f| f.join(TEXT_MODEL).exists()) else {
+            let wanted = [&crate::download::TEXT, &crate::download::MEDIA];
+            let folder = folders.last().expect("a folder");
+            bail!("no model yet\n{}", crate::download::instructions(&wanted, folder));
+        };
         let text = folder.join(TEXT_MODEL);
-        if !text.exists() {
-            bail!(
-                "no {TEXT_MODEL} in {}\nget it with: uvx --from huggingface_hub hf download {MODEL_REPOSITORY} \
-                 {TEXT_MODEL} {MEDIA_MODEL} --revision {MODEL_REVISION}",
-                folder.display()
-            );
-        }
-        let media = Some(folder.join(MEDIA_MODEL)).filter(|p| p.exists());
+        // The encoder may have come later, into the other folder.
+        let media = folders.iter().map(|f| f.join(MEDIA_MODEL)).find(|p| p.exists());
         Ok(ModelFiles { text, media })
     }
+}
+
+/// Where rummage downloads the model: `$XDG_DATA_HOME/rummage/models` or `~/.local/share/rummage/models`, one folder
+/// per revision (whatever `RUMMAGE_INDEX` says: the model serves every index).
+pub fn download_folder() -> PathBuf {
+    env_path("RUMMAGE_MODELS").unwrap_or_else(|| {
+        env_path("XDG_DATA_HOME")
+            .unwrap_or_else(|| home().join(".local/share"))
+            .join("rummage/models")
+            .join(MODEL_REVISION)
+    })
 }
 
 /// `$HF_HUB_CACHE`, `$HF_HOME/hub` or `~/.cache/huggingface/hub`, then the pinned snapshot in it.

@@ -26,13 +26,11 @@ git clone --recurse-submodules https://github.com/jonathankeogh/rummage && cd ru
 cargo build --release                    # macOS: Metal. Linux: CPU, or add --features cuda / --features vulkan
 ```
 
-The model is [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache 2.0). Download it once: 310 MB
-for text, and 555 MB more for pictures, sound and video (without it, those wait):
-
-```sh
-uvx --from huggingface_hub hf download ggml-org/embeddinggemma-2-GGUF embeddinggemma-2-Q8_0.gguf \
-  mmproj-embeddinggemma-2-Q8_0.gguf --revision bfcd298762cc34d0357ece5ebdd31791a3a374d8
-```
+The model is [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache 2.0): 310 MB for text, and
+555 MB more for pictures, sound and video. The first time rummage needs it, it asks, then downloads it from Hugging
+Face with `curl` into `~/.local/share/rummage/models` and checks it. Say no and it prints the folder and the `curl`
+commands, to do it yourself (or point `RUMMAGE_MODELS` at a folder that has the files, say on a machine without
+internet). A copy already in the Hugging Face cache (`hf download`) is used as it is.
 
 ## Use
 

@@ -1,6 +1,7 @@
 //! rummage: describe a file, find it. The engine behind the `rummage` command.
 
 pub mod crawl;
+pub mod download;
 pub mod embed;
 pub mod extract;
 pub mod grep;

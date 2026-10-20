@@ -218,13 +218,13 @@ fn index_command(
         )?)
     };
     let pictures_pending = pending_count("'image', 'screenshot', 'audio', 'video'")?;
-    if pictures_pending > 0 && ModelFiles::locate().is_ok_and(|m| m.media.is_none()) {
-        eprintln!(
-            "{pictures_pending} pictures, recordings and videos wait for the image and audio encoder (555 MB): uvx --from huggingface_hub hf download {} {} --revision {}",
-            paths::MODEL_REPOSITORY,
-            paths::MEDIA_MODEL,
-            paths::MODEL_REVISION
-        );
+    let partial: i64 = store.db.query_row("SELECT COUNT(*) FROM files WHERE state = 'partial'", [], |r| r.get(0))?;
+    // The model, asked for the first time it's needed (the service's runs never ask: they need a terminal).
+    if !background && pending_count("'doc', 'pdf', 'code', 'image', 'screenshot', 'audio', 'video'")? + partial > 0 {
+        let models = rummage::download::ensure(pictures_pending > 0)?;
+        if pictures_pending > 0 && models.media.is_none() {
+            eprintln!("{pictures_pending} pictures, recordings and videos wait for the image and audio encoder");
+        }
     }
     if pending_count("'screenshot'")? > 0 && !rummage::ocr::available() {
         eprintln!("screenshots are read by what they show only; for their words, {}", rummage::ocr::HINT);
@@ -280,6 +280,7 @@ fn search_command(
     no_serve: bool,
     no_grep: bool,
 ) -> Result<()> {
+    rummage::download::ensure(false)?;
     let query = words.join(" ");
     let kinds: Vec<Kind> =
         kind.iter().map(|k| Kind::parse(k).with_context(|| format!("unknown kind {k}"))).collect::<Result<_>>()?;
@@ -354,6 +355,7 @@ fn interface(dir: &PathBuf) -> Result<()> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         bail!("the interface needs a terminal; for scripts use `rummage search … --json`");
     }
+    rummage::download::ensure(false)?;
     match Store::open(dir) {
         Ok(store) if store.roots()?.is_empty() => {
             bail!("nothing indexed yet: rummage index <folder>... (rummage --help for more)")
