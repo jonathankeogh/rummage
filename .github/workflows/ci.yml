@@ -35,10 +35,12 @@ jobs:
       # Git comes first so the checkout brings the llama.cpp submodule.
       - name: System packages (Fedora)
         if: matrix.name == 'fedora'
+        # Each try again a few times: package mirrors come and go.
         run: |
-          dnf install -y git tar gzip zstd cmake gcc-c++ clang clang-devel poppler-utils tesseract curl
-          dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-42.noarch.rpm
-          dnf install -y --allowerasing ffmpeg
+          retry() { for i in 1 2 3; do "$@" && return; sleep 10; done; return 1; }
+          retry dnf install -y --allowerasing git tar gzip zstd cmake gcc-c++ clang clang-devel poppler-utils tesseract
+          retry dnf install -y https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-42.noarch.rpm
+          retry dnf install -y --allowerasing ffmpeg
           git config --global --add safe.directory '*'
       - uses: actions/checkout@v4
         with:
