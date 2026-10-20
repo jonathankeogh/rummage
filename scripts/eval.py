@@ -69,15 +69,21 @@ for query in queries:
     if out.returncode != 0:
         sys.exit(f"rummage failed on {query['q']!r}: {out.stderr.strip()}")
     results = json.loads(out.stdout)
-    hits = [str(pathlib.Path(h["path"]).resolve().relative_to(base)) if h["path"].startswith(str(base)) else h["path"]
-            for h in results]
-    rank = next((i + 1 for i, (h, r) in enumerate(zip(hits, results)) if h in expected and lands(r, expected[h])), None)
+    def relative(path):
+        return str(pathlib.Path(path).resolve().relative_to(base)) if path.startswith(str(base)) else path
+
+    # A result stands for every copy of its content: the one shown and those it lists as also in.
+    hits = [[relative(p) for p in [h["path"], *h.get("also_in", [])]] for h in results]
+    rank = next(
+        (i + 1 for i, (paths, r) in enumerate(zip(hits, results)) if any(p in expected and lands(r, expected[p]) for p in paths)),
+        None,
+    )
     counted += 1
     r1 += rank == 1
     r5 += rank is not None and rank <= 5
     mrr += 1 / rank if rank else 0
     if args.verbose and rank != 1:
-        print(f"  #{rank or '-'}  {query['q']!r}  want {sorted(expected)[0]}  got {hits[:3]}")
+        print(f"  #{rank or '-'}  {query['q']!r}  want {sorted(expected)[0]}  got {[h[0] for h in hits[:3]]}")
 
 if counted == 0:
     sys.exit("no query has an expected file of the counted kinds under --base")

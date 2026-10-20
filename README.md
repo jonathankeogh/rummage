@@ -69,9 +69,26 @@ Text and Markdown, PDFs a page at a time (scanned pages as pictures, read by OCR
 screenshots (JPEG, PNG, HEIC, WebP, GIF, BMP, TIFF; icons under 256 px and dataset folders of machine-named pictures
 are left out), recordings of any length (MP3, M4A, WAV, FLAC, Ogg, Opus …, in overlapping 30 s windows; silence
 skipped) and videos (MP4, MOV, MKV, WebM, AVI, MPEG-TS …: a frame per shot plus the sound; a TypeScript .ts stays
-code), and with `--code` source code and notebooks, in projects and as loose scripts. Long files go in two
-passes: the first 30 pages of a big PDF or 40 passages of a long document right away, the rest once everything else
-is in, so a 500-page PDF can't hold up the first pass. Scanned PDFs (no text) wait for OCR.
+code), and with `--code` source code and notebooks, in projects and as loose scripts. Long files go in passes: the
+first 30 pages of a big PDF, 40 passages of a long document or 10 minutes of a recording or video right away, the rest
+once everything else is in, so a 500-page PDF or a film can't hold up the first pass (`rummage status` says how far it
+has got: "Film.mp4 30 of 118 minutes"). Scanned PDFs (no text) wait for OCR. A video under 5 seconds (a Live Photo's
+clip) is read as one picture, its middle frame. Text that's mostly numbers (a data dump, a CSV saved as .txt) gets 3
+passages embedded and the rest left to its words and grep.
+
+In an Apple Photos library only the originals are read (macOS asks for Full Disk Access first; `rummage index` says
+so), not its thumbnails and edited copies, and Lightroom's previews are skipped.
+
+Files in iCloud Drive (with Optimize Mac Storage), Dropbox, OneDrive or Google Drive that aren't downloaded to the Mac
+are left out, never downloaded to be read, and counted in `rummage status`; one downloaded later is read then. On Linux,
+network and cloud mounts (rclone, sshfs, NFS, SMB …) inside a folder are left out unless added as folders themselves.
+
+Each file's content is hashed (BLAKE3), so a copy is read once and found as one result that says where the others are
+("also in ~/Downloads, ~/Backup"), and a moved or renamed file, or a whole folder of them, reads nothing again. A file
+that keeps changing (a log, a download, a document being worked on) is read once it has been still for 5 minutes, not
+at every change. A program that hangs on a file (poppler, tesseract, ffmpeg) is stopped after a minute; a file that
+can't be read is left out whole, with the reason in `rummage status`, and tried again when it changes or rummage is
+updated.
 
 Only the folders you add. It never reads hidden folders, keys, certificates or password files, dependency folders
 (`node_modules`, `venv` …) or `~/Library`. Inside a code project (a folder with `.git`, `Cargo.toml`, `package.json`
@@ -99,8 +116,11 @@ query's words.
 
 `cargo test --release` runs the unit tests everywhere. With the model files present it also runs
 `tests/reference_vectors.rs` (rummage's vectors must match DigUp's reference vectors, cosine ≥ 0.999) and
-`tests/end_to_end.rs` (index, re-sync, long files in two passes, the service, grep, crash recovery); without them
-(as on CI) those skip. `scripts/eval.py` measures ranking on DigUp's eval sets: build the text parts of its testbed
+`tests/end_to_end.rs` (index, re-sync, long files in two passes, the service, grep, crash recovery); without them those
+skip (CI keeps the model in GitHub's cache, so they run there). `uv run scripts/edge_cases.py` builds the files that
+once made indexing slow, stuck or wrong (a tool that hangs, a password-protected PDF, a Photos library, a file written
+every 2 s, a 40-minute recording, clips, number dumps, copies and moves) and checks each against the release build;
+`uv run scripts/edge_cases.py icloud` does the same with a test file in your iCloud Drive. `scripts/eval.py` measures ranking on DigUp's eval sets: build the text parts of its testbed
 somewhere outside a code project (e.g. `~/.cache/rummage-eval`) and see the script's header. `scripts/sweep.py` runs
 every eval set with one ranking weight changed at a time (each weight can be overridden by `RUMMAGE_<NAME>`, e.g.
 `RUMMAGE_WORD_WEIGHT=1.5`).
