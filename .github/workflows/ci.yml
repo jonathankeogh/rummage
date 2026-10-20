@@ -7,23 +7,46 @@ on:
 
 jobs:
   test:
+    name: test (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - name: ubuntu
+            os: ubuntu-latest
+          - name: ubuntu-arm64
+            os: ubuntu-24.04-arm
+          - name: macos
+            os: macos-latest
+          # Fedora's packages and compilers, in a container on an Ubuntu machine.
+          - name: fedora
+            os: ubuntu-latest
+            container: fedora:42
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     steps:
+      - name: System packages (Ubuntu)
+        if: startsWith(matrix.name, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev poppler-utils tesseract-ocr ffmpeg
+      - name: System packages (macOS)
+        if: matrix.name == 'macos'
+        run: brew install cmake poppler tesseract ffmpeg
+      # ffmpeg from RPM Fusion, as Fedora users get it (Fedora's own ffmpeg-free can't encode H.264 for the tests).
+      # Git comes first so the checkout brings the llama.cpp submodule.
+      - name: System packages (Fedora)
+        if: matrix.name == 'fedora'
+        run: |
+          dnf install -y git tar gzip zstd cmake gcc-c++ clang clang-devel poppler-utils tesseract curl
+          dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-42.noarch.rpm
+          dnf install -y --allowerasing ffmpeg
+          git config --global --add safe.directory '*'
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: System packages (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev poppler-utils tesseract-ocr ffmpeg
-      - name: System packages (macOS)
-        if: runner.os == 'macOS'
-        run: brew install cmake poppler tesseract ffmpeg
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
       # The model (865 MB, public on Hugging Face), kept in GitHub's cache between runs so the tests that need it run
       # here too: downloaded once, restored after (dropped by GitHub after 7 days unused, then downloaded again).
       - uses: astral-sh/setup-uv@v6
