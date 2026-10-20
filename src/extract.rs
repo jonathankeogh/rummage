@@ -282,6 +282,25 @@ pub fn pdf_pages(path: &Path, first: usize, last: usize) -> Result<Vec<String>> 
     Ok(pages)
 }
 
+/// Whether text is mostly numbers (data dumps, a CSV saved as .txt, exported readings): over 40% of the letters and
+/// digits in its first 20,000 characters are digits.
+pub fn mostly_digits(parts: &[Part]) -> bool {
+    let (mut digits, mut alphanumeric, mut seen) = (0usize, 0usize, 0usize);
+    'parts: for part in parts {
+        for c in part.text.chars() {
+            seen += 1;
+            if seen > 20_000 {
+                break 'parts;
+            }
+            if c.is_alphanumeric() {
+                alphanumeric += 1;
+                digits += c.is_ascii_digit() as usize;
+            }
+        }
+    }
+    alphanumeric > 0 && digits * 10 > alphanumeric * 4
+}
+
 /// The file's text, or an error for binary files.
 pub fn read_text(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path)?;
@@ -535,6 +554,14 @@ mod tests {
     fn short_text_is_one_passage() {
         assert_eq!(passages("hello there", 1800, 200, 10), vec!["hello there"]);
         assert!(passages("   ", 1800, 200, 10).is_empty());
+    }
+
+    #[test]
+    fn numbers_are_told_from_prose() {
+        let part = |text: &str| vec![Part { loc: 1, text: text.into() }];
+        assert!(mostly_digits(&part("2026-10-20T10:00:01,21.4,1013.2,55\n2026-10-20T10:00:02,21.5,1013.1,54\n")));
+        assert!(!mostly_digits(&part("Invoice INV-20931, 2 October 2026: 3 boxes of A4 paper at 4.99 EUR each.")));
+        assert!(!mostly_digits(&part("")));
     }
 
     #[test]

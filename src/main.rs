@@ -274,6 +274,7 @@ fn index_command(
             path.file_name().map(|n| n.to_string_lossy().chars().take(60).collect()).unwrap_or_default()
         };
         match progress {
+            index::Progress::Note { path, note } => eprintln!("\r\x1b[K{}: {note}", short(path)),
             index::Progress::File { done, total, path } => eprint!("\r\x1b[K[{done}/{total}] {}", short(path)),
             index::Progress::Later { path, kind, done, total } => {
                 if !first_pass_over {

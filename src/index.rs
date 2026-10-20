@@ -23,6 +23,11 @@ const FIRST_PASSAGES: usize = 40;
 const LATER_STEP: usize = 200;
 /// Small files are grouped so the GPU gets full batches.
 const GROUP_PARTS: usize = 32;
+/// Text that's mostly digits (data dumps, a CSV saved as .txt) has only this many passages embedded: a digit costs the
+/// model about a token, so such passages take several times longer than prose, and their vectors say little. All of it
+/// stays searchable by its words.
+const NUMBERS_EMBEDDED: usize = 3;
+
 /// Recordings and videos go in passes of this many seconds (their progress is counted in seconds). One up to a minute
 /// longer goes at once.
 const PASS_SECONDS: usize = 600;
@@ -133,6 +138,8 @@ pub enum Progress<'a> {
     File { done: usize, total: usize, path: &'a Path },
     /// A later pass read more of a long file: `done` of its `total` pages or passages.
     Later { path: &'a Path, kind: Kind, done: usize, total: usize },
+    /// Something worth knowing about a file, said once.
+    Note { path: &'a Path, note: &'static str },
 }
 
 /// Some of a file's parts, read and ready for the model.
@@ -147,6 +154,8 @@ struct Job {
     picture: Option<Kind>,
     /// For sound and video in passes, the seconds this one covers (None: all of it).
     span: Option<(f64, f64)>,
+    /// Only this many of `parts` are embedded; the rest go to the word index alone (number-heavy text).
+    embedded: Option<usize>,
     /// Parts read once this job is stored, and the file's total.
     done: usize,
     total: usize,
@@ -167,7 +176,11 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
     let mut done = 0;
     let mut group: Vec<Job> = Vec::new();
     for (file_id, path, kind) in pending {
-        match first_step(file_id, &path, kind) {
+        let step = first_step(file_id, &path, kind);
+        if let Ok(Job { embedded: Some(_), .. }) = &step {
+            progress(Progress::Note { path: &path, note: "mostly numbers, searched by its words" });
+        }
+        match step {
             Ok(job)
                 if job.parts.is_empty() && job.scans.is_empty() && job.picture.is_none() && job.done >= job.total =>
             {
@@ -208,6 +221,7 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
                 scans: Vec::new(),
                 picture: Some(kind),
                 span: Some((parts_done as f64, to as f64)),
+                embedded: None,
                 done: to,
                 total: parts_total,
             };
@@ -237,6 +251,7 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
                 scans: read.blank,
                 picture: None,
                 span: None,
+                embedded: None,
                 done: range.end.min(read.total),
                 total: read.total,
             };
@@ -269,6 +284,7 @@ fn first_step(file_id: i64, path: &Path, kind: Kind) -> Result<Job> {
             scans: Vec::new(),
             picture: Some(kind),
             span,
+            embedded: None,
             done,
             total,
         });
@@ -283,7 +299,16 @@ fn first_step(file_id: i64, path: &Path, kind: Kind) -> Result<Job> {
         Kind::Code => extract::MAX_PASSAGES,
         Kind::Image | Kind::Screenshot | Kind::Audio | Kind::Video => unreachable!("handled above"),
     };
-    let read = extract::read_parts(path, kind, 0..step)?;
+    let mut read = extract::read_parts(path, kind, 0..step)?;
+    // Mostly numbers: all of it at once, a few passages embedded.
+    let mut embedded = None;
+    if kind == Kind::Doc && extract::mostly_digits(&read.parts) {
+        if read.total > step {
+            read = extract::read_parts(path, kind, 0..extract::MAX_PASSAGES)?;
+        }
+        embedded = Some(NUMBERS_EMBEDDED);
+    }
+    let done = if embedded.is_some() { read.total } else { step.min(read.total) };
     Ok(Job {
         file_id,
         path: path.to_path_buf(),
@@ -292,7 +317,8 @@ fn first_step(file_id: i64, path: &Path, kind: Kind) -> Result<Job> {
         scans: read.blank,
         picture: None,
         span: None,
-        done: step.min(read.total),
+        embedded,
+        done,
         total: read.total,
     })
 }
@@ -310,7 +336,10 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<(
     }
     let inputs: Vec<String> = jobs
         .iter()
-        .flat_map(|job| job.parts.iter().map(|part| prompts::document(Some(&job.name), &part.text)))
+        .flat_map(|job| {
+            let embedded = job.embedded.unwrap_or(usize::MAX);
+            job.parts.iter().take(embedded).map(|part| prompts::document(Some(&job.name), &part.text))
+        })
         .collect();
     let vectors = embedder.embed_texts(&inputs)?;
 
@@ -368,8 +397,12 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<(
             paths.push((job.path, true));
             continue;
         }
-        for part in &job.parts {
-            let vector = next.next().expect("one vector per part");
+        for (i, part) in job.parts.iter().enumerate() {
+            let vector = if i < job.embedded.unwrap_or(usize::MAX) {
+                Some(next.next().expect("one vector per embedded part").as_slice())
+            } else {
+                None
+            };
             let excerpt = extract::excerpt(&part.text, 200);
             store.add_segment(
                 job.file_id,
@@ -377,7 +410,7 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<(
                 &job.name,
                 &part.text,
                 &excerpt,
-                Some(vector),
+                vector,
                 Modality::Text,
             )?;
         }
