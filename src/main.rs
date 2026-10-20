@@ -190,6 +190,17 @@ fn index_command(
         index::duration(started)
     );
     let started = Instant::now();
+    if sync.cloud_only > 0 {
+        eprintln!("{}", cloud_only_note(sync.cloud_only));
+    }
+    for folder in &sync.remote_folders {
+        eprintln!(
+            "left out {} (a network or cloud drive: reading it downloads it); to index it, add it as its own folder: \
+             rummage index {}",
+            tilde(folder),
+            tilde(folder)
+        );
+    }
     if sync.media_without_ffmpeg > 0 {
         eprintln!(
             "left out {} recordings and videos: {}, then run rummage index again",
@@ -440,6 +451,9 @@ fn index_status(dir: &PathBuf, store: &Store) -> Result<()> {
             println!("  and {} more reasons", reasons.len() - 8);
         }
     }
+    if let Some(n) = store.meta("cloud_only")?.and_then(|n| n.parse::<usize>().ok()).filter(|n| *n > 0) {
+        println!("{}", cloud_only_note(n));
+    }
     println!("model: {}", store.meta("fingerprint")?.unwrap_or_default());
     let size = std::fs::metadata(&store.file).map(|m| m.len()).unwrap_or(0);
     println!("size: {:.1} MB", size as f64 / 1e6);
@@ -458,6 +472,13 @@ fn index_status(dir: &PathBuf, store: &Store) -> Result<()> {
         Err(_) => println!("search service: not running (a search starts it, and it catches up with changes then)"),
     }
     Ok(())
+}
+
+/// What to say about files that are in the cloud only.
+fn cloud_only_note(n: usize) -> String {
+    let files = if n == 1 { "file" } else { "files" };
+    let here = if cfg!(target_os = "macos") { "this Mac" } else { "this computer" };
+    format!("{n} {files} in iCloud or another cloud drive aren't downloaded to {here}: left out until they are")
 }
 
 /// The programs rummage uses when they're there: whether each is found (and which), what it adds, how to get it.

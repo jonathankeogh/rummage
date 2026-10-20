@@ -8,6 +8,7 @@ once made indexing slow, stuck or wrong, indexed into its own index with the rel
     cargo build --release
     uv run scripts/edge_cases.py              # every case
     uv run scripts/edge_cases.py limits retries
+    uv run scripts/edge_cases.py icloud       # only when named: it uses your iCloud Drive (a test folder, deleted)
 
 The folders go in ~/.cache/rummage-eval/edge/<case>; each run starts it afresh.
 """
@@ -46,11 +47,11 @@ def fresh(name: str) -> pathlib.Path:
     return folder
 
 
-def index(folder: pathlib.Path, env: dict | None = None, timeout: float = 900) -> tuple[str, float]:
-    """Indexes folder/files into folder/index; returns what it said and how long it took."""
+def index(folder: pathlib.Path, env: dict | None = None, timeout: float = 900, files=None) -> tuple[str, float]:
+    """Indexes folder/files (or `files`) into folder/index; returns what it said and how long it took."""
     started = time.time()
     result = subprocess.run(
-        [str(RUMMAGE), "--index", str(folder / "index"), "index", str(folder / "files")],
+        [str(RUMMAGE), "--index", str(folder / "index"), "index", str(files or folder / "files")],
         env={**os.environ, **(env or {})},
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -214,10 +215,50 @@ def retries():
     check(changed(said) == 2, f"after an update: {changed(said)} failed files read again")
 
 
+SF_DATALESS = 0x40000000
+
+
+def dataless(path: pathlib.Path) -> bool:
+    return bool(os.stat(path).st_flags & SF_DATALESS)
+
+
+@case
+def icloud():
+    """Fix 1: a file in iCloud only (evicted) is left out and counted, never downloaded. Touches iCloud Drive: one
+    small test folder, deleted after. Run only when named."""
+    drive = pathlib.Path("~/Library/Mobile Documents/com~apple~CloudDocs").expanduser()
+    if not drive.is_dir():
+        print("  skipped: no iCloud Drive here")
+        return
+    test = drive / f"rummage-edge-test-{os.getpid()}"
+    folder = fresh("icloud")
+    try:
+        test.mkdir()
+        (test / "kept.md").write_text("A note that stays on this Mac: the plumber comes on Thursday.")
+        evicted = test / "evicted.md"
+        evicted.write_text("A note only in iCloud: the boiler service is booked for March.")
+        # Uploaded first: only an uploaded file can be evicted.
+        for _ in range(120):
+            if subprocess.run(["brctl", "evict", str(evicted)], capture_output=True).returncode == 0 and dataless(evicted):
+                break
+            time.sleep(2)
+        check(dataless(evicted), "the test file is evicted (in iCloud only)")
+        said, _ = index(folder, files=test)
+        check("1 file in iCloud" in said, f"counted: {[l for l in said.splitlines() if 'iCloud' in l]}")
+        check(file_row(folder, "evicted.md") is None, "not indexed")
+        kept = file_row(folder, "kept.md")
+        check(kept is not None and kept[0] == "done", f"the downloaded one is: {kept}")
+        check(dataless(evicted), "still in iCloud only after indexing (not downloaded)")
+    finally:
+        shutil.rmtree(test, ignore_errors=True)
+
+
+OPT_IN = {"icloud"}
+
 if __name__ == "__main__":
     if not RUMMAGE.exists():
         sys.exit("build first: cargo build --release")
-    names = sys.argv[1:] or list(CASES)
+    names = sys.argv[1:] or [n for n in CASES if n not in OPT_IN]
     for name in names:
         print(f"{name}: {CASES[name].__doc__.splitlines()[0]}")
         CASES[name]()

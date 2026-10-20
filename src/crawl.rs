@@ -7,6 +7,8 @@
 use crate::store::Kind;
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
 pub struct Found {
@@ -112,12 +114,26 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
     let mut heic_without_tool = 0;
     let mut media_without_ffmpeg = 0;
     let mut small_pictures = 0;
+    let mut cloud = Vec::new();
+    let placeholders = Arc::new(AtomicUsize::new(0));
+    let mut remote_folders = Vec::new();
     for root in roots {
-        for entry in walker(root, &options.excluded).filter_map(|e| e.ok()) {
+        let remote = remote_mounts_below(root, &remote_mounts());
+        remote_folders.extend(remote.iter().cloned());
+        let walk = walker(root, &options.excluded, &remote, Some(placeholders.clone()));
+        for entry in walk.filter_map(|e| e.ok()) {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
             let path = entry.path();
+            // In the cloud only: reading anything of it (even a picture's size) would download it.
+            let Ok(meta) = entry.metadata() else { continue };
+            if in_cloud_only(&meta) {
+                if indexable_name(path) {
+                    cloud.push(Found { path: path.to_path_buf(), kind: Kind::Doc, size: meta.len(), mtime: mtime(&meta) });
+                }
+                continue;
+            }
             let Some(kind) = classify(path, options) else { continue };
             if kind == Kind::Pdf && !crate::extract::pdf_tools() {
                 pdfs_without_tools += 1;
@@ -133,7 +149,6 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
                 heic_without_tool += 1;
                 continue;
             }
-            let Ok(meta) = entry.metadata() else { continue };
             let limit = match kind {
                 Kind::Code => MAX_CODE_BYTES,
                 Kind::Pdf => MAX_PDF_BYTES,
@@ -157,7 +172,110 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
     let datasets = dataset_folders(&found, roots);
     let dataset_files = found.iter().filter(|f| f.path.parent().is_some_and(|p| datasets.contains(p))).count();
     found.retain(|f| !f.path.parent().is_some_and(|p| datasets.contains(p)));
-    Walk { found, pdfs_without_tools, heic_without_tool, media_without_ffmpeg, small_pictures, dataset_files }
+    Walk {
+        found,
+        pdfs_without_tools,
+        heic_without_tool,
+        media_without_ffmpeg,
+        small_pictures,
+        dataset_files,
+        cloud,
+        placeholders: placeholders.load(Ordering::Relaxed),
+        remote_folders,
+    }
+}
+
+/// The file's content isn't on this disk, only in the cloud: macOS marks such files "dataless" (iCloud Drive with
+/// Optimize Mac Storage; Dropbox, OneDrive and Google Drive through File Provider). Reading one downloads it.
+pub fn in_cloud_only(meta: &std::fs::Metadata) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        const SF_DATALESS: u32 = 0x4000_0000;
+        meta.st_flags() & SF_DATALESS != 0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// Whether a file's name says it's something rummage reads (without reading it), for counting cloud-only files.
+fn indexable_name(path: &Path) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let ext = ext.as_str();
+    ext == "pdf"
+        || DOC_EXTENSIONS.contains(&ext)
+        || PICTURE_EXTENSIONS.contains(&ext)
+        || AUDIO_EXTENSIONS.contains(&ext)
+        || VIDEO_EXTENSIONS.contains(&ext)
+}
+
+/// Network and cloud file systems: reading a file there fetches it over the network (Linux's mount types).
+const REMOTE_FILE_SYSTEMS: &[&str] = &[
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smb3",
+    "smbfs",
+    "afs",
+    "ceph",
+    "glusterfs",
+    "davfs",
+    "fuse.rclone",
+    "fuse.sshfs",
+    "fuse.s3fs",
+    "fuse.gcsfuse",
+    "fuse.goofys",
+    "fuse.onedriver",
+    "fuse.gvfsd-fuse",
+    "fuse.davfs2",
+    "fuse.dropbox",
+];
+
+/// Where network and cloud file systems are mounted (Linux; none elsewhere).
+fn remote_mounts() -> Vec<PathBuf> {
+    std::fs::read_to_string("/proc/self/mountinfo").map(|text| remote_mounts_in(&text)).unwrap_or_default()
+}
+
+/// The remote mount points in a /proc/self/mountinfo: "id parent dev root mountpoint options … - type source …".
+fn remote_mounts_in(mountinfo: &str) -> Vec<PathBuf> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (before, after) = line.split_once(" - ")?;
+            let point = before.split(' ').nth(4)?;
+            let kind = after.split(' ').next()?;
+            REMOTE_FILE_SYSTEMS.contains(&kind).then(|| PathBuf::from(unescape_mount(point)))
+        })
+        .collect()
+}
+
+/// Mount points escape spaces, tabs, newlines and backslashes as octal (\040).
+fn unescape_mount(point: &str) -> String {
+    let bytes = point.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b)) {
+            out.push(u8::from_str_radix(&point[i + 1..i + 4], 8).unwrap_or(b'?'));
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The remote mounts inside `root` that a walk of it leaves out. A root that is itself on one (or is one) was chosen
+/// on purpose, so what's inside it is read.
+fn remote_mounts_below(root: &Path, mounts: &[PathBuf]) -> Vec<PathBuf> {
+    if mounts.iter().any(|m| root.starts_with(m)) {
+        return Vec::new();
+    }
+    mounts.iter().filter(|m| m.starts_with(root)).cloned().collect()
 }
 
 /// Folders of hundreds of same-kind, machine-named pictures, clips or videos ("frame_000123.png", "clip_0042.wav",
@@ -222,14 +340,16 @@ fn mtime(meta: &std::fs::Metadata) -> i64 {
 pub fn grep_files(roots: &[PathBuf], code: bool) -> Vec<(PathBuf, Kind, i64)> {
     let mut files = Vec::new();
     for root in roots {
-        for entry in walker(root, &[]).filter_map(|e| e.ok()) {
+        let remote = remote_mounts_below(root, &remote_mounts());
+        for entry in walker(root, &[], &remote, None).filter_map(|e| e.ok()) {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
             let path = entry.path();
             let Some(kind) = grep_kind(path, code) else { continue };
             let Ok(meta) = entry.metadata() else { continue };
-            if meta.len() > 0 {
+            // Never downloads a file to search it.
+            if meta.len() > 0 && !in_cloud_only(&meta) {
                 files.push((path.to_path_buf(), kind, mtime(&meta)));
             }
         }
@@ -262,13 +382,20 @@ fn grep_kind(path: &Path, code: bool) -> Option<Kind> {
     (GREP_DOC_EXTENSIONS.contains(&ext.as_str()) && !in_project(path.parent()?)).then_some(Kind::Doc)
 }
 
-/// Walks `root` with the skip rules: hidden and dependency folders, ~/Library, `excluded`, submodules, and inside code
-/// projects what git ignores plus vendored or built folders.
-fn walker(root: &Path, excluded: &[PathBuf]) -> ignore::Walk {
+/// Walks `root` with the skip rules: hidden files and folders, dependency folders, ~/Library, `excluded`, `remote`
+/// mounts, submodules, and inside code projects what git ignores plus vendored or built folders. Old-style iCloud
+/// placeholders (".Report.pdf.icloud", hidden) are counted into `placeholders`.
+fn walker(
+    root: &Path,
+    excluded: &[PathBuf],
+    remote: &[PathBuf],
+    placeholders: Option<Arc<AtomicUsize>>,
+) -> ignore::Walk {
     let excluded = excluded.to_vec();
+    let remote = remote.to_vec();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     WalkBuilder::new(root)
-        .hidden(true)
+        .hidden(false)
         .git_ignore(true)
         .git_global(false)
         .git_exclude(true)
@@ -276,10 +403,22 @@ fn walker(root: &Path, excluded: &[PathBuf]) -> ignore::Walk {
         .follow_links(false)
         .filter_entry(move |entry| {
             let path = entry.path();
-            if !entry.file_type().is_some_and(|t| t.is_dir()) || entry.depth() == 0 {
+            if entry.depth() == 0 {
                 return true;
             }
             let name = entry.file_name().to_string_lossy();
+            if name.starts_with('.') {
+                if name.ends_with(".icloud") && let Some(count) = &placeholders {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+                return false;
+            }
+            if !entry.file_type().is_some_and(|t| t.is_dir()) {
+                return true;
+            }
+            if remote.iter().any(|m| path == m) {
+                return false;
+            }
             if SKIPPED_FOLDERS.contains(&name.as_ref()) || name.ends_with(".noindex") {
                 return false;
             }
@@ -310,6 +449,12 @@ pub struct Walk {
     /// Pictures under 256 px (icons, thumbnails) and in dataset folders, left out.
     pub small_pictures: usize,
     pub dataset_files: usize,
+    /// Files in the cloud only (not downloaded), not read: their kind isn't known, so it's Doc.
+    pub cloud: Vec<Found>,
+    /// Old-style iCloud placeholder files.
+    pub placeholders: usize,
+    /// Network and cloud mounts inside the folders, left out.
+    pub remote_folders: Vec<PathBuf>,
 }
 
 /// What kind of file this is for rummage, or None to leave it alone.
@@ -453,5 +598,43 @@ mod tests {
         for name in ["notes.md", "keyboard.txt", "README.md"] {
             assert!(!is_secret(name), "{name}");
         }
+    }
+
+    #[test]
+    fn network_and_cloud_mounts_are_found_and_left_out_unless_chosen() {
+        let mountinfo = "\
+22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
+40 22 0:35 / /home/sam/Drive rw,nosuid shared:20 - fuse.rclone gdrive: rw,user_id=1000
+41 22 0:36 / /home/sam/My\\040Server rw shared:21 - fuse.sshfs sam@box:/ rw
+42 22 0:37 / /mnt/nas rw shared:22 - nfs4 nas:/export rw
+43 22 0:38 / /home/sam/usb rw shared:23 - vfat /dev/sda1 rw
+";
+        let mounts = remote_mounts_in(mountinfo);
+        assert_eq!(
+            mounts,
+            vec![PathBuf::from("/home/sam/Drive"), PathBuf::from("/home/sam/My Server"), PathBuf::from("/mnt/nas")]
+        );
+        // Inside home: left out. Chosen as a folder itself, or a folder inside it: read.
+        assert_eq!(
+            remote_mounts_below(Path::new("/home/sam"), &mounts),
+            vec![PathBuf::from("/home/sam/Drive"), PathBuf::from("/home/sam/My Server")]
+        );
+        assert!(remote_mounts_below(Path::new("/home/sam/Drive"), &mounts).is_empty());
+        assert!(remote_mounts_below(Path::new("/home/sam/Drive/Work"), &mounts).is_empty());
+    }
+
+    #[test]
+    fn hidden_files_are_skipped_and_icloud_placeholders_counted() {
+        let dir = std::env::temp_dir().join(format!("rummage-crawl-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+        std::fs::write(dir.join("note.md"), "A note.").unwrap();
+        std::fs::write(dir.join(".secret-note.md"), "Hidden.").unwrap();
+        std::fs::write(dir.join(".hidden/inside.md"), "Hidden too.").unwrap();
+        std::fs::write(dir.join(".Report.pdf.icloud"), "placeholder").unwrap();
+        let walk = walk(std::slice::from_ref(&dir), &Options::default());
+        let names: Vec<_> = walk.found.iter().map(|f| f.path.file_name().unwrap().to_owned()).collect();
+        assert_eq!(names, vec!["note.md"]);
+        assert_eq!(walk.placeholders, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

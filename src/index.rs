@@ -38,6 +38,10 @@ pub struct Sync {
     /// Pictures left out as icons (under 256 px) or as dataset folders.
     pub small_pictures: usize,
     pub dataset_files: usize,
+    /// Files in the cloud only, not downloaded here: left out until they are (those already in stay).
+    pub cloud_only: usize,
+    /// Network and cloud mounts inside the folders, left out.
+    pub remote_folders: Vec<PathBuf>,
 }
 
 /// Compares what's on disk under `roots` with the index: new and changed files become pending, gone ones go.
@@ -51,9 +55,20 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options) -> Resul
         media_without_ffmpeg: walk.media_without_ffmpeg,
         small_pictures: walk.small_pictures,
         dataset_files: walk.dataset_files,
+        cloud_only: walk.placeholders,
+        remote_folders: walk.remote_folders,
         ..Default::default()
     };
     let tx = store.db.unchecked_transaction()?;
+    // A file that went to the cloud after it was read (evicted) keeps what's in; one that's new or changed there waits
+    // until it's downloaded.
+    let mut kept: Vec<&Path> = Vec::new();
+    for file in &walk.cloud {
+        match store.file(&file.path)? {
+            Some(f) if f.size == file.size && f.mtime == file.mtime && f.settled() => kept.push(&file.path),
+            _ => summary.cloud_only += 1,
+        }
+    }
     for Found { path, kind, size, mtime } in &found {
         // A failed file is tried again when it changes, or by a newer rummage (it may read it now); not at every sweep.
         let unchanged = store.file(path)?.is_some_and(|f| f.size == *size && f.mtime == *mtime && f.settled());
@@ -62,7 +77,7 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options) -> Resul
             summary.new_or_changed += 1;
         }
     }
-    let on_disk: std::collections::HashSet<&Path> = found.iter().map(|f| f.path.as_path()).collect();
+    let on_disk: std::collections::HashSet<&Path> = found.iter().map(|f| f.path.as_path()).chain(kept).collect();
     // Gone: deleted, excluded, or under no indexed folder any more. A folder missing altogether (an unplugged drive)
     // keeps its files until it's back.
     let missing: Vec<&PathBuf> = roots.iter().filter(|root| !root.exists()).collect();
@@ -72,6 +87,7 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options) -> Resul
             summary.removed += 1;
         }
     }
+    store.set_meta("cloud_only", &summary.cloud_only.to_string())?;
     tx.commit()?;
     Ok(summary)
 }
