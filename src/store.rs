@@ -335,6 +335,32 @@ impl Store {
             .collect())
     }
 
+    /// The long file later passes are reading, when every file has had its first: "Film.mp4 30 of 118 minutes",
+    /// "Atlas.pdf page 230 of 900".
+    pub fn reading_now(&self) -> Result<Option<String>> {
+        let pending: i64 = self.db.query_row("SELECT COUNT(*) FROM files WHERE state = 'pending'", [], |r| r.get(0))?;
+        if pending > 0 {
+            return Ok(None);
+        }
+        let Some((path, kind, done, total)) = self
+            .db
+            .query_row(
+                "SELECT path, kind, parts_done, parts_total FROM files WHERE state = 'partial' ORDER BY parts_total LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(path);
+        let kind = Kind::parse(&kind).unwrap_or(Kind::Doc);
+        Ok(Some(match kind {
+            Kind::Audio | Kind::Video => format!("{name} {} of {} minutes", done / 60, (total + 59) / 60),
+            _ => format!("{name} {} {done} of {total}", kind.unit()),
+        }))
+    }
+
     /// Records how far a file has been read: `partial` until every part is in, then `done`.
     pub fn progress(&self, file_id: i64, done: usize, total: usize) -> Result<()> {
         let state = if done < total { "partial" } else { "done" };
@@ -460,4 +486,25 @@ pub fn open_for_reindex(dir: &Path) -> Result<Store> {
     let store = Store::open(dir)?;
     store.reset_vectors()?;
     Ok(store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn says_which_long_file_later_passes_are_reading() {
+        let dir = std::env::temp_dir().join(format!("rummage-store-{}", std::process::id()));
+        let store = Store::open(&dir).unwrap();
+        let film = store.upsert_pending(Path::new("/m/Film.mp4"), Kind::Video, 1, 1).unwrap();
+        let atlas = store.upsert_pending(Path::new("/d/Atlas.pdf"), Kind::Pdf, 1, 1).unwrap();
+        // While first passes go on, nothing to say.
+        assert_eq!(store.reading_now().unwrap(), None);
+        store.progress(film, 1800, 7080).unwrap();
+        store.progress(atlas, 230, 900).unwrap();
+        assert_eq!(store.reading_now().unwrap().as_deref(), Some("Atlas.pdf page 230 of 900"));
+        store.progress(atlas, 900, 900).unwrap();
+        assert_eq!(store.reading_now().unwrap().as_deref(), Some("Film.mp4 30 of 118 minutes"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

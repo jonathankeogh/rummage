@@ -54,12 +54,15 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.filter != super::app::Filter::All {
         block = block.title(Line::from(format!(" {} only ", app.filter.label())).right_aligned());
     }
-    if let Some(left) = app.indexing {
-        let files = if left == 1 { "file" } else { "files" };
-        block = block.title(
-            Line::styled(format!(" indexing · {left} {files} to go "), Style::default().fg(Color::DarkGray))
-                .right_aligned(),
-        );
+    if let Some(indexing) = &app.indexing {
+        let text = match &indexing.reading {
+            Some(reading) => format!(" indexing · {reading} "),
+            None => {
+                let files = if indexing.left == 1 { "file" } else { "files" };
+                format!(" indexing · {} {files} to go ", indexing.left)
+            }
+        };
+        block = block.title(Line::styled(text, Style::default().fg(Color::DarkGray)).right_aligned());
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);

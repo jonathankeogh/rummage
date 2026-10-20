@@ -187,7 +187,7 @@ pub struct App {
     /// Listening to the selected recording or video (Ctrl-s).
     pub player: Option<Player>,
     /// Files left while the service brings the index up to date.
-    pub indexing: Option<usize>,
+    pub indexing: Option<super::backend::Indexing>,
 }
 
 /// A stretch of sound drawn as a waveform: `from`..`to` seconds of the file, `levels` loud from 0 to 1.
@@ -283,7 +283,7 @@ impl App {
     }
 
     /// The service's indexing progress: when it finishes, the search runs again to take in what it added.
-    pub fn set_indexing(&mut self, left: Option<usize>) {
+    pub fn set_indexing(&mut self, left: Option<super::backend::Indexing>) {
         let finished = self.indexing.is_some() && left.is_none();
         self.indexing = left;
         if finished && !self.query.is_empty() {

@@ -115,12 +115,28 @@ pub struct AudioWindow {
 }
 
 /// Decodes the audio (a file's, or a video's soundtrack) and hands each non-silent window to `each` as it comes:
-/// memory stays at one window, even for a three-hour podcast. Returns the length in seconds.
-pub fn audio_windows(path: &Path, mut each: impl FnMut(AudioWindow) -> Result<()>) -> Result<f64> {
+/// memory stays at one window, even for a three-hour podcast. With `span` (from, to), only the windows that start in
+/// it, as a whole-file read would cut them (a long file goes in passes). Returns the length in seconds.
+pub fn audio_windows(
+    path: &Path,
+    span: Option<(f64, f64)>,
+    mut each: impl FnMut(AudioWindow) -> Result<()>,
+) -> Result<f64> {
     let window = (WINDOW_SECONDS * SAMPLE_RATE as f64) as usize;
     let hop = (HOP_SECONDS * SAMPLE_RATE as f64) as usize;
-    let mut child = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-i"])
+    let mut command = Command::new("ffmpeg");
+    command.args(["-v", "error", "-nostdin"]);
+    let from = match span {
+        Some((from, to)) => {
+            // The last window that starts before `to` runs 5 s past it.
+            let length = to - from + WINDOW_SECONDS - HOP_SECONDS;
+            command.args(["-ss", &format!("{from:.3}"), "-t", &format!("{length:.3}")]);
+            from
+        }
+        None => 0.0,
+    };
+    let mut child = command
+        .arg("-i")
         .arg(path)
         .args(["-vn", "-ac", "1", "-ar", &SAMPLE_RATE.to_string(), "-f", "s16le", "-"])
         .stdin(Stdio::null())
@@ -145,8 +161,8 @@ pub fn audio_windows(path: &Path, mut each: impl FnMut(AudioWindow) -> Result<()
             return Ok(());
         }
         each(AudioWindow {
-            start: offset as f64 / SAMPLE_RATE as f64,
-            end: (offset + buffer.len()) as f64 / SAMPLE_RATE as f64,
+            start: from + offset as f64 / SAMPLE_RATE as f64,
+            end: from + (offset + buffer.len()) as f64 / SAMPLE_RATE as f64,
             samples: buffer.iter().map(|&s| s as f32 / 32768.0).collect(),
         })
     };
@@ -182,7 +198,7 @@ pub fn audio_windows(path: &Path, mut each: impl FnMut(AudioWindow) -> Result<()
     if buffer.len().saturating_sub(covered) >= (MIN_TAIL_SECONDS * SAMPLE_RATE as f64) as usize {
         emit(&buffer, offset, &mut each)?;
     }
-    Ok(duration(path).unwrap_or((offset + buffer.len()) as f64 / SAMPLE_RATE as f64))
+    Ok(duration(path).unwrap_or(from + (offset + buffer.len()) as f64 / SAMPLE_RATE as f64))
 }
 
 /// A video frame for the model: a JPEG on disk and the stretch it stands for, in seconds.
@@ -192,25 +208,38 @@ pub struct Frame {
     pub end: f64,
 }
 
-/// Frames of a video, one per shot: a frame every `FRAME_INTERVAL` seconds (more apart for very long videos), and one
-/// that looks like the last kept one (8×8 average hash within 4 bits) only extends it. The JPEGs are written into
+/// Frames of a video, one per shot: a frame every `FRAME_INTERVAL` seconds (more apart for very long videos, so at
+/// most `MAX_FRAMES` in all), and one that looks like the last kept one (8×8 average hash within 4 bits) only extends
+/// it. With `span` (from, to), only the frames in it (a long video goes in passes). The JPEGs are written into
 /// `folder`, which the caller removes.
-pub fn keyframes(path: &Path, folder: &Path) -> Result<Vec<Frame>> {
+pub fn keyframes(path: &Path, folder: &Path, span: Option<(f64, f64)>) -> Result<Vec<Frame>> {
     let Some(duration) = duration(path) else { return Ok(Vec::new()) };
     let step = FRAME_INTERVAL.max(duration / MAX_FRAMES as f64);
     let first = 0.5f64.min(duration / 2.0);
+    let (from, to) = span.map_or((0.0, duration), |(from, to)| (from, to.min(duration)));
+    // The first slot in the span: frame n is the one shown at first + n * step, wherever the passes cut.
+    let start = first + ((from - first) / step).ceil().max(0.0) * step;
+    if start >= to {
+        return Ok(Vec::new());
+    }
     std::fs::create_dir_all(folder)?;
-    // Frame n is the one shown at first + n * step (round=up: the last frame at or before each slot). Reading from the
-    // start costs nothing over seeking (every frame is decoded anyway), and an MPEG-TS has no index to seek with.
-    let child = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-i"])
+    // Round=up: the last frame at or before each slot. From the start, every frame is decoded anyway (and an MPEG-TS
+    // has no index to seek with); a later pass seeks to where it starts.
+    let mut command = Command::new("ffmpeg");
+    command.args(["-v", "error", "-nostdin"]);
+    if from > 0.0 {
+        command.args(["-ss", &format!("{from:.3}"), "-t", &format!("{:.3}", to - from)]);
+    }
+    let child = command
+        .arg("-i")
         .arg(path)
         .args([
             "-an",
             "-vf",
             &format!(
-                "fps=fps={}:start_time={first}:round=up,scale=1024:1024:force_original_aspect_ratio=decrease",
-                1.0 / step
+                "fps=fps={}:start_time={}:round=up,scale=1024:1024:force_original_aspect_ratio=decrease",
+                1.0 / step,
+                start - from
             ),
             "-q:v",
             "3",
@@ -238,8 +267,8 @@ pub fn keyframes(path: &Path, folder: &Path) -> Result<Vec<Frame>> {
     let mut frames: Vec<Frame> = Vec::new();
     let mut last_hash: Option<u64> = None;
     for (index, frame) in names.into_iter().enumerate() {
-        let start = first + index as f64 * step;
-        if start >= duration {
+        let start = start + index as f64 * step;
+        if start >= to {
             continue; // fps can fill a slot past the end
         }
         if let Ok(image) = image::open(&frame) {
@@ -249,7 +278,7 @@ pub fn keyframes(path: &Path, folder: &Path) -> Result<Vec<Frame>> {
             }
             last_hash = Some(hash);
         }
-        frames.push(Frame { path: frame, start, end: duration });
+        frames.push(Frame { path: frame, start, end: to });
     }
     // Each kept frame stands for the stretch until the next.
     for i in 1..frames.len() {
@@ -432,7 +461,7 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let mut windows = Vec::new();
-        let length = audio_windows(&wav, |w| {
+        let length = audio_windows(&wav, None, |w| {
             windows.push((w.start, w.end, w.samples.len()));
             Ok(())
         })
@@ -442,5 +471,16 @@ mod tests {
         let starts: Vec<f64> = windows.iter().map(|w| w.0).collect();
         assert_eq!(starts, vec![0.0, 25.0, 50.0], "{windows:?}");
         assert!(windows.iter().all(|w| w.2 == 30 * SAMPLE_RATE || w.1 >= 69.0));
+        // Read in two passes, cut at 50 s: the same windows, each once.
+        let mut passes = Vec::new();
+        for span in [(0.0, 50.0), (50.0, 71.0)] {
+            audio_windows(&wav, Some(span), |w| {
+                passes.push((w.start, w.end, w.samples.len()));
+                Ok(())
+            })
+            .unwrap();
+        }
+        let close = |a: &(f64, f64, usize), b: &(f64, f64, usize)| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.1;
+        assert!(passes.len() == windows.len() && passes.iter().zip(&windows).all(|(a, b)| close(a, b)), "{passes:?}");
     }
 }

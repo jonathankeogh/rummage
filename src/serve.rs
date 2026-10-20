@@ -90,6 +90,9 @@ pub struct Response {
     /// Files still to read while the index is being brought up to date (a ping's answer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexing: Option<usize>,
+    /// The long file being read in later passes, and how far ("Film.mp4 30 of 118 minutes").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading: Option<String>,
     /// Folders watched for changes, and why some can't be (a ping's answer).
     #[serde(default)]
     pub watching: usize,
@@ -109,6 +112,7 @@ impl Default for Response {
             vectors: 0,
             millis: 0.0,
             indexing: None,
+            reading: None,
             watching: 0,
             watch_problem: None,
         }
@@ -433,15 +437,18 @@ fn handle(
                 quit(socket);
             }
             Request::Ping => {
-                let (vectors, indexing) = {
+                let (vectors, indexing, reading) = {
                     let engine = engine.lock().unwrap();
-                    let indexing = keeping.indexer.running().then(|| files_left(&engine.store).ok()).flatten();
-                    (engine.vector_count(), indexing)
+                    let running = keeping.indexer.running();
+                    let indexing = running.then(|| files_left(&engine.store).ok()).flatten();
+                    let reading = running.then(|| engine.store.reading_now().ok().flatten()).flatten();
+                    (engine.vector_count(), indexing, reading)
                 };
                 send(&Response {
                     ok: true,
                     vectors,
                     indexing,
+                    reading,
                     watching: keeping.watching.folders.load(Ordering::Relaxed),
                     watch_problem: keeping.watching.problem.lock().unwrap().clone(),
                     ..Default::default()
@@ -702,9 +709,12 @@ impl crate::tui::backend::Backend for ServiceBackend {
         }
     }
 
-    fn indexing_probe(&self) -> Option<Box<dyn FnMut() -> Option<usize> + Send>> {
+    fn indexing_probe(&self) -> Option<Box<dyn FnMut() -> Option<crate::tui::backend::Indexing> + Send>> {
         let dir = self.dir.clone();
-        Some(Box::new(move || Client::connect(&dir).ok()?.request(&Request::Ping).ok()?.indexing))
+        Some(Box::new(move || {
+            let ping = Client::connect(&dir).ok()?.request(&Request::Ping).ok()?;
+            Some(crate::tui::backend::Indexing { left: ping.indexing?, reading: ping.reading })
+        }))
     }
 }
 

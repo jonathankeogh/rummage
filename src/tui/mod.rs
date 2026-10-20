@@ -69,7 +69,7 @@ fn event_loop(
     terminal: &mut Term,
     app: &mut App,
     responses: &std::sync::mpsc::Receiver<app::Response>,
-    progress: &std::sync::mpsc::Receiver<Option<usize>>,
+    progress: &std::sync::mpsc::Receiver<Option<backend::Indexing>>,
 ) -> Result<()> {
     loop {
         while let Ok(response) = responses.try_recv() {

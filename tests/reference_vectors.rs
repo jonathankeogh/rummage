@@ -83,7 +83,7 @@ fn audio_vector_matches_digups() {
             return Vec::new();
         }
         let mut windows = Vec::new();
-        rummage::media::audio_windows(&speech, |w| {
+        rummage::media::audio_windows(&speech, None, |w| {
             windows.push(w.samples);
             Ok(())
         })

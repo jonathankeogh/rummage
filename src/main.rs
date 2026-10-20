@@ -283,7 +283,10 @@ fn index_command(
                         index::duration(started)
                     );
                 }
-                eprint!("\r\x1b[K{} {} of {} {}s", short(path), done, total, kind.unit());
+                match kind.is_timed() {
+                    true => eprint!("\r\x1b[K{} {} of {} minutes", short(path), done / 60, total.div_ceil(60)),
+                    false => eprint!("\r\x1b[K{} {} of {} {}s", short(path), done, total, kind.unit()),
+                }
             }
         }
         std::io::stderr().flush().ok();
@@ -474,9 +477,10 @@ fn index_status(dir: &PathBuf, store: &Store) -> Result<()> {
         Ok(ping) => {
             let folders = if ping.watching == 1 { "folder" } else { "folders" };
             print!("search service: running, watching {} {folders} for changes", ping.watching);
-            match ping.indexing {
-                Some(left) => println!("; indexing, {left} files to go"),
-                None => println!(),
+            match (ping.indexing, ping.reading) {
+                (Some(_), Some(reading)) => println!("; indexing, reading the rest of {reading}"),
+                (Some(left), None) => println!("; indexing, {left} files to go"),
+                _ => println!(),
             }
             if let Some(problem) = ping.watch_problem {
                 println!("  {problem}");

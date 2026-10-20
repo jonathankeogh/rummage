@@ -23,6 +23,9 @@ const FIRST_PASSAGES: usize = 40;
 const LATER_STEP: usize = 200;
 /// Small files are grouped so the GPU gets full batches.
 const GROUP_PARTS: usize = 32;
+/// Recordings and videos go in passes of this many seconds (their progress is counted in seconds). One up to a minute
+/// longer goes at once.
+const PASS_SECONDS: usize = 600;
 
 /// A file changed twice within this many seconds is busy (a log, a download, a document being worked on): it's read
 /// once it has been still this long. RUMMAGE_BUSY_SECONDS shortens it for tests.
@@ -142,6 +145,8 @@ struct Job {
     scans: Vec<usize>,
     /// A picture, sound or video file: embedded by what it shows or sounds like (see `embed`).
     picture: Option<Kind>,
+    /// For sound and video in passes, the seconds this one covers (None: all of it).
+    span: Option<(f64, f64)>,
     /// Parts read once this job is stored, and the file's total.
     done: usize,
     total: usize,
@@ -192,7 +197,28 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
     // Later passes: the rest of each long file, a step at a time, shortest file first.
     for (file_id, path, kind, mut parts_done, mut parts_total) in store.partial()? {
         let name = file_name(&path);
-        while parts_done < parts_total {
+        // Sound and video: the next ten minutes at a time.
+        while kind.is_timed() && parts_done < parts_total {
+            let to = (parts_done + PASS_SECONDS).min(parts_total);
+            let job = Job {
+                file_id,
+                path: path.clone(),
+                name: name.clone(),
+                parts: Vec::new(),
+                scans: Vec::new(),
+                picture: Some(kind),
+                span: Some((parts_done as f64, to as f64)),
+                done: to,
+                total: parts_total,
+            };
+            let took = embed(store, &mut embedder, vec![job])?;
+            if took.is_empty() || took.iter().any(|(_, failed)| *failed) {
+                break; // failed (it's out), or the encoder isn't there
+            }
+            parts_done = to;
+            progress(Progress::Later { path: &path, kind, done: parts_done, total: parts_total });
+        }
+        while !kind.is_timed() && parts_done < parts_total {
             let range = parts_done..(parts_done + LATER_STEP).min(parts_total);
             let read = match extract::read_parts(&path, kind, range.clone()) {
                 Ok(read) => read,
@@ -210,6 +236,7 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
                 parts: read.parts,
                 scans: read.blank,
                 picture: None,
+                span: None,
                 done: range.end.min(read.total),
                 total: read.total,
             };
@@ -226,16 +253,24 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
 /// A file's first step: all of a short file; the start of a long one.
 fn first_step(file_id: i64, path: &Path, kind: Kind) -> Result<Job> {
     if kind.is_picture() || kind.is_timed() {
-        let name = file_name(path);
+        // A long recording or video: its first ten minutes now, the rest in later passes.
+        let length = if kind.is_timed() { crate::media::duration(path) } else { None };
+        let (span, done, total) = match length {
+            Some(length) if length > (PASS_SECONDS + 60) as f64 => {
+                (Some((0.0, PASS_SECONDS as f64)), PASS_SECONDS, length.ceil() as usize)
+            }
+            _ => (None, 1, 1),
+        };
         return Ok(Job {
             file_id,
             path: path.to_path_buf(),
-            name,
+            name: file_name(path),
             parts: Vec::new(),
             scans: Vec::new(),
             picture: Some(kind),
-            done: 1,
-            total: 1,
+            span,
+            done,
+            total,
         });
     }
     let step = match kind {
@@ -256,6 +291,7 @@ fn first_step(file_id: i64, path: &Path, kind: Kind) -> Result<Job> {
         parts: read.parts,
         scans: read.blank,
         picture: None,
+        span: None,
         done: step.min(read.total),
         total: read.total,
     })
@@ -289,7 +325,7 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<(
                 continue;
             }
             let result = if kind.is_timed() {
-                embed_timed(embedder, &job.path, kind).map(|stretches| {
+                embed_timed(embedder, &job.path, kind, job.span).map(|stretches| {
                     for (start, end, vector, modality) in stretches {
                         seen.push(Seen { job: j, loc: start, end: Some(end), words: String::new(), vector, modality });
                     }
@@ -382,12 +418,17 @@ struct Seen {
 
 /// A recording's or a video's vectors: (start, end, vector, modality). A video gives a frame per shot (70 vision
 /// tokens) and its sound; a recording its sound, in 30 s windows.
-fn embed_timed(embedder: &mut Embedder, path: &Path, kind: Kind) -> Result<Vec<(f64, f64, Vec<f32>, Modality)>> {
+fn embed_timed(
+    embedder: &mut Embedder,
+    path: &Path,
+    kind: Kind,
+    span: Option<(f64, f64)>,
+) -> Result<Vec<(f64, f64, Vec<f32>, Modality)>> {
     let mut out = Vec::new();
     let (has_audio, has_video) = crate::media::streams(path);
     if kind == Kind::Video && has_video {
         let folder = std::env::temp_dir().join(format!("rummage-frames-{}-{}", std::process::id(), now_nanos()));
-        let frames = crate::media::keyframes(path, &folder);
+        let frames = crate::media::keyframes(path, &folder, span);
         let result = frames.and_then(|frames| {
             for frame in frames {
                 let vector = embedder.embed_image(Picture::File(frame.path.clone()), crate::media::FRAME_BUDGET)?;
@@ -399,7 +440,7 @@ fn embed_timed(embedder: &mut Embedder, path: &Path, kind: Kind) -> Result<Vec<(
         result?;
     }
     if has_audio {
-        crate::media::audio_windows(path, |window| {
+        crate::media::audio_windows(path, span, |window| {
             let vector = embedder.embed_audio(&window.samples)?;
             out.push((window.start, window.end, vector, Modality::Audio));
             Ok(())
