@@ -109,6 +109,9 @@ impl Kind {
 /// Which model and pipeline made the vectors. An index made with another one must embed again.
 pub const FINGERPRINT: &str = "embeddinggemma-2@bfcd298+llama.cpp-b11461/vectors1/stemmed-words";
 
+/// This rummage, as a failed file records it: a newer one tries the file again (it may read it now).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// The keyword index: file names and text, contentless (the text stays in the files), English endings stemmed
 /// ("invoices" finds "invoice"), accents ignored. A change here changes `FINGERPRINT`: its text can't be read back.
 const WORDS_TABLE: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS words USING fts5(
@@ -125,6 +128,19 @@ pub struct FileRow {
     pub size: u64,
     pub mtime: i64,
     pub state: String,
+    /// For a failed file, the rummage that failed it.
+    pub failed_by: Option<String>,
+}
+
+impl FileRow {
+    /// Read as far as it goes, or failed by this rummage: nothing to do until it changes.
+    pub fn settled(&self) -> bool {
+        match self.state.as_str() {
+            "pending" => false,
+            "failed" => self.failed_by.as_deref() == Some(VERSION),
+            _ => true,
+        }
+    }
 }
 
 impl Store {
@@ -187,6 +203,10 @@ impl Store {
         if !has_end {
             db.execute("ALTER TABLE segments ADD COLUMN loc_end REAL", [])?;
         }
+        // And before failed files waited for a change, which rummage failed them.
+        if !columns.iter().any(|c| c == "failed_by") {
+            db.execute("ALTER TABLE files ADD COLUMN failed_by TEXT", [])?;
+        }
         let store = Store { db, file };
         match store.meta("fingerprint")? {
             None => store.set_meta("fingerprint", FINGERPRINT)?,
@@ -235,9 +255,19 @@ impl Store {
     pub fn file(&self, path: &Path) -> Result<Option<FileRow>> {
         Ok(self
             .db
-            .query_row("SELECT id, size, mtime, state FROM files WHERE path = ?", [path.to_string_lossy()], |r| {
-                Ok(FileRow { id: r.get(0)?, size: r.get::<_, i64>(1)? as u64, mtime: r.get(2)?, state: r.get(3)? })
-            })
+            .query_row(
+                "SELECT id, size, mtime, state, failed_by FROM files WHERE path = ?",
+                [path.to_string_lossy()],
+                |r| {
+                    Ok(FileRow {
+                        id: r.get(0)?,
+                        size: r.get::<_, i64>(1)? as u64,
+                        mtime: r.get(2)?,
+                        state: r.get(3)?,
+                        failed_by: r.get(4)?,
+                    })
+                },
+            )
             .optional()?)
     }
 
@@ -339,9 +369,21 @@ impl Store {
         Ok(())
     }
 
+    /// Done; or failed with `error`, which also takes out whatever of it was in (a half-read file never shows).
     pub fn finish(&self, file_id: i64, error: Option<&str>) -> Result<()> {
-        let state = if error.is_some() { "failed" } else { "done" };
-        self.db.execute("UPDATE files SET state = ?, error = ? WHERE id = ?", params![state, error, file_id])?;
+        match error {
+            None => {
+                self.db.execute("UPDATE files SET state = 'done', error = NULL WHERE id = ?", [file_id])?;
+            }
+            Some(error) => {
+                self.clear_segments(file_id)?;
+                self.db.execute(
+                    "UPDATE files SET state = 'failed', error = ?, failed_by = ?, parts_done = NULL, parts_total = NULL
+                     WHERE id = ?",
+                    params![error, VERSION, file_id],
+                )?;
+            }
+        }
         Ok(())
     }
 

@@ -3,6 +3,7 @@
 //! packaged on every Unix (`brew install poppler`, `apt install poppler-utils`).
 
 use crate::store::Kind;
+use crate::tool;
 use anyhow::{Context, Result, bail};
 use quick_xml::events::Event;
 use std::io::Read as _;
@@ -225,8 +226,9 @@ fn office_text(path: &Path, member: &str, format: Office) -> Result<String> {
 pub fn pdf_tools() -> bool {
     static FOUND: OnceLock<bool> = OnceLock::new();
     *FOUND.get_or_init(|| {
-        Command::new("pdftotext").arg("-v").output().is_ok_and(|o| o.status.success() || !o.stderr.is_empty())
-            && Command::new("pdfinfo").arg("-v").output().is_ok()
+        tool::output(Command::new("pdftotext").arg("-v"), tool::limit(10))
+            .is_ok_and(|o| o.status.success() || !o.stderr.is_empty())
+            && tool::output(Command::new("pdfinfo").arg("-v"), tool::limit(10)).is_ok()
     })
 }
 
@@ -236,12 +238,13 @@ pub const PDF_TOOLS_HINT: &str =
 
 /// Renders page `page` (from 1) of a PDF to a PNG `height` pixels tall (its width follows), with `pdftoppm`.
 pub fn pdf_page_png(path: &Path, page: usize, height: u32) -> Result<Vec<u8>> {
-    let output = Command::new("pdftoppm")
-        .args(["-png", "-singlefile", "-f", &page.to_string(), "-l", &page.to_string()])
-        .args(["-scale-to-x", "-1", "-scale-to-y", &height.max(64).to_string()])
-        .arg(path)
-        .output()
-        .context("can't run pdftoppm")?;
+    let output = tool::output(
+        Command::new("pdftoppm")
+            .args(["-png", "-singlefile", "-f", &page.to_string(), "-l", &page.to_string()])
+            .args(["-scale-to-x", "-1", "-scale-to-y", &height.max(64).to_string()])
+            .arg(path),
+        tool::limit(30),
+    )?;
     if !output.status.success() || output.stdout.is_empty() {
         bail!("pdftoppm: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -250,7 +253,7 @@ pub fn pdf_page_png(path: &Path, page: usize, height: u32) -> Result<Vec<u8>> {
 
 /// A PDF's page count, from `pdfinfo`.
 pub fn pdf_page_count(path: &Path) -> Result<usize> {
-    let output = Command::new("pdfinfo").arg(path).output().context("can't run pdfinfo")?;
+    let output = tool::output(Command::new("pdfinfo").arg(path), tool::limit(60))?;
     if !output.status.success() {
         bail!("pdfinfo: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -263,12 +266,13 @@ pub fn pdf_page_count(path: &Path) -> Result<usize> {
 /// The text of pages `first..=last` (from 1), one string a page, from `pdftotext` (it ends each page with a form
 /// feed).
 pub fn pdf_pages(path: &Path, first: usize, last: usize) -> Result<Vec<String>> {
-    let output = Command::new("pdftotext")
-        .args(["-enc", "UTF-8", "-f", &first.to_string(), "-l", &last.to_string()])
-        .arg(path)
-        .arg("-")
-        .output()
-        .context("can't run pdftotext")?;
+    let output = tool::output(
+        Command::new("pdftotext")
+            .args(["-enc", "UTF-8", "-f", &first.to_string(), "-l", &last.to_string()])
+            .arg(path)
+            .arg("-"),
+        tool::limit(60),
+    )?;
     if !output.status.success() {
         bail!("pdftotext: {}", String::from_utf8_lossy(&output.stderr).trim());
     }

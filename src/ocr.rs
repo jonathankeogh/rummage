@@ -1,16 +1,18 @@
 //! The words in a picture, through tesseract (packaged on every Unix: `brew install tesseract`,
 //! `apt install tesseract-ocr`). For screenshots and scanned PDF pages; the words go to keyword search.
 
+use crate::tool;
 use anyhow::{Result, bail};
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
 
 /// Whether tesseract is installed (checked once).
 pub fn available() -> bool {
     static FOUND: OnceLock<bool> = OnceLock::new();
-    *FOUND.get_or_init(|| Command::new("tesseract").arg("--version").output().is_ok_and(|o| o.status.success()))
+    *FOUND.get_or_init(|| {
+        tool::output(Command::new("tesseract").arg("--version"), tool::limit(10)).is_ok_and(|o| o.status.success())
+    })
 }
 
 /// How to get OCR, for messages.
@@ -41,15 +43,10 @@ pub fn png_bytes(png: &[u8]) -> Result<String> {
 }
 
 fn run(command: &mut Command, input: Option<&[u8]>) -> Result<String> {
-    let mut child = command
-        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
-        stdin.write_all(bytes)?;
-    }
-    let output = child.wait_with_output()?;
+    let output = match input {
+        Some(bytes) => tool::output_with_input(command, bytes, tool::limit(60))?,
+        None => tool::output(command, tool::limit(60))?,
+    };
     if !output.status.success() {
         bail!("tesseract: {}", String::from_utf8_lossy(&output.stderr).trim());
     }

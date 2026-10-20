@@ -420,6 +420,26 @@ fn index_status(dir: &PathBuf, store: &Store) -> Result<()> {
         let (kind, state, count) = row?;
         println!("  {kind:<10} {state:<8} {count}");
     }
+    // Why files failed, most common first (each is tried again when it changes, or by a newer rummage).
+    let mut statement = store.db.prepare(
+        "SELECT error, COUNT(*), MIN(path) FROM files WHERE state = 'failed' GROUP BY error ORDER BY COUNT(*) DESC",
+    )?;
+    let reasons: Vec<(String, i64, String)> = statement
+        .query_map([], |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    if !reasons.is_empty() {
+        println!("not read (tried again when they change):");
+        for (error, count, example) in reasons.iter().take(8) {
+            let error: String = error.lines().next().unwrap_or_default().chars().take(100).collect();
+            match count {
+                1 => println!("  {}: {error}", tilde(std::path::Path::new(example))),
+                _ => println!("  {count} files ({} …): {error}", tilde(std::path::Path::new(example))),
+            }
+        }
+        if reasons.len() > 8 {
+            println!("  and {} more reasons", reasons.len() - 8);
+        }
+    }
     println!("model: {}", store.meta("fingerprint")?.unwrap_or_default());
     let size = std::fs::metadata(&store.file).map(|m| m.len()).unwrap_or(0);
     println!("size: {:.1} MB", size as f64 / 1e6);

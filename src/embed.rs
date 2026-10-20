@@ -63,7 +63,8 @@ impl Embedder {
         let path = CString::new(models.text.to_string_lossy().as_bytes())?;
         unsafe {
             let mut model_params = sys::llama_model_default_params();
-            model_params.n_gpu_layers = 999;
+            // RUMMAGE_CPU=1 runs on the CPU even with a GPU there (to compare, or to get round a GPU driver's trouble).
+            model_params.n_gpu_layers = if on_cpu() { 0 } else { 999 };
             let model = sys::llama_model_load_from_file(path.as_ptr(), model_params);
             if model.is_null() {
                 bail!("can't load {}", models.text.display());
@@ -103,7 +104,7 @@ impl Embedder {
             if let (false, Some(media)) = (query_only, &models.media) {
                 let path = CString::new(media.to_string_lossy().as_bytes())?;
                 let mut params = sys::mtmd_context_params_default();
-                params.use_gpu = true;
+                params.use_gpu = !on_cpu();
                 params.print_timings = false;
                 params.warmup = true;
                 // Never rescale: pictures arrive at their final size (`picture::target_size`).
@@ -417,4 +418,9 @@ unsafe extern "C" fn log(level: sys::ggml_log_level, text: *const c_char, _: *mu
     if LOG_LEVEL.load(Ordering::Relaxed) >= threshold {
         eprint!("{}", unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy());
     }
+}
+
+/// RUMMAGE_CPU=1: no GPU.
+fn on_cpu() -> bool {
+    std::env::var("RUMMAGE_CPU").is_ok_and(|v| v == "1")
 }

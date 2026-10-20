@@ -4,6 +4,7 @@
 //! Audio becomes 30 s windows of 16 kHz mono, 25 s apart (one model input hears at most 30 s), silent ones skipped.
 //! Video becomes a frame every few seconds, one kept per shot, plus its soundtrack as audio windows.
 
+use crate::tool;
 use anyhow::{Context, Result, bail};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -28,9 +29,9 @@ pub const FRAME_BUDGET: usize = 70;
 pub fn available() -> bool {
     static FOUND: OnceLock<bool> = OnceLock::new();
     *FOUND.get_or_init(|| {
-        ["ffmpeg", "ffprobe"]
-            .iter()
-            .all(|tool| Command::new(tool).arg("-version").output().is_ok_and(|o| o.status.success()))
+        ["ffmpeg", "ffprobe"].iter().all(|name| {
+            tool::output(Command::new(name).arg("-version"), tool::limit(10)).is_ok_and(|o| o.status.success())
+        })
     })
 }
 
@@ -38,12 +39,12 @@ pub fn available() -> bool {
 pub const HINT: &str = "install ffmpeg (brew install ffmpeg, apt install ffmpeg, dnf install ffmpeg)";
 
 fn probe(path: &Path, entries: &str) -> Result<String> {
-    let output = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", entries, "-of", "default=noprint_wrappers=1:nokey=1"])
-        .arg(path)
-        .stdin(Stdio::null())
-        .output()
-        .context("can't run ffprobe")?;
+    let output = tool::output(
+        Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", entries, "-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(path),
+        tool::limit(30),
+    )?;
     if !output.status.success() {
         bail!("ffprobe: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -59,14 +60,22 @@ pub fn duration(path: &Path) -> Option<f64> {
 /// to 1 (as loud as its loudest 1%). Decoded at a low rate, so minutes take a fraction of a second.
 pub fn loudness(path: &Path, from: f64, to: f64, slices: usize) -> Result<Vec<f32>> {
     const RATE: usize = 4000;
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-ss", &format!("{from:.3}"), "-t", &format!("{:.3}", (to - from).max(0.1))])
-        .arg("-i")
-        .arg(path)
-        .args(["-vn", "-ac", "1", "-ar", &RATE.to_string(), "-f", "s16le", "-"])
-        .stderr(Stdio::null())
-        .output()
-        .context("can't run ffmpeg")?;
+    let output = tool::output(
+        Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-ss",
+                &format!("{from:.3}"),
+                "-t",
+                &format!("{:.3}", (to - from).max(0.1)),
+            ])
+            .arg("-i")
+            .arg(path)
+            .args(["-vn", "-ac", "1", "-ar", &RATE.to_string(), "-f", "s16le", "-"]),
+        tool::limit(60),
+    )?;
     let samples: Vec<f32> =
         output.stdout.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect();
     if samples.is_empty() {
@@ -120,6 +129,11 @@ pub fn audio_windows(path: &Path, mut each: impl FnMut(AudioWindow) -> Result<()
         .spawn()
         .context("can't run ffmpeg")?;
     let mut stdout = child.stdout.take().expect("piped");
+    // Given up on when a window's worth of sound takes over a minute to come (the model's time doesn't count).
+    let reading = tool::Reading::default();
+    let progress = reading.clone();
+    let watchdog = tool::Watchdog::new(child, "ffmpeg", tool::limit(60), move || progress.progress());
+    let mut bytes_read = 0u64;
     let mut buffer: Vec<i16> = Vec::new();
     let mut offset = 0usize; // sample index of buffer[0] in the file
     let mut odd: Option<u8> = None; // a byte left over when a read ends mid-sample
@@ -137,10 +151,13 @@ pub fn audio_windows(path: &Path, mut each: impl FnMut(AudioWindow) -> Result<()
         })
     };
     loop {
+        reading.at(bytes_read);
         let read = stdout.read(&mut chunk)?;
+        reading.idle();
         if read == 0 {
             break;
         }
+        bytes_read += read as u64;
         let mut bytes: Vec<u8> = Vec::with_capacity(read + 1);
         if let Some(first) = odd.take() {
             bytes.push(first);
@@ -156,7 +173,7 @@ pub fn audio_windows(path: &Path, mut each: impl FnMut(AudioWindow) -> Result<()
             offset += hop;
         }
     }
-    let status = child.wait()?;
+    let status = watchdog.finish()?;
     if !status.success() && offset == 0 && buffer.is_empty() {
         bail!("ffmpeg couldn't decode the audio");
     }
@@ -185,7 +202,7 @@ pub fn keyframes(path: &Path, folder: &Path) -> Result<Vec<Frame>> {
     std::fs::create_dir_all(folder)?;
     // Frame n is the one shown at first + n * step (round=up: the last frame at or before each slot). Reading from the
     // start costs nothing over seeking (every frame is decoded anyway), and an MPEG-TS has no index to seek with.
-    let status = Command::new("ffmpeg")
+    let child = Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
         .args([
@@ -204,8 +221,12 @@ pub fn keyframes(path: &Path, folder: &Path) -> Result<Vec<Frame>> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .context("can't run ffmpeg")?;
+    // Given up on when a frame takes over a minute to come.
+    let written = folder.to_path_buf();
+    let frames_so_far = move || Some(std::fs::read_dir(&written).map_or(0, |d| d.count() as u64));
+    let status = tool::Watchdog::new(child, "ffmpeg", tool::limit(60), frames_so_far).finish()?;
     let mut names: Vec<PathBuf> = std::fs::read_dir(folder)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("frame-")))
@@ -264,23 +285,23 @@ pub fn average_hash(image: &image::RgbImage) -> u64 {
 
 /// The frame shown at `seconds`, as an RGB picture with its long side at most `pixels` (for the preview).
 pub fn frame_at(path: &Path, seconds: f64, pixels: u32) -> Result<image::DynamicImage> {
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-ss", &seconds.max(0.0).to_string(), "-i"])
-        .arg(path)
-        .args([
-            "-frames:v",
-            "1",
-            "-vf",
-            &format!("scale='min(iw,{pixels})':'min(ih,{pixels})':force_original_aspect_ratio=decrease"),
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "-",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .context("can't run ffmpeg")?;
+    let output = tool::output(
+        Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-ss", &seconds.max(0.0).to_string(), "-i"])
+            .arg(path)
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                &format!("scale='min(iw,{pixels})':'min(ih,{pixels})':force_original_aspect_ratio=decrease"),
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "png",
+                "-",
+            ]),
+        tool::limit(60),
+    )?;
     if output.stdout.is_empty() {
         bail!("no frame at {seconds:.0} s");
     }

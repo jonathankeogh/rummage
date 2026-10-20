@@ -55,10 +55,8 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options) -> Resul
     };
     let tx = store.db.unchecked_transaction()?;
     for Found { path, kind, size, mtime } in &found {
-        // Failed files are tried again: they're few, and a newer rummage may read them (scans, once it could).
-        let unchanged = store
-            .file(path)?
-            .is_some_and(|f| f.size == *size && f.mtime == *mtime && f.state != "pending" && f.state != "failed");
+        // A failed file is tried again when it changes, or by a newer rummage (it may read it now); not at every sweep.
+        let unchanged = store.file(path)?.is_some_and(|f| f.size == *size && f.mtime == *mtime && f.settled());
         if !unchanged {
             store.upsert_pending(path, *kind, *size, *mtime)?;
             summary.new_or_changed += 1;
@@ -132,15 +130,15 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
             }
         }
         if group.iter().map(|j| j.parts.len()).sum::<usize>() >= GROUP_PARTS {
-            for job in embed(store, &mut embedder, std::mem::take(&mut group))? {
+            for (path, _) in embed(store, &mut embedder, std::mem::take(&mut group))? {
                 done += 1;
-                progress(Progress::File { done, total, path: &job });
+                progress(Progress::File { done, total, path: &path });
             }
         }
     }
-    for job in embed(store, &mut embedder, group)? {
+    for (path, _) in embed(store, &mut embedder, group)? {
         done += 1;
-        progress(Progress::File { done, total, path: &job });
+        progress(Progress::File { done, total, path: &path });
     }
 
     // Later passes: the rest of each long file, a step at a time, shortest file first.
@@ -151,8 +149,8 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
             let read = match extract::read_parts(&path, kind, range.clone()) {
                 Ok(read) => read,
                 Err(error) => {
-                    // It may have changed or gone since; keep what's in and let the next sync sort it out.
-                    eprintln!("rummage: stopped reading {}: {error:#}", path.display());
+                    // The whole file goes, not just this step (if it changed, the next sync reads it again).
+                    store.finish(file_id, Some(&format!("{error:#}")))?;
                     break;
                 }
             };
@@ -167,7 +165,9 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
                 done: range.end.min(read.total),
                 total: read.total,
             };
-            embed(store, &mut embedder, vec![job])?;
+            if embed(store, &mut embedder, vec![job])?.iter().any(|(_, failed)| *failed) {
+                break; // it's out
+            }
             parts_done = range.end.min(read.total);
             progress(Progress::Later { path: &path, kind, done: parts_done, total: parts_total });
         }
@@ -218,8 +218,9 @@ fn file_name(path: &Path) -> String {
 }
 
 /// Embeds and stores the jobs' parts (text passages and pages, scanned pages, pictures), records each file's progress,
-/// and returns the paths of the files it took. A picture waits (stays pending) while the image encoder isn't there.
-fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<PathBuf>> {
+/// and returns the files it took, each with whether it failed. A picture waits (stays pending) while the image encoder isn't there. A
+/// file with a part that fails is failed whole: what's in from it (earlier steps too) goes.
+fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<(PathBuf, bool)>> {
     if jobs.is_empty() {
         return Ok(Vec::new());
     }
@@ -265,7 +266,10 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<P
                         vector,
                         modality: Modality::Image,
                     }),
-                    Err(error) => eprintln!("rummage: page {page} of {}: {error:#}", job.path.display()),
+                    Err(error) => {
+                        failed.push((j, format!("page {page}: {error:#}")));
+                        break;
+                    }
                 }
             }
         }
@@ -275,6 +279,11 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<P
     let mut next = vectors.iter();
     let mut paths = Vec::with_capacity(jobs.len());
     for (j, job) in jobs.into_iter().enumerate() {
+        if let Some((_, error)) = failed.iter().find(|f| f.0 == j) {
+            store.finish(job.file_id, Some(error))?;
+            paths.push((job.path, true));
+            continue;
+        }
         for part in &job.parts {
             let vector = next.next().expect("one vector per part");
             let excerpt = extract::excerpt(&part.text, 200);
@@ -305,11 +314,8 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<P
         if waiting.contains(&j) {
             continue;
         }
-        match failed.iter().find(|f| f.0 == j) {
-            Some((_, error)) => store.finish(job.file_id, Some(error))?,
-            None => store.progress(job.file_id, job.done, job.total)?,
-        }
-        paths.push(job.path);
+        store.progress(job.file_id, job.done, job.total)?;
+        paths.push((job.path, false));
     }
     tx.commit()?;
     Ok(paths)

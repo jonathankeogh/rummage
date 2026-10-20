@@ -190,8 +190,11 @@ pub const HEIC_HINT: &str = "install libheif (apt install libheif-examples, dnf 
 fn heic_to_png(path: &Path) -> Result<Vec<u8>> {
     let out = std::env::temp_dir().join(format!("rummage-heic-{}-{}.png", std::process::id(), rand_suffix()));
     let status = match heic_tool() {
-        Some("sips") => Command::new("sips").args(["-s", "format", "png"]).arg(path).arg("--out").arg(&out).output()?,
-        Some(_) => Command::new("heif-convert").arg(path).arg(&out).output()?,
+        Some("sips") => crate::tool::output(
+            Command::new("sips").args(["-s", "format", "png"]).arg(path).arg("--out").arg(&out),
+            crate::tool::limit(30),
+        )?,
+        Some(_) => crate::tool::output(Command::new("heif-convert").arg(path).arg(&out), crate::tool::limit(30))?,
         None => bail!("can't read HEIC: {HEIC_HINT}"),
     };
     if !status.status.success() {

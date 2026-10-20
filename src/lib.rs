@@ -13,5 +13,6 @@ pub mod picture;
 pub mod search;
 pub mod serve;
 pub mod store;
+pub mod tool;
 pub mod tui;
 pub mod watch;
