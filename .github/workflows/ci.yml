@@ -57,20 +57,21 @@ jobs:
       # The model (865 MB, public on Hugging Face), kept in GitHub's cache between runs so the tests that need it run
       # here too: downloaded once, restored after (dropped by GitHub after 7 days unused, then downloaded again). Plain
       # files in rummage's own model folder: Hugging Face's cache is links into a blob store, and a cache of it once
-      # kept the links without the files (1.5 KB), so the model tests skipped for days without anyone noticing.
+      # kept the links without the files (1.5 KB), so the model tests skipped for days without anyone noticing. One
+      # cache per machine: GitHub stores paths relative to the checkout, and the Fedora container's home is elsewhere,
+      # so a copy saved there unpacked out of sight on the others.
       - uses: astral-sh/setup-uv@v6
       - name: Model files
-        id: model
         uses: actions/cache@v4
         with:
           path: ~/.local/share/rummage/models
-          key: rummage-models-bfcd298762cc34d0357ece5ebdd31791a3a374d8
-      - name: Download the model
-        if: steps.model.outputs.cache-hit != 'true'
+          key: rummage-models-${{ matrix.name }}-bfcd298762cc34d0357ece5ebdd31791a3a374d8
+      - name: Download the model (unless it's there)
         run: |
           dir="$HOME/.local/share/rummage/models/bfcd298762cc34d0357ece5ebdd31791a3a374d8"
           mkdir -p "$dir"
           for file in embeddinggemma-2-Q8_0.gguf mmproj-embeddinggemma-2-Q8_0.gguf; do
+            [ -s "$dir/$file" ] && continue
             curl -fL --retry 3 -o "$dir/$file" \
               "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/bfcd298762cc34d0357ece5ebdd31791a3a374d8/$file"
           done

@@ -80,20 +80,25 @@ jobs:
           - name: ubuntu-arm64
             os: ubuntu-24.04-arm
             binary: linux-arm64
+            cache: ubuntu-arm64
           - name: fedora
             os: ubuntu-latest
             container: fedora:42
             binary: linux-x86_64
+            cache: fedora
           - name: debian
             os: ubuntu-latest
             container: debian:12
             binary: linux-x86_64
+            cache: fedora
           - name: macos
             os: macos-latest
             binary: macos-arm64
+            cache: macos
           - name: macos-14
             os: macos-14
             binary: macos-arm64
+            cache: macos
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
     steps:
@@ -116,17 +121,19 @@ jobs:
         run: |
           rummage --version
           if [ "$(uname)" = Darwin ]; then otool -L "$(command -v rummage)"; else ldd "$(command -v rummage)"; fi
+      # CI's cache from the machine of the same kind (its paths match only there).
       - name: Model files (GitHub's cache)
-        id: model
         if: matrix.model != 'instructions'
         uses: actions/cache/restore@v4
         with:
           path: ~/.local/share/rummage/models
-          key: rummage-models-bfcd298762cc34d0357ece5ebdd31791a3a374d8
-      # Also when the cache isn't there (CI hasn't made it yet, or GitHub dropped it).
+          key: rummage-models-${{ matrix.cache }}-bfcd298762cc34d0357ece5ebdd31791a3a374d8
+      # Whenever the files aren't there after that (no such cache, or GitHub dropped it).
       - name: Model files (as rummage says to get them)
-        if: matrix.model == 'instructions' || steps.model.outputs.cache-hit != 'true'
-        run: rummage status | grep -E '^ +(mkdir|curl) ' | sh -ex
+        run: |
+          if [ "${{ matrix.model }}" = instructions ] || rummage status | grep -q 'model files: missing'; then
+            rummage status | grep -E '^ +(mkdir|curl) ' | sh -ex
+          fi
       - name: Status
         run: rummage status
       - name: Index and search
