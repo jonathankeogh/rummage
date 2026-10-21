@@ -120,8 +120,9 @@ jobs:
         if: matrix.model != 'instructions'
         uses: actions/cache/restore@v4
         with:
-          path: ~/.cache/huggingface/hub/models--ggml-org--embeddinggemma-2-GGUF
-          key: embeddinggemma-2-bfcd298762cc34d0357ece5ebdd31791a3a374d8
+          path: ~/.local/share/rummage/models
+          key: rummage-models-bfcd298762cc34d0357ece5ebdd31791a3a374d8
+          fail-on-cache-miss: true
       - name: Model files (as rummage says to get them)
         if: matrix.model == 'instructions'
         run: rummage status | grep -E '^ +(mkdir|curl) ' | sh -ex

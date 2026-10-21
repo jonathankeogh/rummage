@@ -95,9 +95,14 @@ fn audio_vector_matches_digups() {
 
 /// Embeds with `make` and compares each vector with its reference.
 fn check(make: impl FnOnce(&mut Embedder) -> Vec<(String, Vec<f32>)>) {
-    let Ok(models) = ModelFiles::locate() else {
-        eprintln!("skipped: no model files");
-        return;
+    let models = match ModelFiles::locate() {
+        Ok(models) => models,
+        // On CI a missing model is a failure, not a skip (RUMMAGE_REQUIRE_MODEL=1).
+        Err(error) if std::env::var_os("RUMMAGE_REQUIRE_MODEL").is_some() => panic!("no model files: {error:#}"),
+        Err(_) => {
+            eprintln!("skipped: no model files");
+            return;
+        }
     };
     let reference: Reference =
         serde_json::from_str(include_str!("reference/vectors.json")).expect("tests/reference/vectors.json");

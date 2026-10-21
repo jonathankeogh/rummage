@@ -1,16 +1,19 @@
 //! The whole thing, through the `rummage` binary on a temporary folder: indexing, re-syncing, long files in two
 //! passes, the background service (start, grep, stop, recovery after a crash). Needs the model files; skipped
-//! without them, as on CI.
+//! without them, unless RUMMAGE_REQUIRE_MODEL=1 (as on CI, where a missing model is a failure).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn model_present() -> bool {
-    if rummage::paths::ModelFiles::locate().is_ok() {
-        return true;
+    match rummage::paths::ModelFiles::locate() {
+        Ok(_) => true,
+        Err(error) if std::env::var_os("RUMMAGE_REQUIRE_MODEL").is_some() => panic!("no model files: {error:#}"),
+        Err(_) => {
+            eprintln!("skipped: no model files");
+            false
+        }
     }
-    eprintln!("skipped: no model files");
-    false
 }
 
 /// A temporary folder of files and an index of its own; stops that index's service when dropped.
