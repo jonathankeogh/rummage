@@ -30,6 +30,9 @@ enum Command {
         /// Also read source code in code projects (find it with "code: …")
         #[arg(long)]
         code: bool,
+        /// Also read music: songs, music videos and album art in ~/Music and music libraries (left out otherwise)
+        #[arg(long)]
+        music: bool,
         /// Don't index this folder (repeatable)
         #[arg(long)]
         exclude: Vec<PathBuf>,
@@ -109,8 +112,8 @@ fn run() -> Result<()> {
     }
     let dir = cli.index.clone().unwrap_or_else(paths::index_dir);
     match cli.command {
-        Some(Command::Index { folders, code, exclude, reindex, background }) => {
-            index_command(&dir, folders, code, exclude, reindex, background)
+        Some(Command::Index { folders, code, music, exclude, reindex, background }) => {
+            index_command(&dir, folders, code, music, exclude, reindex, background)
         }
         Some(Command::Search { words, limit, kind, zgate, json, no_serve, no_grep }) => {
             search_command(&dir, words, limit, kind, zgate, json, no_serve, no_grep)
@@ -153,6 +156,7 @@ fn index_command(
     dir: &PathBuf,
     folders: Vec<PathBuf>,
     code: bool,
+    music: bool,
     exclude: Vec<PathBuf>,
     reindex: bool,
     background: bool,
@@ -170,16 +174,45 @@ fn index_command(
     if code {
         store.set_meta("code", "1")?;
     }
+    if music {
+        store.set_meta("music", "1")?;
+    }
+    if let Some(kind) = crawl::network_file_system(dir).filter(|_| !background) {
+        eprintln!(
+            "the index is on a network drive ({kind}), where SQLite can't lock its files reliably: it may fail or \
+             be damaged. Set RUMMAGE_INDEX to a folder on this computer"
+        );
+    }
     let roots = store.roots()?;
     if roots.is_empty() {
         bail!("no folders yet: rummage index <folder>...");
     }
     // Left out for good: later runs (and the service's) leave them out too.
     store.add_excluded(&exclude.iter().filter_map(|e| e.canonicalize().ok()).collect::<Vec<_>>())?;
-    let options =
-        crawl::Options { code: code || store.meta("code")?.as_deref() == Some("1"), excluded: store.excluded()? };
+    let options = crawl::Options {
+        code: code || store.meta("code")?.as_deref() == Some("1"),
+        excluded: store.excluded()?,
+        music: music || store.meta("music")?.as_deref() == Some("1"),
+    };
     let started = Instant::now();
-    let sync = index::sync(&store, &roots, &options, background)?;
+    // The first look through a big folder takes minutes (every file is hashed): say how far it's got.
+    let mut said = false;
+    let sync = index::sync(&store, &roots, &options, background, &mut |looking| {
+        if background {
+            return;
+        }
+        match looking {
+            index::Looking::Found(n) => eprint!("\r\x1b[Klooking through your files: {n} found"),
+            index::Looking::Checking { done, of } => {
+                eprint!("\r\x1b[Kchecking for new and changed files: {done} of {of}")
+            }
+        }
+        std::io::stderr().flush().ok();
+        said = true;
+    })?;
+    if said {
+        eprint!("\r\x1b[K");
+    }
     eprintln!(
         "{} files in {} folder{}: {} new or changed, {} gone ({})",
         sync.found,
@@ -207,6 +240,15 @@ fn index_command(
     }
     if sync.cloud_only > 0 {
         eprintln!("{}", cloud_only_note(sync.cloud_only));
+    }
+    if sync.music_skipped > 0 {
+        eprintln!(
+            "left out {} songs, music videos and album covers in music folders (rummage index --music reads them)",
+            sync.music_skipped
+        );
+    }
+    if sync.bad_names > 0 {
+        eprintln!("left out {} files whose names aren't readable text (another system's encoding)", sync.bad_names);
     }
     for (folder, why) in &sync.unreadable {
         eprintln!("can't read {} ({why}): what's indexed from it stays as it was", tilde(folder));
@@ -447,6 +489,11 @@ fn status(dir: &PathBuf) -> Result<()> {
 /// The index's folders, files by kind and state, size and service.
 fn index_status(dir: &PathBuf, store: &Store) -> Result<()> {
     println!("index: {}", tilde(&store.file));
+    if let Some(kind) = crawl::network_file_system(dir) {
+        println!(
+            "  on a network drive ({kind}): SQLite can't lock files there reliably; set RUMMAGE_INDEX to a local folder"
+        );
+    }
     let roots = store.roots()?;
     println!(
         "folders: {}",

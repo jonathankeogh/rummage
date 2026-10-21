@@ -68,6 +68,9 @@ pub struct Sync {
     pub photos_refused: Vec<PathBuf>,
     /// Folders it couldn't read, and why: their files were kept as they were.
     pub unreadable: Vec<(PathBuf, String)>,
+    /// Songs, music videos and album art left out of music folders, and files whose names aren't text.
+    pub music_skipped: usize,
+    pub bad_names: usize,
     /// Files changing often, left as they were read until they're still (see `is_busy`).
     pub busy: usize,
     /// New files whose content was already in (copies), and files moved or renamed: none read again.
@@ -77,10 +80,26 @@ pub struct Sync {
     pub hashed: usize,
 }
 
+/// How far a sync has got, for a progress line: it can take minutes on a big folder the first time (every file is
+/// hashed).
+pub enum Looking {
+    /// Files found so far.
+    Found(usize),
+    /// Files checked against the index (hashed when new or changed), of all found.
+    Checking { done: usize, of: usize },
+}
+
 /// Compares what's on disk under `roots` with the index: new and changed files become pending, gone ones go. In the
-/// service's runs (`background`), files that keep changing wait until they're still; yours read every change.
-pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options, background: bool) -> Result<Sync> {
-    let walk = crawl::walk(roots, options);
+/// service's runs (`background`), files that keep changing wait until they're still; yours read every change. What's
+/// done is saved every couple of seconds, so a sync stopped halfway doesn't hash everything again.
+pub fn sync(
+    store: &Store,
+    roots: &[PathBuf],
+    options: &crawl::Options,
+    background: bool,
+    looking: &mut dyn FnMut(Looking),
+) -> Result<Sync> {
+    let walk = crawl::walk(roots, options, &mut |n| looking(Looking::Found(n)));
     let found = walk.found;
     let mut summary = Sync {
         found: found.len(),
@@ -90,12 +109,15 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options, backgrou
         small_pictures: walk.small_pictures,
         dataset_files: walk.dataset_files,
         cloud_only: walk.placeholders,
+        music_skipped: walk.music_skipped,
+        bad_names: walk.bad_names,
         remote_folders: walk.remote_folders,
         photos_refused: walk.refused.clone(),
         unreadable: walk.unreadable.clone(),
         ..Default::default()
     };
-    let tx = store.db.unchecked_transaction()?;
+    store.db.execute_batch("BEGIN")?;
+    let mut saved = std::time::Instant::now();
     // A file that went to the cloud after it was read (evicted) keeps what's in; one that's new or changed there waits
     // until it's downloaded.
     let mut kept: Vec<&Path> = Vec::new();
@@ -118,7 +140,16 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options, backgrou
         .chain(&walk.refused)
         .collect();
     let gone = |path: &Path| !on_disk.contains(path) && !missing.iter().any(|root| path.starts_with(root));
-    for Found { path, kind, size, mtime } in &found {
+    let mut last_said = std::time::Instant::now();
+    for (done, Found { path, kind, size, mtime }) in found.iter().enumerate() {
+        if last_said.elapsed().as_millis() >= 100 {
+            looking(Looking::Checking { done, of: found.len() });
+            last_said = std::time::Instant::now();
+        }
+        if saved.elapsed().as_secs() >= 2 {
+            store.db.execute_batch("COMMIT; BEGIN")?;
+            saved = std::time::Instant::now();
+        }
         let known = store.file(path)?;
         // A failed file is tried again when it changes, or by a newer rummage (it may read it now); not at every sweep.
         if let Some(f) = known.as_ref().filter(|f| f.size == *size && f.mtime == *mtime && f.settled()) {
@@ -191,7 +222,7 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options, backgrou
         }
     }
     store.set_meta("cloud_only", &summary.cloud_only.to_string())?;
-    tx.commit()?;
+    store.db.execute_batch("COMMIT")?;
     Ok(summary)
 }
 
@@ -615,13 +646,13 @@ mod tests {
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("boiler.md"), "The boiler service is booked for March.").unwrap();
         let store = Store::open(&dir.join("index")).unwrap();
-        let options = crawl::Options { code: false, excluded: Vec::new() };
+        let options = crawl::Options { code: false, excluded: Vec::new(), music: false };
         let roots = [dir.join("home")];
-        assert_eq!(sync(&store, &roots, &options, false).unwrap().new_or_changed, 1);
+        assert_eq!(sync(&store, &roots, &options, false, &mut |_| {}).unwrap().new_or_changed, 1);
         // Locked (as macOS may lock Documents for a background service): kept, not taken for deleted. (Run as root,
         // as in a container, the lock does nothing and the file is simply still there.)
         std::fs::set_permissions(&docs, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let locked = sync(&store, &roots, &options, true);
+        let locked = sync(&store, &roots, &options, true, &mut |_| {});
         std::fs::set_permissions(&docs, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(locked.unwrap().removed, 0);
         assert_eq!(store.files_under(&docs).unwrap().len(), 1);
@@ -658,8 +689,8 @@ mod tests {
             store.add_segment(id, 1.0, "allotment.md", text, text, Some(&[0.1; 768]), Modality::Text).unwrap();
             store.progress(id, 1, 1).unwrap();
         }
-        let options = crawl::Options { code: false, excluded: Vec::new() };
-        let summary = sync(&store, &[a.clone(), b.clone()], &options, false).unwrap();
+        let options = crawl::Options { code: false, excluded: Vec::new(), music: false };
+        let summary = sync(&store, &[a.clone(), b.clone()], &options, false, &mut |_| {}).unwrap();
         assert_eq!((summary.hashed, summary.new_or_changed), (2, 0));
         let holders: i64 = store
             .db
@@ -669,7 +700,7 @@ mod tests {
             store.db.query_row("SELECT COUNT(*) FROM files WHERE state = 'copy'", [], |r| r.get(0)).unwrap();
         assert_eq!((holders, copies), (1, 1));
         // Hashed once: the next sweep has nothing to do.
-        assert_eq!(sync(&store, &[a, b], &options, false).unwrap().hashed, 0);
+        assert_eq!(sync(&store, &[a, b], &options, false, &mut |_| {}).unwrap().hashed, 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -683,14 +714,14 @@ mod tests {
             std::fs::write(folder.join("note.md"), text).unwrap();
         }
         let store = Store::open(&dir.join("index")).unwrap();
-        let options = crawl::Options { code: false, excluded: Vec::new() };
-        assert_eq!(sync(&store, &[a.clone(), b.clone()], &options, false).unwrap().new_or_changed, 2);
+        let options = crawl::Options { code: false, excluded: Vec::new(), music: false };
+        assert_eq!(sync(&store, &[a.clone(), b.clone()], &options, false, &mut |_| {}).unwrap().new_or_changed, 2);
         // b is no longer indexed: its file goes.
-        assert_eq!(sync(&store, std::slice::from_ref(&a), &options, false).unwrap().removed, 1);
+        assert_eq!(sync(&store, std::slice::from_ref(&a), &options, false, &mut |_| {}).unwrap().removed, 1);
         // a is missing altogether, as an unplugged drive would be: its file stays.
         let moved = dir.join("a-away");
         std::fs::rename(&a, &moved).unwrap();
-        assert_eq!(sync(&store, std::slice::from_ref(&a), &options, false).unwrap().removed, 0);
+        assert_eq!(sync(&store, std::slice::from_ref(&a), &options, false, &mut |_| {}).unwrap().removed, 0);
         assert_eq!(store.files_under(&a).unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }

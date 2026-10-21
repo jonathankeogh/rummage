@@ -43,6 +43,7 @@ rummage index ~/Documents ~/notes        # add folders and index them (afterward
 rummage search "the clause about pets in the lease"
 rummage search INV20931                  # exact words count too
 rummage search "/INV\d{5}/"              # a regex: grep runs over text and code files beside meaning search
+rummage index --music ~                  # also read songs and music videos (music folders are left out otherwise)
 rummage index --code ~/code              # also read code in code projects...
 rummage search "code: retry a failed call with backoff"   # ...and search it with "code:"
 rummage status                           # the index, and which optional tools are installed
@@ -75,6 +76,10 @@ once everything else is in, so a 500-page PDF or a film can't hold up the first 
 has got: "Film.mp4 30 of 118 minutes"). Scanned PDFs (no text) wait for OCR. A video under 5 seconds (a Live Photo's
 clip) is read as one picture, its middle frame. Text that's mostly numbers (a data dump, a CSV saved as .txt) gets 3
 passages embedded and the rest left to its words and grep.
+
+Music folders (`~/Music`, Apple Music and iTunes libraries) are left out unless you ask for them with `--music`: a
+library of songs is days of sound to read, and rarely what you're looking for. Files whose names aren't readable text
+(another system's encoding, as old zips leave them) are left out and counted.
 
 In an Apple Photos library only the originals are read (macOS asks for Full Disk Access first; `rummage index` says
 so), not its thumbnails and edited copies, and Lightroom's previews are skipped.
@@ -111,6 +116,10 @@ Text is cut into ~1,800-character passages, each embedded by EmbeddingGemma 2 th
 `vendor/llama.cpp`, built by `crates/llama-sys`). One SQLite file holds a vector per passage plus an FTS5 keyword
 index. A search scores every vector, keeps passages that stand out for that query, and boosts files that contain the
 query's words.
+
+The search service keeps every vector in memory, about 1.5 GB per million passages (a few thousand long PDFs), plus
+about 300 MB for the model, and 550 MB more while it reads pictures, sound or video. Keep the index on a disk in the
+computer: SQLite can't lock its files reliably on a network drive (NFS, SMB), and rummage warns when it's on one.
 
 ## Tests
 

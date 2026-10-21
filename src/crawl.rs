@@ -23,6 +23,9 @@ pub struct Options {
     /// Also index source code inside code projects (searched with "code: …").
     pub code: bool,
     pub excluded: Vec<PathBuf>,
+    /// Also songs, music videos and album art in music folders (left out unless asked for: a music library is days
+    /// of sound to embed, rarely what's searched for).
+    pub music: bool,
 }
 
 /// Documents read as text: plain text, plus docx, odt and html converted (see `extract::document_text`).
@@ -107,9 +110,12 @@ const MAX_DOC_BYTES: u64 = 20 << 20;
 const MAX_PDF_BYTES: u64 = 500 << 20;
 const MAX_CODE_BYTES: u64 = 1 << 20;
 
-/// Every file to index under `roots`, sorted by path.
-pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
-    let mut found = Vec::new();
+/// Every file to index under `roots`, sorted by path. `looking` hears how many have been found so far, now and then.
+pub fn walk(roots: &[PathBuf], options: &Options, looking: &mut dyn FnMut(usize)) -> Walk {
+    let mut found: Vec<Found> = Vec::new();
+    let mut music_skipped = 0;
+    let mut bad_names = 0;
+    let music_folders = music_folders();
     let mut pdfs_without_tools = 0;
     let mut heic_without_tool = 0;
     let mut media_without_ffmpeg = 0;
@@ -122,6 +128,8 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
     for root in roots {
         let remote = remote_mounts_below(root, &remote_mounts());
         remote_folders.extend(remote.iter().cloned());
+        // A folder chosen inside a music folder is read whole: it was asked for.
+        let skip_music = !options.music && !music_folders.iter().any(|m| root.starts_with(m));
         let walk = walker(root, &options.excluded, &remote, Some(placeholders.clone()));
         for entry in walk {
             let entry = match entry {
@@ -146,6 +154,11 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
                 continue;
             }
             let path = entry.path();
+            // A name that isn't text (bytes from another system's encoding) can't be kept in the index as itself.
+            if path.to_str().is_none() {
+                bad_names += 1;
+                continue;
+            }
             // In the cloud only: reading anything of it (even a picture's size) would download it.
             let Ok(meta) = entry.metadata() else { continue };
             if in_cloud_only(&meta) {
@@ -160,6 +173,10 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
                 continue;
             }
             let Some(kind) = classify(path, options) else { continue };
+            if skip_music && (kind.is_timed() || kind.is_picture()) && in_music_library(path, &music_folders) {
+                music_skipped += 1;
+                continue;
+            }
             if kind == Kind::Pdf && !crate::extract::pdf_tools() {
                 pdfs_without_tools += 1;
                 continue;
@@ -190,6 +207,9 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
                 continue;
             }
             found.push(Found { path: path.to_path_buf(), kind, size: meta.len(), mtime: mtime(&meta) });
+            if found.len().is_multiple_of(500) {
+                looking(found.len());
+            }
         }
     }
     found.sort_by(|a, b| a.path.cmp(&b.path));
@@ -209,7 +229,32 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
         remote_folders,
         refused,
         unreadable,
+        music_skipped,
+        bad_names,
     }
+}
+
+/// The music folders: ~/Music, and on Linux the one ~/.config/user-dirs.dirs names (XDG_MUSIC_DIR="$HOME/Musik").
+fn music_folders() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Vec::new() };
+    let mut folders = vec![home.join("Music")];
+    let dirs = std::fs::read_to_string(home.join(".config/user-dirs.dirs")).unwrap_or_default();
+    for line in dirs.lines() {
+        if let Some(value) = line.strip_prefix("XDG_MUSIC_DIR=") {
+            let value = value.trim_matches('"').replace("$HOME", &home.to_string_lossy());
+            folders.push(PathBuf::from(value));
+        }
+    }
+    folders
+}
+
+/// In a music folder, or in an Apple Music or iTunes library wherever it is.
+fn in_music_library(path: &Path, music_folders: &[PathBuf]) -> bool {
+    music_folders.iter().any(|m| path.starts_with(m))
+        || path.ancestors().any(|a| {
+            let name = a.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+            name == "iTunes Media" || name == "Media.localized" || name.ends_with(".musiclibrary")
+        })
 }
 
 /// The Apple Photos library a path is in, if any ("~/Pictures/Photos Library.photoslibrary").
@@ -285,23 +330,68 @@ const REMOTE_FILE_SYSTEMS: &[&str] = &[
     "fuse.gvfsd-fuse",
     "fuse.davfs2",
     "fuse.dropbox",
+    // macOS's
+    "smbfs",
+    "afpfs",
+    "webdav",
 ];
 
-/// Where network and cloud file systems are mounted (Linux; none elsewhere).
+/// Where network and cloud file systems are mounted.
 fn remote_mounts() -> Vec<PathBuf> {
-    std::fs::read_to_string("/proc/self/mountinfo").map(|text| remote_mounts_in(&text)).unwrap_or_default()
+    mounts().into_iter().filter(|(_, kind)| REMOTE_FILE_SYSTEMS.contains(&kind.as_str())).map(|(p, _)| p).collect()
 }
 
-/// The remote mount points in a /proc/self/mountinfo: "id parent dev root mountpoint options … - type source …".
-fn remote_mounts_in(mountinfo: &str) -> Vec<PathBuf> {
+/// The network file system `path` is on ("nfs", "smbfs" …), if it's on one.
+pub fn network_file_system(path: &Path) -> Option<String> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let (_, kind) =
+        mounts().into_iter().filter(|(point, _)| path.starts_with(point)).max_by_key(|(p, _)| p.as_os_str().len())?;
+    REMOTE_FILE_SYSTEMS.contains(&kind.as_str()).then_some(kind)
+}
+
+/// Every mount: where, and its file system's type. Linux says in /proc/self/mountinfo; macOS and the BSDs in `mount`'s
+/// output.
+fn mounts() -> Vec<(PathBuf, String)> {
+    if let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") {
+        return mounts_in_mountinfo(&text);
+    }
+    let output = std::process::Command::new("mount").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    mounts_in_mount_output(&output.unwrap_or_default())
+}
+
+/// The mounts in a /proc/self/mountinfo: "id parent dev root mountpoint options … - type source …".
+fn mounts_in_mountinfo(mountinfo: &str) -> Vec<(PathBuf, String)> {
     mountinfo
         .lines()
         .filter_map(|line| {
             let (before, after) = line.split_once(" - ")?;
             let point = before.split(' ').nth(4)?;
             let kind = after.split(' ').next()?;
-            REMOTE_FILE_SYSTEMS.contains(&kind).then(|| PathBuf::from(unescape_mount(point)))
+            Some((PathBuf::from(unescape_mount(point)), kind.to_string()))
         })
+        .collect()
+}
+
+/// The mounts in `mount`'s output: "//sam@nas/share on /Volumes/share (smbfs, nodev, nosuid, mounted by sam)".
+fn mounts_in_mount_output(output: &str) -> Vec<(PathBuf, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (before, options) = line.rsplit_once(" (")?;
+            let (_, point) = before.split_once(" on ")?;
+            let kind = options.split([',', ')']).next()?.trim();
+            Some((PathBuf::from(point), kind.to_string()))
+        })
+        .collect()
+}
+
+/// The remote mount points in a /proc/self/mountinfo.
+#[cfg(test)]
+fn remote_mounts_in(mountinfo: &str) -> Vec<PathBuf> {
+    mounts_in_mountinfo(mountinfo)
+        .into_iter()
+        .filter(|(_, kind)| REMOTE_FILE_SYSTEMS.contains(&kind.as_str()))
+        .map(|(p, _)| p)
         .collect()
 }
 
@@ -403,6 +493,9 @@ pub fn grep_files(roots: &[PathBuf], code: bool) -> Vec<(PathBuf, Kind, i64)> {
             let path = entry.path();
             let Some(kind) = grep_kind(path, code) else { continue };
             let Ok(meta) = entry.metadata() else { continue };
+            if path.to_str().is_none() {
+                continue;
+            }
             // Never downloads a file to search it.
             if meta.len() > 0 && !in_cloud_only(&meta) {
                 files.push((path.to_path_buf(), kind, mtime(&meta)));
@@ -522,6 +615,10 @@ pub struct Walk {
     pub refused: Vec<PathBuf>,
     /// Other places it couldn't read, and why: what's indexed under them stays.
     pub unreadable: Vec<(PathBuf, String)>,
+    /// Songs, music videos and album art left out of music folders (`Options::music` reads them).
+    pub music_skipped: usize,
+    /// Files whose names aren't text (another system's encoding), left out.
+    pub bad_names: usize,
 }
 
 /// What kind of file this is for rummage, or None to leave it alone.
@@ -708,6 +805,52 @@ mod tests {
     }
 
     #[test]
+    fn macos_mounts_are_read_from_mount() {
+        let output = "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)
+//sam@nas._smb._tcp.local/Photos on /Volumes/Photos (smbfs, nodev, nosuid, mounted by sam)
+nas:/export/home on /Users/sam/Shared Home (nfs, asynchronous)
+";
+        let mounts = mounts_in_mount_output(output);
+        assert_eq!(mounts[1], (PathBuf::from("/Volumes/Photos"), "smbfs".to_string()));
+        assert_eq!(mounts[2], (PathBuf::from("/Users/sam/Shared Home"), "nfs".to_string()));
+        assert!(mounts.iter().filter(|(_, k)| REMOTE_FILE_SYSTEMS.contains(&k.as_str())).count() == 2);
+    }
+
+    #[test]
+    fn music_libraries_are_left_out_unless_asked_for() {
+        let dir = std::env::temp_dir().join(format!("rummage-music-{}", std::process::id()));
+        let album = dir.join("Music Library/Media.localized/Nina Simone/Pastel Blues");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("01 Be My Husband.mp3"), "ID3 not really a song").unwrap();
+        std::fs::write(dir.join("voice memo.m4a"), "not really a recording").unwrap();
+        let skipped = walk(std::slice::from_ref(&dir), &Options::default(), &mut |_| {});
+        assert_eq!(skipped.music_skipped, 1);
+        let asked = walk(std::slice::from_ref(&dir), &Options { music: true, ..Options::default() }, &mut |_| {});
+        assert_eq!(asked.music_skipped, 0);
+        assert!(in_music_library(Path::new("/home/sam/Musik/a.flac"), &[PathBuf::from("/home/sam/Musik")]));
+        assert!(!in_music_library(Path::new("/home/sam/Podcasts/a.mp3"), &[PathBuf::from("/home/sam/Musik")]));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn names_that_arent_text_are_left_out() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("rummage-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // "café.md" in Latin-1, as an old Windows zip leaves it. macOS won't create such a name; Linux will.
+        let latin1 = dir.join(std::ffi::OsStr::from_bytes(b"caf\xe9.md"));
+        if std::fs::write(&latin1, "Notes from the café.").is_err() {
+            eprintln!("skipped: this file system only takes UTF-8 names");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        std::fs::write(dir.join("menu.md"), "The menu.").unwrap();
+        let walk = walk(std::slice::from_ref(&dir), &Options::default(), &mut |_| {});
+        assert_eq!((walk.found.len(), walk.bad_names), (1, 1));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn hidden_files_are_skipped_and_icloud_placeholders_counted() {
         let dir = std::env::temp_dir().join(format!("rummage-crawl-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".hidden")).unwrap();
@@ -715,7 +858,7 @@ mod tests {
         std::fs::write(dir.join(".secret-note.md"), "Hidden.").unwrap();
         std::fs::write(dir.join(".hidden/inside.md"), "Hidden too.").unwrap();
         std::fs::write(dir.join(".Report.pdf.icloud"), "placeholder").unwrap();
-        let walk = walk(std::slice::from_ref(&dir), &Options::default());
+        let walk = walk(std::slice::from_ref(&dir), &Options::default(), &mut |_| {});
         let names: Vec<_> = walk.found.iter().map(|f| f.path.file_name().unwrap().to_owned()).collect();
         assert_eq!(names, vec!["note.md"]);
         assert_eq!(walk.placeholders, 1);
