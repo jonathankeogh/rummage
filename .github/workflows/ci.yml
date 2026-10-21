@@ -38,7 +38,7 @@ jobs:
         # Each try again a few times: package mirrors come and go.
         run: |
           retry() { for i in 1 2 3; do "$@" && return; sleep 10; done; return 1; }
-          retry dnf install -y --allowerasing git tar gzip zstd cmake gcc-c++ clang clang-devel poppler-utils tesseract
+          retry dnf install -y --allowerasing git tar gzip zstd cmake gcc-c++ clang clang-devel poppler-utils tesseract tmux
           retry dnf install -y https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-42.noarch.rpm
           retry dnf install -y --allowerasing ffmpeg
           git config --global --add safe.directory '*'
@@ -79,26 +79,24 @@ jobs:
         env:
           RUMMAGE_REQUIRE_MODEL: "1"
         run: cargo test --release -- --nocapture
-      # The files that once made indexing slow, stuck or wrong, each checked against the release build. Two machines
-      # are enough (the code paths are the same elsewhere); quick mode keeps the long recordings short on a CPU.
+      # The files that once made indexing slow, stuck or wrong, each checked against the release build; quick mode
+      # keeps the long recordings short on a CPU.
       - name: Edge cases
-        if: matrix.name == 'macos' || matrix.name == 'ubuntu'
         env:
           EDGE_QUICK: "1"
         run: uv run scripts/edge_cases.py
-      # The service installed as a login item, as people run it: launchd here on macOS, a systemd user service on
-      # Ubuntu (whose user manager needs lingering on a machine nobody logs in to).
+      # The service installed as a login item, as people run it: launchd on macOS, a systemd user service on Ubuntu
+      # (whose user manager needs lingering on a machine nobody logs in to). Fedora runs in a container, without
+      # systemd: there the service runs as `rummage watch` in the foreground (watching and keeping up are the same).
       - name: Background service (systemd user manager)
-        if: matrix.name == 'ubuntu'
+        if: startsWith(matrix.name, 'ubuntu')
         run: |
           sudo loginctl enable-linger "$USER"
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
           for i in $(seq 1 30); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 1; done
       - name: Background service
-        if: matrix.name == 'macos' || matrix.name == 'ubuntu'
-        run: uv run scripts/service_check.py
+        run: uv run scripts/service_check.py ${{ matrix.container && '--foreground' || '' }}
       # The interface in a terminal and inside tmux: draws at once, finds as you type, opens on ⏎ (and says so when
-      # it can't: Ubuntu here has no xdg-open), gives the terminal back on esc.
+      # it can't: the Linux machines here have no xdg-open), gives the terminal back on esc; and the first run's setup.
       - name: Interface
-        if: matrix.name == 'macos' || matrix.name == 'ubuntu'
         run: uv run scripts/interface_check.py

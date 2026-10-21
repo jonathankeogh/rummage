@@ -24,6 +24,8 @@ import time
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 QUICK = os.environ.get("EDGE_QUICK") == "1"
+# Root reads folders whatever their permissions (as in a container on CI): the checks that lock one can't run.
+ROOT = os.geteuid() == 0
 RUMMAGE = REPO / "target/release/rummage"
 EDGE = pathlib.Path("~/.cache/rummage-eval/edge").expanduser()
 CASES = {}
@@ -197,6 +199,9 @@ def unreadable():
         said, _ = index(folder)
     finally:
         docs.chmod(0o755)
+    if ROOT:
+        print("  skipped: run as root, which reads a locked folder anyway")
+        return
     check(" 0 gone" in said and "can't read" in said, f"locked: kept and said: {said.splitlines()[:2]}")
     said, _ = index(folder)
     check(changed(said) == 0, f"unlocked: nothing read again ({changed(said)} new or changed)")
@@ -302,7 +307,10 @@ def photos():
     check(len(in_library) == 3 and all("/originals/" in p for p in in_library), f"only the originals: {in_library}")
     check(not any(".lrdata" in p for p in paths), "Lightroom previews skipped")
     check(any(p.endswith("beach.jpg") for p in paths), "an ordinary photo next to them is read")
-    check("Full Disk Access" in said and "Old Library.photoslibrary" in said, "a locked library gives the message")
+    if ROOT:
+        print("  skipped (a locked library): run as root, which reads it anyway")
+    else:
+        check("Full Disk Access" in said and "Old Library.photoslibrary" in said, "a locked library gives the message")
     shown = subprocess.run(
         [str(RUMMAGE), "--index", str(folder / "index"), "search", "--no-serve", "--zgate=-9", "picture"],
         capture_output=True, text=True,
