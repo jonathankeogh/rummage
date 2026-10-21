@@ -117,14 +117,15 @@ jobs:
           rummage --version
           if [ "$(uname)" = Darwin ]; then otool -L "$(command -v rummage)"; else ldd "$(command -v rummage)"; fi
       - name: Model files (GitHub's cache)
+        id: model
         if: matrix.model != 'instructions'
         uses: actions/cache/restore@v4
         with:
           path: ~/.local/share/rummage/models
           key: rummage-models-bfcd298762cc34d0357ece5ebdd31791a3a374d8
-          fail-on-cache-miss: true
+      # Also when the cache isn't there (CI hasn't made it yet, or GitHub dropped it).
       - name: Model files (as rummage says to get them)
-        if: matrix.model == 'instructions'
+        if: matrix.model == 'instructions' || steps.model.outputs.cache-hit != 'true'
         run: rummage status | grep -E '^ +(mkdir|curl) ' | sh -ex
       - name: Status
         run: rummage status
