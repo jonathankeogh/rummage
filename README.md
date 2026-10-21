@@ -46,6 +46,7 @@ rummage search "/INV\d{5}/"              # a regex: grep runs over text and code
 rummage index --music ~                  # also read songs and music videos (music folders are left out otherwise)
 rummage index --code ~/code              # also read code in code projects...
 rummage search "code: retry a failed call with backoff"   # ...and search it with "code:"
+rummage index --remove ~/old-backup      # stop indexing a folder (its files leave the index)
 rummage status                           # the index, and which optional tools are installed
 ```
 
@@ -59,6 +60,9 @@ shows "indexing · N files to go" while it works. `rummage watch` keeps it runni
 
 Recordings and videos show their sound as a waveform, the matched stretch marked; ^s plays it from there through mpv
 (or ffmpeg's ffplay), and ⏎ opens it in mpv or VLC at the moment.
+
+To remove rummage entirely: `rummage watch --uninstall` (if you installed the login item), `rummage stop`, then delete
+the binary and `~/.local/share/rummage` (or `$XDG_DATA_HOME/rummage`), which holds the index and the model files.
 
 `--json` on search prints results for scripts. The index lives in `$XDG_DATA_HOME/rummage` (or
 `~/.local/share/rummage`); set `RUMMAGE_INDEX` or `--index` to use another. `RUMMAGE_MODELS` points at a folder with

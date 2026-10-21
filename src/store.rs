@@ -152,6 +152,14 @@ impl FileRow {
 impl Store {
     pub fn open(dir: &Path) -> Result<Store> {
         std::fs::create_dir_all(dir).with_context(|| format!("can't create {}", dir.display()))?;
+        // The index holds the text of private files: only its owner may look inside (other accounts on the computer
+        // could read it otherwise). Folders made by an older rummage are closed too.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
         let file = dir.join("index.sqlite");
         let db = Connection::open(&file)?;
         db.execute_batch(
@@ -274,6 +282,11 @@ impl Store {
         let mut statement = self.db.prepare("SELECT path FROM roots ORDER BY path")?;
         let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok()).map(PathBuf::from).collect())
+    }
+
+    /// Stops indexing `path` (its files go at the next sync). False if it wasn't an indexed folder.
+    pub fn remove_root(&self, path: &Path) -> Result<bool> {
+        Ok(self.db.execute("DELETE FROM roots WHERE path = ?", [path.to_string_lossy()])? > 0)
     }
 
     pub fn add_root(&self, path: &Path) -> Result<()> {
@@ -618,6 +631,16 @@ impl Store {
     }
 }
 
+/// Whether an error comes down to a full disk (SQLite's, or a write's).
+pub fn is_disk_full(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(|e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::StorageFull)
+    })
+}
+
 /// An index made by another model or pipeline: its vectors and words can't be used, only rebuilt.
 #[derive(Debug)]
 pub struct StaleIndex {
@@ -652,6 +675,25 @@ pub fn open_for_reindex(dir: &Path) -> Result<Store> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_disk_is_told_apart() {
+        let full = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL), None);
+        assert!(is_disk_full(&anyhow::Error::from(full).context("storing a passage")));
+        assert!(is_disk_full(&std::io::Error::from(std::io::ErrorKind::StorageFull).into()));
+        assert!(!is_disk_full(&anyhow::anyhow!("something else")));
+    }
+
+    #[test]
+    fn only_its_owner_can_look_inside_the_index() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rummage-private-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Store::open(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn says_which_long_file_later_passes_are_reading() {

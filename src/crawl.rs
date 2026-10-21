@@ -257,6 +257,33 @@ fn in_music_library(path: &Path, music_folders: &[PathBuf]) -> bool {
         })
 }
 
+/// The system's own folders (and the root of everything): never indexed, as they're not someone's files.
+pub fn is_system_folder(path: &Path) -> bool {
+    const SYSTEM: &[&str] = &[
+        "/System",
+        "/Library",
+        "/Applications",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/etc",
+        "/private/etc",
+        "/opt",
+        "/boot",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/run",
+        "/lib",
+        "/lib32",
+        "/lib64",
+        "/snap",
+        "/nix",
+        "/cores",
+    ];
+    path == Path::new("/") || SYSTEM.iter().any(|s| path.starts_with(s))
+}
+
 /// The Apple Photos library a path is in, if any ("~/Pictures/Photos Library.photoslibrary").
 pub fn photos_library(path: &Path) -> Option<&Path> {
     path.ancestors().find(|a| a.extension().is_some_and(|e| e == "photoslibrary"))
@@ -802,6 +829,16 @@ mod tests {
         let roots = [PathBuf::from("/home")];
         assert_eq!(dataset_folders(&found("/home/training/frames"), &roots).len(), 1);
         assert!(dataset_folders(&found("/home/Pictures/Photos Library.photoslibrary/originals/4"), &roots).is_empty());
+    }
+
+    #[test]
+    fn system_folders_are_not_indexed() {
+        for system in ["/", "/usr", "/usr/share/doc", "/System/Library", "/Applications/Safari.app", "/etc"] {
+            assert!(is_system_folder(Path::new(system)), "{system}");
+        }
+        for mine in ["/Users/sam", "/home/sam/notes", "/Volumes/Photos", "/mnt/nas", "/private/var/folders/x", "/srv"] {
+            assert!(!is_system_folder(Path::new(mine)), "{mine}");
+        }
     }
 
     #[test]

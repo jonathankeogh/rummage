@@ -203,6 +203,37 @@ def unreadable():
 
 
 @case
+def folders():
+    """A folder can be taken back out (its files leave the index), the system's folders can't be added, and only its
+    owner can look inside the index."""
+    folder = fresh("folders")
+    for name in ["notes", "backup"]:
+        (folder / name / "inner").mkdir(parents=True)
+        (folder / name / "inner/list.md").write_text(f"The {name} list: rope, tent pegs and a torch for the {name}.")
+    index_dir = str(folder / "index")
+
+    def run(*args):
+        return subprocess.run([str(RUMMAGE), "--index", index_dir, "index", *args], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL)  # fmt: skip
+
+    run(str(folder / "notes"), str(folder / "backup"))
+    out = run("--remove", str(folder / "backup"))
+    with db(folder) as c:
+        left = [r[0] for r in c.execute("SELECT path FROM files")]
+        roots = [r[0] for r in c.execute("SELECT path FROM roots")]
+    check(out.returncode == 0 and all("/notes/" in p for p in left) and len(roots) == 1,
+          f"removed: its files left the index ({len(left)} left)")  # fmt: skip
+    out = run("--remove", str(folder / "notes/inner"))
+    check(out.returncode != 0 and "--exclude" in out.stderr, f"a folder inside one: {out.stderr.strip()}")
+    out = run("/")
+    check(out.returncode != 0 and "system" in out.stderr, f"the root of everything: {out.stderr.strip()}")
+    out = run("/usr")
+    check(out.returncode != 0, "a system folder")
+    mode = (folder / "index").stat().st_mode & 0o777
+    check(mode == 0o700, f"the index folder is its owner's alone ({oct(mode)})")
+
+
+@case
 def retries():
     """Fix 4: a failed file is tried again when it changes, or by a newer rummage, not at every sweep."""
     folder = fresh("retries")

@@ -33,6 +33,9 @@ enum Command {
         /// Also read music: songs, music videos and album art in ~/Music and music libraries (left out otherwise)
         #[arg(long)]
         music: bool,
+        /// Stop indexing these folders: their files leave the index
+        #[arg(long)]
+        remove: bool,
         /// Don't index this folder (repeatable)
         #[arg(long)]
         exclude: Vec<PathBuf>,
@@ -100,7 +103,13 @@ fn quiet_when_piped_output_closes() {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("rummage: {error:#}");
+        if store::is_disk_full(&error) {
+            eprintln!(
+                "rummage: the disk is full ({error:#}). Free some space and run it again: nothing indexed so far is lost"
+            );
+        } else {
+            eprintln!("rummage: {error:#}");
+        }
         std::process::exit(1);
     }
 }
@@ -112,8 +121,8 @@ fn run() -> Result<()> {
     }
     let dir = cli.index.clone().unwrap_or_else(paths::index_dir);
     match cli.command {
-        Some(Command::Index { folders, code, music, exclude, reindex, background }) => {
-            index_command(&dir, folders, code, music, exclude, reindex, background)
+        Some(Command::Index { folders, code, music, remove, exclude, reindex, background }) => {
+            index_command(&dir, folders, code, music, remove, exclude, reindex, background)
         }
         Some(Command::Search { words, limit, kind, zgate, json, no_serve, no_grep }) => {
             search_command(&dir, words, limit, kind, zgate, json, no_serve, no_grep)
@@ -157,6 +166,7 @@ fn index_command(
     folders: Vec<PathBuf>,
     code: bool,
     music: bool,
+    remove: bool,
     exclude: Vec<PathBuf>,
     reindex: bool,
     background: bool,
@@ -165,9 +175,38 @@ fn index_command(
     let _lock = rummage::watch::lock_index(dir, background)?;
     let store = if reindex { store::open_for_reindex(dir)? } else { Store::open(dir)? };
     for folder in &folders {
+        if remove {
+            // It may be gone already (a deleted folder, an unplugged drive): matched as written too.
+            let given = std::path::absolute(folder)?;
+            let folder = folder.canonicalize().unwrap_or(given);
+            let roots = store.roots()?;
+            if !store.remove_root(&folder)? {
+                match roots.iter().find(|root| folder.starts_with(root)) {
+                    Some(root) => bail!(
+                        "{} is inside {}, which is indexed: to leave it out, rummage index --exclude {}",
+                        tilde(&folder),
+                        tilde(root),
+                        tilde(&folder)
+                    ),
+                    None => bail!(
+                        "{} isn't an indexed folder (those are: {})",
+                        tilde(&folder),
+                        roots.iter().map(|r| tilde(r)).collect::<Vec<_>>().join(", ")
+                    ),
+                }
+            }
+            eprintln!("{} isn't indexed any more", tilde(&folder));
+            continue;
+        }
         let folder = folder.canonicalize().with_context(|| format!("no folder {}", folder.display()))?;
         if !folder.is_dir() {
             bail!("{} isn't a folder", folder.display());
+        }
+        if crawl::is_system_folder(&folder) {
+            bail!(
+                "{} is the system's, not yours: rummage reads your files (rummage index ~ for all of them)",
+                folder.display()
+            );
         }
         store.add_root(&folder)?;
     }
@@ -184,7 +223,7 @@ fn index_command(
         );
     }
     let roots = store.roots()?;
-    if roots.is_empty() {
+    if roots.is_empty() && !remove {
         bail!("no folders yet: rummage index <folder>...");
     }
     // Left out for good: later runs (and the service's) leave them out too.
