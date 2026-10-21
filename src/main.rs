@@ -506,9 +506,9 @@ fn index_status(dir: &PathBuf, store: &Store) -> Result<()> {
 
 /// What to say about files that are in the cloud only.
 fn cloud_only_note(n: usize) -> String {
-    let files = if n == 1 { "file" } else { "files" };
+    let (files, are) = if n == 1 { ("file", "isn't") } else { ("files", "aren't") };
     let here = if cfg!(target_os = "macos") { "this Mac" } else { "this computer" };
-    format!("{n} {files} in iCloud or another cloud drive aren't downloaded to {here}: left out until they are")
+    format!("{n} {files} in iCloud or another cloud drive {are} downloaded to {here}: left out until downloaded")
 }
 
 /// The programs rummage uses when they're there: whether each is found (and which), what it adds, how to get it.
