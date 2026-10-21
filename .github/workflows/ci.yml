@@ -75,3 +75,14 @@ jobs:
         env:
           EDGE_QUICK: "1"
         run: uv run scripts/edge_cases.py
+      # The service installed as a login item, as people run it: launchd here on macOS, a systemd user service on
+      # Ubuntu (whose user manager needs lingering on a machine nobody logs in to).
+      - name: Background service (systemd user manager)
+        if: matrix.name == 'ubuntu'
+        run: |
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 1; done
+      - name: Background service
+        if: matrix.name == 'macos' || matrix.name == 'ubuntu'
+        run: uv run scripts/service_check.py
