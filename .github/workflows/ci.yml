@@ -68,3 +68,10 @@ jobs:
         run: cargo build --release --all-targets
       - name: Test
         run: cargo test --release -- --nocapture
+      # The files that once made indexing slow, stuck or wrong, each checked against the release build. Two machines
+      # are enough (the code paths are the same elsewhere); quick mode keeps the long recordings short on a CPU.
+      - name: Edge cases
+        if: matrix.name == 'macos' || matrix.name == 'ubuntu'
+        env:
+          EDGE_QUICK: "1"
+        run: uv run scripts/edge_cases.py

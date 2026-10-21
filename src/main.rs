@@ -297,7 +297,10 @@ fn index_command(
                     );
                 }
                 match kind.is_timed() {
-                    true => eprint!("\r\x1b[K{} {} of {} minutes", short(path), done / 60, total.div_ceil(60)),
+                    true => {
+                        let minutes = if done >= total { total.div_ceil(60) } else { done / 60 };
+                        eprint!("\r\x1b[K{} {minutes} of {} minutes", short(path), total.div_ceil(60))
+                    }
                     false => eprint!("\r\x1b[K{} {} of {} {}s", short(path), done, total, kind.unit()),
                 }
             }

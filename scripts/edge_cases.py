@@ -10,7 +10,8 @@ once made indexing slow, stuck or wrong, indexed into its own index with the rel
     uv run scripts/edge_cases.py limits retries
     uv run scripts/edge_cases.py icloud       # only when named: it uses your iCloud Drive (a test folder, deleted)
 
-The folders go in ~/.cache/rummage-eval/edge/<case>; each run starts it afresh.
+The folders go in ~/.cache/rummage-eval/edge/<case>; each run starts it afresh. EDGE_QUICK=1 (as on CI, where there's
+no GPU) cuts the long media to minutes, read in 1-minute passes instead of 10.
 """
 
 import os
@@ -22,6 +23,7 @@ import sys
 import time
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
+QUICK = os.environ.get("EDGE_QUICK") == "1"
 RUMMAGE = REPO / "target/release/rummage"
 EDGE = pathlib.Path("~/.cache/rummage-eval/edge").expanduser()
 CASES = {}
@@ -337,22 +339,27 @@ def busy():
 @case
 def long_media():
     """Fix 6: a 40-minute recording and a 25-minute video go in 10-minute passes: the first pass takes 10 minutes of
-    each, later passes the rest, with every 30 s window and the frames past minute 10 there in the end."""
+    each, later passes the rest, with every 30 s window and the frames past minute 10 there in the end. (Quick: 4 and
+    2.5 minutes, in 1-minute passes.)"""
     folder = fresh("long_media")
     files = folder / "files"
-    ffmpeg("-f", "lavfi", "-i", "sine=frequency=440:duration=2400", "-c:a", "aac", "-b:a", "32k",
+    passes, recording, film = (60, 240, 150) if QUICK else (600, 2400, 1500)
+    ffmpeg("-f", "lavfi", "-i", f"sine=frequency=440:duration={recording}", "-c:a", "aac", "-b:a", "32k",
            str(files / "lecture.m4a"))  # fmt: skip
     ffmpeg(
-        "-f", "lavfi", "-i", "smptebars=size=320x240:rate=2:duration=1500",
-        "-f", "lavfi", "-i", "sine=frequency=330:duration=1500",
+        "-f", "lavfi", "-i", f"smptebars=size=320x240:rate=2:duration={film}",
+        "-f", "lavfi", "-i", f"sine=frequency=330:duration={film}",
         "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-b:a", "32k", "-shortest",
         str(files / "film.mp4"),
     )  # fmt: skip
-    said, took = index(folder)
+    said, took = index(folder, {"RUMMAGE_PASS_SECONDS": str(passes)})
     lines = said.splitlines()
     searchable = next((i for i, l in enumerate(lines) if "everything is searchable" in l), None)
     check(searchable is not None, f"a first pass, then later ones: {lines[searchable] if searchable else said[-300:]}")
-    for progress in ["20 of 40 minutes", "40 of 40 minutes", "20 of 25 minutes", "25 of 25 minutes"]:
+    minutes = lambda seconds: -(-seconds // 60)  # noqa: E731
+    second = 2 * passes // 60
+    for progress in [f"{second} of {minutes(recording)} minutes", f"{minutes(recording)} of {minutes(recording)} minutes",
+                     f"{second} of {minutes(film)} minutes", f"{minutes(film)} of {minutes(film)} minutes"]:  # fmt: skip
         at = next((i for i, l in enumerate(lines) if progress in l), None)
         check(at is not None and searchable is not None and at > searchable, f"later pass: {progress}")
     with db(folder) as c:
@@ -361,13 +368,14 @@ def long_media():
                 "SELECT s.loc FROM segments s JOIN files f ON f.id = s.file_id WHERE f.path LIKE ? AND s.modality = ?",
                 (f"%/{name}", modality)))  # fmt: skip
         windows = locs("lecture.m4a", "audio")
-        expected = [float(t) for t in range(0, 2400, 25)]
+        expected = [float(t) for t in range(0, recording, 25)]
         check(len(windows) == len(expected) and all(abs(a - b) < 0.01 for a, b in zip(windows, expected)),
-              f"recording: every window once, 0 to 39:35 ({len(windows)} of {len(expected)})")  # fmt: skip
+              f"recording: every window once, to the end ({len(windows)} of {len(expected)})")  # fmt: skip
         film_sound = locs("film.mp4", "audio")
-        check(len(film_sound) == 60 and film_sound[-1] > 1400, f"video's sound to the end ({len(film_sound)} windows)")
+        check(len(film_sound) == len(range(0, film, 25)) and film_sound[-1] > film - 100,
+              f"video's sound to the end ({len(film_sound)} windows)")  # fmt: skip
         frames = locs("film.mp4", "image")
-        check(len(frames) >= 3 and frames[-1] > 1200, f"frames spread over the video, not bunched: {frames}")
+        check(len(frames) >= 3 and frames[-1] > 2 * passes, f"frames spread over the video, not bunched: {frames}")
         states = [r[0] for r in c.execute("SELECT state FROM files")]
     check(states == ["done", "done"], f"both done: {states}")
     print(f"  ({took:.0f} s in all)")
@@ -400,7 +408,10 @@ def numbers():
     instead of minutes; a number deep inside is still found."""
     folder = fresh("numbers")
     files = folder / "files"
-    shutil.copy(pathlib.Path("~/.cache/rummage-eval/testbed/synthetic/long/sensor readings.txt").expanduser(), files)
+    # The test set's sensor file, as DigUp's testbed has it (a planted reading included).
+    readings = [f"{1760000000 + 60 * i} {i % 17} {i * 7919 % 100003}" for i in range(12000)]
+    readings.insert(11501, "4815162342 0 0")
+    (files / "sensor readings.txt").write_text("timestamp,sensor,value\n" + "\n".join(readings) + "\n")
     rows = [f"2026-10-{1 + i // 1440:02d} {i // 60 % 24:02d}:{i % 60:02d},{20 + (i * 7) % 50 / 10:.1f},{1000 + i % 37}"
             for i in range(8000)]  # fmt: skip
     rows[6000] = "2026-10-05 04:00,24.2,8675309"

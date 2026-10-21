@@ -128,10 +128,16 @@ pub fn audio_windows(
     command.args(["-v", "error", "-nostdin"]);
     let from = match span {
         Some((from, to)) => {
-            // The last window that starts before `to` runs 5 s past it.
-            let length = to - from + WINDOW_SECONDS - HOP_SECONDS;
-            command.args(["-ss", &format!("{from:.3}"), "-t", &format!("{length:.3}")]);
-            from
+            // Windows start every 25 s from the file's start, wherever the passes cut: from the first one at or after
+            // `from` to the last one before `to`, which runs 5 s past it.
+            let first = (from / HOP_SECONDS).ceil() * HOP_SECONDS;
+            let last = ((to / HOP_SECONDS).ceil() - 1.0) * HOP_SECONDS;
+            if last < first {
+                return Ok(duration(path).unwrap_or(to));
+            }
+            let length = last + WINDOW_SECONDS - first;
+            command.args(["-ss", &format!("{first:.3}"), "-t", &format!("{length:.3}")]);
+            first
         }
         None => 0.0,
     };
@@ -471,9 +477,9 @@ mod tests {
         let starts: Vec<f64> = windows.iter().map(|w| w.0).collect();
         assert_eq!(starts, vec![0.0, 25.0, 50.0], "{windows:?}");
         assert!(windows.iter().all(|w| w.2 == 30 * SAMPLE_RATE || w.1 >= 69.0));
-        // Read in two passes, cut at 50 s: the same windows, each once.
+        // Read in passes, cut anywhere: the same windows, each once.
         let mut passes = Vec::new();
-        for span in [(0.0, 50.0), (50.0, 71.0)] {
+        for span in [(0.0, 33.0), (33.0, 60.0), (60.0, 71.0)] {
             audio_windows(&wav, Some(span), |w| {
                 passes.push((w.start, w.end, w.samples.len()));
                 Ok(())

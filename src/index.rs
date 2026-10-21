@@ -28,9 +28,11 @@ const GROUP_PARTS: usize = 32;
 /// stays searchable by its words.
 const NUMBERS_EMBEDDED: usize = 3;
 
-/// Recordings and videos go in passes of this many seconds (their progress is counted in seconds). One up to a minute
-/// longer goes at once.
-const PASS_SECONDS: usize = 600;
+/// Recordings and videos go in passes of this many seconds (their progress is counted in seconds); one up to a tenth
+/// longer goes at once. RUMMAGE_PASS_SECONDS shortens it for tests.
+fn pass_seconds() -> usize {
+    std::env::var("RUMMAGE_PASS_SECONDS").ok().and_then(|s| s.parse().ok()).filter(|s| *s > 0).unwrap_or(600)
+}
 
 /// A file changed twice within this many seconds is busy (a log, a download, a document being worked on): it's read
 /// once it has been still this long. RUMMAGE_BUSY_SECONDS shortens it for tests.
@@ -273,7 +275,7 @@ pub fn embed_pending(store: &Store, mut progress: impl FnMut(Progress)) -> Resul
         let name = file_name(&path);
         // Sound and video: the next ten minutes at a time.
         while kind.is_timed() && parts_done < parts_total {
-            let to = (parts_done + PASS_SECONDS).min(parts_total);
+            let to = (parts_done + pass_seconds()).min(parts_total);
             let job = Job {
                 file_id,
                 path: path.clone(),
@@ -332,8 +334,8 @@ fn first_step(file_id: i64, path: &Path, kind: Kind) -> Result<Job> {
         // A long recording or video: its first ten minutes now, the rest in later passes.
         let length = if kind.is_timed() { crate::media::duration(path) } else { None };
         let (span, done, total) = match length {
-            Some(length) if length > (PASS_SECONDS + 60) as f64 => {
-                (Some((0.0, PASS_SECONDS as f64)), PASS_SECONDS, length.ceil() as usize)
+            Some(length) if length > (pass_seconds() * 11 / 10) as f64 => {
+                (Some((0.0, pass_seconds() as f64)), pass_seconds(), length.ceil() as usize)
             }
             _ => (None, 1, 1),
         };
