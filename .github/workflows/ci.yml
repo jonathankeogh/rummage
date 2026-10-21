@@ -27,10 +27,10 @@ jobs:
     steps:
       - name: System packages (Ubuntu)
         if: startsWith(matrix.name, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev poppler-utils tesseract-ocr ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev poppler-utils tesseract-ocr ffmpeg tmux
       - name: System packages (macOS)
         if: matrix.name == 'macos'
-        run: brew install cmake poppler tesseract ffmpeg
+        run: brew install cmake poppler tesseract ffmpeg tmux
       # ffmpeg from RPM Fusion, as Fedora users get it (Fedora's own ffmpeg-free can't encode H.264 for the tests).
       # Git comes first so the checkout brings the llama.cpp submodule.
       - name: System packages (Fedora)
@@ -97,3 +97,8 @@ jobs:
       - name: Background service
         if: matrix.name == 'macos' || matrix.name == 'ubuntu'
         run: uv run scripts/service_check.py
+      # The interface in a terminal and inside tmux: draws at once, finds as you type, opens on ⏎ (and says so when
+      # it can't: Ubuntu here has no xdg-open), gives the terminal back on esc.
+      - name: Interface
+        if: matrix.name == 'macos' || matrix.name == 'ubuntu'
+        run: uv run scripts/interface_check.py
