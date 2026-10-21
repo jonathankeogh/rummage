@@ -468,7 +468,11 @@ def numbers():
         letter = c.execute("SELECT COUNT(*), SUM(length(s.vector) > 0) FROM segments s JOIN files f ON f.id = s.file_id "
                            "WHERE f.path LIKE '%/letter.txt'").fetchone()  # fmt: skip
     check(letter[0] == letter[1] and letter[0] > 1, f"prose is embedded whole ({letter[1]} of {letter[0]})")
-    check(took < 30, f"indexed in {took:.0f} s (the sensor file alone took 84 s before)")
+    # The time is the GPU's (84 s for the sensor file alone, before); a CPU (CI) only shows it.
+    if QUICK:
+        print(f"  (indexed in {took:.0f} s)")
+    else:
+        check(took < 30, f"indexed in {took:.0f} s (the sensor file alone took 84 s before)")
     for number, name in [("8675309", "weather export.txt"), ("1760479880", "sensor readings.txt")]:
         found = subprocess.run(
             [str(RUMMAGE), "--index", str(folder / "index"), "search", "--no-serve", number],
