@@ -243,7 +243,7 @@ fn watch_problem(root: &Path, error: &notify::Error) -> String {
 /// Starts `rummage watch` at login: a launchd agent on macOS, a systemd user service elsewhere. PATH is kept from
 /// now, so the service finds ffmpeg, poppler and tesseract where this shell does.
 pub fn install(dir: &Path) -> Result<()> {
-    let exe = std::env::current_exe()?.canonicalize()?;
+    let exe = stable_path(&std::env::current_exe()?.canonicalize()?);
     let dir = {
         std::fs::create_dir_all(dir)?;
         dir.canonicalize()?
@@ -308,6 +308,18 @@ pub fn install(dir: &Path) -> Result<()> {
         println!("rummage watch starts at login now, and is running ({})", unit.display());
     }
     Ok(())
+}
+
+/// A path to this program that outlasts updates. Homebrew keeps each version in its own folder
+/// (`…/Cellar/rummage/0.2.0/bin/rummage`) and deletes old ones, so a login item pointing there breaks after an
+/// upgrade; `…/opt/rummage/bin/rummage` always points at the version installed.
+fn stable_path(exe: &Path) -> PathBuf {
+    let parts: Vec<_> = exe.components().collect();
+    let Some(cellar) = parts.iter().position(|c| c.as_os_str() == "Cellar") else { return exe.to_path_buf() };
+    let (Some(formula), Some(name)) = (parts.get(cellar + 1), exe.file_name()) else { return exe.to_path_buf() };
+    let prefix: PathBuf = parts[..cellar].iter().collect();
+    let opt = prefix.join("opt").join(formula).join("bin").join(name);
+    if opt.exists() { opt } else { exe.to_path_buf() }
 }
 
 /// Undoes `install`.
@@ -375,6 +387,26 @@ mod tests {
         assert!(!matters(&event(create, "/home/a/.local/share/rummage/index.sqlite-wal"), &roots, index), "the index");
         let read = EventKind::Access(notify::event::AccessKind::Read);
         assert!(!matters(&event(read, "/home/a/.cache/notes/trip.md"), &roots, index), "a read changes nothing");
+    }
+
+    #[test]
+    fn login_items_point_past_homebrew_versions() {
+        let brew = std::env::temp_dir().join(format!("rummage-brew-{}", std::process::id()));
+        let versioned = brew.join("Cellar/rummage/0.2.0/bin/rummage");
+        std::fs::create_dir_all(versioned.parent().unwrap()).unwrap();
+        std::fs::write(&versioned, "").unwrap();
+        // No opt link (not Homebrew after all): the path as it is.
+        assert_eq!(stable_path(&versioned), versioned);
+        let opt = brew.join("opt/rummage/bin/rummage");
+        std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
+        std::fs::write(&opt, "").unwrap();
+        assert_eq!(stable_path(&versioned), opt);
+        // Built from source: unchanged.
+        assert_eq!(
+            stable_path(Path::new("/home/a/rummage/target/release/rummage")),
+            Path::new("/home/a/rummage/target/release/rummage")
+        );
+        std::fs::remove_dir_all(&brew).unwrap();
     }
 
     #[test]

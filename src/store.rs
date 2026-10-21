@@ -376,7 +376,8 @@ impl Store {
     /// index (the old one stays: the word index can't take a name back out of passages already in).
     pub fn moved(&self, file_id: i64, path: &Path, kind: Kind, size: u64, mtime: i64) -> Result<()> {
         let (old, copy_of): (String, Option<i64>) =
-            self.db.query_row("SELECT path, copy_of FROM files WHERE id = ?", [file_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            self.db
+                .query_row("SELECT path, copy_of FROM files WHERE id = ?", [file_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         self.db.execute(
             "UPDATE files SET path = ?, kind = ?, size = ?, mtime = ?, seen_mtime = NULL WHERE id = ?",
             params![path.to_string_lossy(), kind.as_str(), size as i64, mtime, file_id],
@@ -411,13 +412,16 @@ impl Store {
     /// hands it, with its other copies, to its newest copy; one with no copies loses it.
     fn leave_content(&self, file_id: i64) -> Result<()> {
         self.drop_names(file_id)?;
-        let copy_of: Option<i64> = self.db.query_row("SELECT copy_of FROM files WHERE id = ?", [file_id], |r| r.get(0))?;
+        let copy_of: Option<i64> =
+            self.db.query_row("SELECT copy_of FROM files WHERE id = ?", [file_id], |r| r.get(0))?;
         if copy_of.is_some() {
             return Ok(());
         }
         let heir: Option<i64> = self
             .db
-            .query_row("SELECT id FROM files WHERE copy_of = ? ORDER BY mtime DESC, id LIMIT 1", [file_id], |r| r.get(0))
+            .query_row("SELECT id FROM files WHERE copy_of = ? ORDER BY mtime DESC, id LIMIT 1", [file_id], |r| {
+                r.get(0)
+            })
             .optional()?;
         match heir {
             Some(heir) => {

@@ -465,15 +465,7 @@ fn embed(store: &Store, embedder: &mut Embedder, jobs: Vec<Job>) -> Result<Vec<(
                 None
             };
             let excerpt = extract::excerpt(&part.text, 200);
-            store.add_segment(
-                job.file_id,
-                part.loc as f64,
-                &job.name,
-                &part.text,
-                &excerpt,
-                vector,
-                Modality::Text,
-            )?;
+            store.add_segment(job.file_id, part.loc as f64, &job.name, &part.text, &excerpt, vector, Modality::Text)?;
         }
         for s in seen.iter().filter(|s| s.job == j) {
             // A picture's words in full (up to 4,000 characters): its preview shows them. A stretch of sound or video

@@ -203,7 +203,8 @@ impl Vectors {
             query_centre: None,
             centrality: Vec::new(),
         };
-        let mut statement = store.db.prepare("SELECT id, mtime, path, copy_of FROM files ORDER BY copy_of IS NOT NULL")?;
+        let mut statement =
+            store.db.prepare("SELECT id, mtime, path, copy_of FROM files ORDER BY copy_of IS NOT NULL")?;
         let rows = statement.query_map([], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?))
         })?;
