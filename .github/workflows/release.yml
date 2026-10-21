@@ -1,0 +1,160 @@
+name: release
+
+# Builds the release binaries, tries each on fresh machines the way someone downloading it would (no checkout, no build
+# tools, no optional tools), and for a version tag (v0.2.0) puts them in a draft GitHub release to look over and
+# publish. Run it by hand (Actions › release › Run workflow) to build and try them without releasing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-latest
+          # Built on the oldest Ubuntu GitHub has, so the binary runs on any glibc since (2.35, 2022).
+          - name: linux-x86_64
+            os: ubuntu-22.04
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    env:
+      # The oldest macOS it runs on (llama.cpp's part is built for the same).
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - name: System packages (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      - name: System packages (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+      - name: Version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "the tag ${GITHUB_REF_NAME} doesn't match Cargo.toml's version ${version}"; exit 1
+          fi
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          dir=rummage-${VERSION}-${{ matrix.name }}
+          mkdir "$dir"
+          cp target/release/rummage README.md LICENSE THIRD_PARTY_NOTICES.md "$dir"
+          tar czf "$dir.tar.gz" "$dir"
+          if command -v sha256sum >/dev/null; then sha256sum "$dir.tar.gz"; else shasum -a 256 "$dir.tar.gz"; fi > "$dir.tar.gz.sha256"
+          cat "$dir.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rummage-${{ matrix.name }}
+          path: rummage-*-${{ matrix.name }}.tar.gz*
+          if-no-files-found: error
+
+  # Each binary on machines that have never seen the repo: download, unpack, run. Linux binaries also on Fedora and
+  # Debian, and the Mac one on the oldest macOS GitHub has. One machine gets the model the way the binary tells people
+  # to (its own curl commands); the rest from GitHub's cache.
+  try:
+    name: try (${{ matrix.name }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu
+            os: ubuntu-24.04
+            binary: linux-x86_64
+            model: instructions
+          - name: ubuntu-arm64
+            os: ubuntu-24.04-arm
+            binary: linux-arm64
+          - name: fedora
+            os: ubuntu-latest
+            container: fedora:42
+            binary: linux-x86_64
+          - name: debian
+            os: ubuntu-latest
+            container: debian:12
+            binary: linux-x86_64
+          - name: macos
+            os: macos-latest
+            binary: macos-arm64
+          - name: macos-14
+            os: macos-14
+            binary: macos-arm64
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    steps:
+      # What the cache action itself needs in a bare container; nothing for rummage.
+      - name: Container basics
+        if: matrix.container == 'fedora:42'
+        run: dnf install -y tar gzip zstd
+      - name: Container basics
+        if: matrix.container == 'debian:12'
+        run: apt-get update && apt-get install -y zstd ca-certificates curl
+      - uses: actions/download-artifact@v4
+        with:
+          name: rummage-${{ matrix.binary }}
+      - name: Unpack
+        run: |
+          tar xzf rummage-*.tar.gz
+          dir=$(find . -maxdepth 1 -type d -name 'rummage-*' | head -1)
+          echo "$PWD/$dir" >> "$GITHUB_PATH"
+      - name: What it links to
+        run: |
+          rummage --version
+          if [ "$(uname)" = Darwin ]; then otool -L "$(command -v rummage)"; else ldd "$(command -v rummage)"; fi
+      - name: Model files (GitHub's cache)
+        if: matrix.model != 'instructions'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/huggingface/hub/models--ggml-org--embeddinggemma-2-GGUF
+          key: embeddinggemma-2-bfcd298762cc34d0357ece5ebdd31791a3a374d8
+      - name: Model files (as rummage says to get them)
+        if: matrix.model == 'instructions'
+        run: rummage status | grep -E '^ +(mkdir|curl) ' | sh -ex
+      - name: Status
+        run: rummage status
+      - name: Index and search
+        run: |
+          mkdir -p "$HOME/notes"
+          printf 'The boiler service is booked for the second week of March; the engineer brings the parts.\n' > "$HOME/notes/boiler.md"
+          printf 'Sourdough: feed the starter the night before, let the dough rise for five hours.\n' > "$HOME/notes/bread.md"
+          printf 'Packing list for the coast: rain jacket, walking boots, the long lens.\n' > "$HOME/notes/trip.md"
+          rummage index "$HOME/notes"
+          rummage search --no-serve "when is the heating repaired" | tee out.txt
+          head -1 out.txt | grep -q boiler.md
+          # Through the background service, as the interface searches.
+          rummage search "how long should the dough rise" | tee out.txt
+          head -1 out.txt | grep -q bread.md
+          rummage stop
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [build, try]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --generate-notes --title "rummage ${GITHUB_REF_NAME#v}"
