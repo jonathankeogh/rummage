@@ -87,9 +87,13 @@ jobs:
         run: cargo test --release -- --nocapture
       # The files that once made indexing slow, stuck or wrong, each checked against the release build; quick mode
       # keeps the long recordings short on a CPU.
+      # GitHub's Macs are virtual machines whose GPU is emulated: the model runs there many times slower than on the CPU
+      # (the long media case didn't finish in 15 minutes). The tests above keep the GPU path; what follows runs on the
+      # CPU there (RUMMAGE_CPU, carried into the installed service too).
       - name: Edge cases
         env:
           EDGE_QUICK: "1"
+          RUMMAGE_CPU: ${{ matrix.name == 'macos' && '1' || '' }}
         run: uv run scripts/edge_cases.py
       # The service installed as a login item, as people run it: launchd on macOS, a systemd user service on Ubuntu
       # (whose user manager needs lingering on a machine nobody logs in to). Fedora runs in a container, without
@@ -101,8 +105,12 @@ jobs:
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
           for i in $(seq 1 30); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 1; done
       - name: Background service
+        env:
+          RUMMAGE_CPU: ${{ matrix.name == 'macos' && '1' || '' }}
         run: uv run scripts/service_check.py ${{ matrix.container && '--foreground' || '' }}
       # The interface in a terminal and inside tmux: draws at once, finds as you type, opens on ⏎ (and says so when
       # it can't: the Linux machines here have no xdg-open), gives the terminal back on esc; and the first run's setup.
       - name: Interface
+        env:
+          RUMMAGE_CPU: ${{ matrix.name == 'macos' && '1' || '' }}
         run: uv run scripts/interface_check.py

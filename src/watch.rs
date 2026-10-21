@@ -240,15 +240,32 @@ fn watch_problem(root: &Path, error: &notify::Error) -> String {
     }
 }
 
-/// Starts `rummage watch` at login: a launchd agent on macOS, a systemd user service elsewhere. PATH is kept from
-/// now, so the service finds ffmpeg, poppler and tesseract where this shell does.
+/// Settings kept from the shell that installs the service, besides PATH: where the model and the index live, and the
+/// CPU switch. Without them the service would look elsewhere than this shell's rummage does.
+const KEPT_SETTINGS: &[&str] =
+    &["RUMMAGE_MODELS", "RUMMAGE_CPU", "HF_HUB_CACHE", "HF_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"];
+
+/// The service's environment: PATH (so it finds ffmpeg, poppler and tesseract where this shell does) and the
+/// settings above that are set here.
+fn service_environment() -> Vec<(&'static str, String)> {
+    let mut environment = vec![("PATH", std::env::var("PATH").unwrap_or_default())];
+    for name in KEPT_SETTINGS {
+        if let Ok(value) = std::env::var(name) {
+            environment.push((name, value));
+        }
+    }
+    environment
+}
+
+/// Starts `rummage watch` at login: a launchd agent on macOS, a systemd user service elsewhere, with this shell's
+/// PATH and rummage settings (`service_environment`).
 pub fn install(dir: &Path) -> Result<()> {
     let exe = stable_path(&std::env::current_exe()?.canonicalize()?);
     let dir = {
         std::fs::create_dir_all(dir)?;
         dir.canonicalize()?
     };
-    let path = std::env::var("PATH").unwrap_or_default();
+    let environment = service_environment();
     let home = PathBuf::from(std::env::var_os("HOME").context("no HOME")?);
     if cfg!(target_os = "macos") {
         let plist = home.join("Library/LaunchAgents").join(format!("{LAUNCHD_LABEL}.plist"));
@@ -264,7 +281,7 @@ pub fn install(dir: &Path) -> Result<()> {
   <key>Label</key><string>{LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array><string>{}</string><string>--index</string><string>{}</string><string>watch</string></array>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{}</string></dict>
+  <key>EnvironmentVariables</key><dict>{}</dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Background</string>
@@ -274,7 +291,10 @@ pub fn install(dir: &Path) -> Result<()> {
 "#,
                 xml(&exe.to_string_lossy()),
                 xml(&dir.to_string_lossy()),
-                xml(&path),
+                environment
+                    .iter()
+                    .map(|(name, value)| format!("<key>{name}</key><string>{}</string>", xml(value)))
+                    .collect::<String>(),
                 xml(&log.to_string_lossy())
             ),
         )?;
@@ -296,11 +316,11 @@ pub fn install(dir: &Path) -> Result<()> {
             &unit,
             format!(
                 "[Unit]\nDescription=rummage: keeps the search index up to date\n\n[Service]\n\
-                 ExecStart=\"{}\" --index \"{}\" watch\nEnvironment=\"PATH={}\"\nRestart=on-failure\nNice=10\n\n\
+                 ExecStart=\"{}\" --index \"{}\" watch\n{}Restart=on-failure\nNice=10\n\n\
                  [Install]\nWantedBy=default.target\n",
                 exe.display(),
                 dir.display(),
-                path
+                environment.iter().map(|(name, value)| format!("Environment=\"{name}={value}\"\n")).collect::<String>()
             ),
         )?;
         for args in [vec!["--user", "daemon-reload"], vec!["--user", "enable", "--now", SYSTEMD_UNIT]] {
