@@ -64,6 +64,8 @@ pub struct Sync {
     pub remote_folders: Vec<PathBuf>,
     /// Photos libraries macOS didn't let it read (Full Disk Access).
     pub photos_refused: Vec<PathBuf>,
+    /// Folders it couldn't read, and why: their files were kept as they were.
+    pub unreadable: Vec<(PathBuf, String)>,
     /// Files changing often, left as they were read until they're still (see `is_busy`).
     pub busy: usize,
     /// New files whose content was already in (copies), and files moved or renamed: none read again.
@@ -87,7 +89,8 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options, backgrou
         dataset_files: walk.dataset_files,
         cloud_only: walk.placeholders,
         remote_folders: walk.remote_folders,
-        photos_refused: walk.refused,
+        photos_refused: walk.refused.clone(),
+        unreadable: walk.unreadable.clone(),
         ..Default::default()
     };
     let tx = store.db.unchecked_transaction()?;
@@ -104,8 +107,14 @@ pub fn sync(store: &Store, roots: &[PathBuf], options: &crawl::Options, backgrou
     // When the first busy file is due, for the service's timer.
     let mut busy_until: Option<i64> = None;
     let on_disk: std::collections::HashSet<&Path> = found.iter().map(|f| f.path.as_path()).chain(kept).collect();
-    // A folder missing altogether (an unplugged drive) keeps its files until it's back.
-    let missing: Vec<&PathBuf> = roots.iter().filter(|root| !root.exists()).collect();
+    // A folder missing altogether (an unplugged drive), or one it couldn't read (no permission, a drive that errored),
+    // keeps its files until it's back.
+    let missing: Vec<&PathBuf> = roots
+        .iter()
+        .filter(|root| !root.exists())
+        .chain(walk.unreadable.iter().map(|(path, _)| path))
+        .chain(&walk.refused)
+        .collect();
     let gone = |path: &Path| !on_disk.contains(path) && !missing.iter().any(|root| path.starts_with(root));
     for Found { path, kind, size, mtime } in &found {
         let known = store.file(path)?;
@@ -603,6 +612,27 @@ pub fn duration(started: Instant) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_that_cant_be_read_keeps_its_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rummage-unreadable-{}", std::process::id()));
+        let docs = dir.join("home/Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("boiler.md"), "The boiler service is booked for March.").unwrap();
+        let store = Store::open(&dir.join("index")).unwrap();
+        let options = crawl::Options { code: false, excluded: Vec::new() };
+        let roots = [dir.join("home")];
+        assert_eq!(sync(&store, &roots, &options, false).unwrap().new_or_changed, 1);
+        // Locked (as macOS may lock Documents for a background service): kept, not taken for deleted. (Run as root,
+        // as in a container, the lock does nothing and the file is simply still there.)
+        std::fs::set_permissions(&docs, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let locked = sync(&store, &roots, &options, true);
+        std::fs::set_permissions(&docs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(locked.unwrap().removed, 0);
+        assert_eq!(store.files_under(&docs).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_file_changing_twice_in_five_minutes_waits_until_still() {

@@ -208,6 +208,9 @@ fn index_command(
     if sync.cloud_only > 0 {
         eprintln!("{}", cloud_only_note(sync.cloud_only));
     }
+    for (folder, why) in &sync.unreadable {
+        eprintln!("can't read {} ({why}): what's indexed from it stays as it was", tilde(folder));
+    }
     for library in &sync.photos_refused {
         eprintln!(
             "can't read {}: macOS keeps it private. To index your photos, give your terminal app Full Disk Access \

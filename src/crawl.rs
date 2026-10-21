@@ -118,6 +118,7 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
     let placeholders = Arc::new(AtomicUsize::new(0));
     let mut remote_folders = Vec::new();
     let mut refused: Vec<PathBuf> = Vec::new();
+    let mut unreadable: Vec<(PathBuf, String)> = Vec::new();
     for root in roots {
         let remote = remote_mounts_below(root, &remote_mounts());
         remote_folders.extend(remote.iter().cloned());
@@ -126,11 +127,17 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    // macOS keeps the Photos library private until the terminal has Full Disk Access.
-                    if let Some(library) = refused_library(&error)
-                        && !refused.contains(&library)
-                    {
-                        refused.push(library);
+                    // A folder that can't be listed (no permission, a drive that errored): its files are kept as they
+                    // were, not taken for deleted. macOS keeps the Photos library private until the terminal has Full
+                    // Disk Access.
+                    if let Some((path, why)) = unreadable_path(&error) {
+                        match photos_library(&path) {
+                            Some(library) if !refused.contains(&library.to_path_buf()) => {
+                                refused.push(library.to_path_buf())
+                            }
+                            Some(_) => {}
+                            None => unreadable.push((path, why)),
+                        }
                     }
                     continue;
                 }
@@ -201,6 +208,7 @@ pub fn walk(roots: &[PathBuf], options: &Options) -> Walk {
         placeholders: placeholders.load(Ordering::Relaxed),
         remote_folders,
         refused,
+        unreadable,
     }
 }
 
@@ -213,15 +221,17 @@ pub fn photos_library(path: &Path) -> Option<&Path> {
 /// rest is thumbnails, edited copies and its database.
 const PHOTOS_ORIGINALS: &[&str] = &["originals", "Masters"];
 
-/// The Photos library a walk wasn't allowed into (or into part of).
-fn refused_library(error: &ignore::Error) -> Option<PathBuf> {
-    if !error.io_error().is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) {
-        return None;
-    }
+/// The path a walk couldn't read, and why ("permission denied"): a folder it couldn't list, usually.
+fn unreadable_path(error: &ignore::Error) -> Option<(PathBuf, String)> {
+    let why = error.io_error()?;
+    let why = match why.kind() {
+        std::io::ErrorKind::PermissionDenied => "permission denied".to_string(),
+        _ => why.to_string(),
+    };
     let mut error = error;
     loop {
         match error {
-            ignore::Error::WithPath { path, .. } => return photos_library(path).map(Path::to_path_buf),
+            ignore::Error::WithPath { path, .. } => return Some((path.clone(), why)),
             ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => error = err,
             _ => return None,
         }
@@ -510,6 +520,8 @@ pub struct Walk {
     pub remote_folders: Vec<PathBuf>,
     /// Photos libraries macOS didn't let it read.
     pub refused: Vec<PathBuf>,
+    /// Other places it couldn't read, and why: what's indexed under them stays.
+    pub unreadable: Vec<(PathBuf, String)>,
 }
 
 /// What kind of file this is for rummage, or None to leave it alone.

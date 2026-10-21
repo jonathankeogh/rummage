@@ -181,6 +181,26 @@ exec "{real}" "$@"
 
 
 @case
+def unreadable():
+    """A folder that can't be read (macOS keeping Documents from a background service, a drive that errored) keeps
+    what's indexed from it, and reads nothing again once it's back."""
+    folder = fresh("unreadable")
+    docs = folder / "files/Documents"
+    docs.mkdir()
+    for i in range(3):
+        (docs / f"note {i}.md").write_text(f"Note {i}: the boiler service, the garden, invoice {i}{i}{i}.")
+    index(folder)
+    docs.chmod(0)
+    try:
+        said, _ = index(folder)
+    finally:
+        docs.chmod(0o755)
+    check(" 0 gone" in said and "can't read" in said, f"locked: kept and said: {said.splitlines()[:2]}")
+    said, _ = index(folder)
+    check(changed(said) == 0, f"unlocked: nothing read again ({changed(said)} new or changed)")
+
+
+@case
 def retries():
     """Fix 4: a failed file is tried again when it changes, or by a newer rummage, not at every sweep."""
     folder = fresh("retries")
