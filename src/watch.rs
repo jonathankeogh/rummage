@@ -285,6 +285,10 @@ pub fn install(dir: &Path) -> Result<()> {
             bail!("launchctl couldn't load {}", plist.display());
         }
         println!("rummage watch starts at login now, and is running ({})", plist.display());
+        println!(
+            "macOS may now ask whether rummage can read your Documents, Desktop or Downloads: click Allow (it reads \
+             only the folders you chose). If you don't, rummage status says which it can't read."
+        );
     } else {
         let unit = home.join(".config/systemd/user").join(SYSTEMD_UNIT);
         std::fs::create_dir_all(unit.parent().unwrap())?;

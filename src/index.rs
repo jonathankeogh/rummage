@@ -222,6 +222,10 @@ pub fn sync(
         }
     }
     store.set_meta("cloud_only", &summary.cloud_only.to_string())?;
+    // For rummage status: the folders the last sync (the service's, say) couldn't read, and why.
+    let unreadable: Vec<String> =
+        summary.unreadable.iter().map(|(path, why)| format!("{}\t{why}", path.display())).collect();
+    store.set_meta("unreadable", &unreadable.join("\n"))?;
     store.db.execute_batch("COMMIT")?;
     Ok(summary)
 }

@@ -12,6 +12,7 @@ pub mod paths;
 pub mod picture;
 pub mod search;
 pub mod serve;
+pub mod setup;
 pub mod store;
 pub mod tool;
 pub mod tui;

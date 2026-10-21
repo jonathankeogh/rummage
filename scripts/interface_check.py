@@ -64,13 +64,13 @@ env.pop("RUMMAGE_PICTURES", None)
 class Terminal:
     """rummage in a pseudo-terminal, its output drawn by pyte."""
 
-    def __init__(self, env):
+    def __init__(self, env, args=None):
         self.screen = pyte.Screen(COLUMNS, ROWS)
         self.stream = pyte.ByteStream(self.screen)
         self.raw = b""
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
-            os.execve(RUMMAGE, [RUMMAGE, "--index", str(index)], env)
+            os.execve(RUMMAGE, [RUMMAGE, *(args or ["--index", str(index)])], env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLUMNS, 0, 0))
         os.kill(self.pid, signal.SIGWINCH)
         # Answer what a plain xterm answers (device attributes, cursor position); picture queries go unanswered.
@@ -100,9 +100,13 @@ class Terminal:
         return None
 
     def type(self, keys: str):
-        for key in keys:
-            os.write(self.fd, key.encode())
+        """Types `keys` a key at a time; an escape sequence (an arrow key) goes whole, as a terminal sends it."""
+        i = 0
+        while i < len(keys):
+            n = 3 if keys.startswith("\x1b[", i) else 1
+            os.write(self.fd, keys[i : i + n].encode())
             self.pump(0.05)
+            i += n
 
     def exited(self, timeout):
         end = time.time() + timeout
@@ -146,6 +150,54 @@ def no_opener():
     check(term.exited(10) == 0, "esc still quits")
 
 
+def first_run():
+    """The setup on a first run, in a made-up home: home folder, one folder unticked, no music, no login item."""
+    print("first run (setup):")
+    home = base / "home"
+    for name, file in [("Documents", "lease.md"), ("Downloads", "receipt.md"), ("Music", "song.mp3")]:
+        (home / name).mkdir(parents=True)
+        (home / name / file).write_text(f"The {name.lower()} file: something to find about the lease and the rent.")
+    setup_index = base / "setup-index"
+    models = {k: v for k, v in os.environ.items() if k in ("HF_HUB_CACHE", "HF_HOME", "XDG_DATA_HOME", "RUMMAGE_MODELS")}
+    # The model stays where it is (rummage looks under HOME otherwise).
+    real_home = pathlib.Path.home()
+    first_env = {**env, **models, "HOME": str(home), "HF_HUB_CACHE": os.environ.get("HF_HUB_CACHE", str(real_home / ".cache/huggingface/hub"))}
+    if "XDG_DATA_HOME" not in first_env and (real_home / ".local/share/rummage/models").exists():
+        first_env["RUMMAGE_MODELS"] = str(next((real_home / ".local/share/rummage/models").iterdir()))
+    term = Terminal(first_env, ["--index", str(setup_index), "index"])
+    check(term.until(lambda t: "Index your home folder" in t, 10) is not None, "asks about the home folder")
+    term.type("y\r")
+    check(term.until(lambda t: "[x] Documents" in t and "[x] Music" in t, 10) is not None, "lists its folders, all ticked")
+    term.type("\x1b[B ")  # down to Downloads, untick it
+    check(term.until(lambda t: "[ ] Downloads" in t, 5) is not None, "space unticks one")
+    term.type("\r")
+    check(term.until(lambda t: "Include your music" in t, 10) is not None, "asks about music (Music is ticked)")
+    term.type("n\r")
+    check(term.until(lambda t: "background" in t, 10) is not None, "asks about the background service")
+    term.type("n\r")
+    code = term.exited(300)
+    check(code == 0, f"indexes what was chosen (exit {code})")
+    import sqlite3
+    with sqlite3.connect(setup_index / "index.sqlite") as c:
+        roots = [r[0] for r in c.execute("SELECT path FROM roots")]
+        files = sorted(pathlib.Path(r[0]).name for r in c.execute("SELECT path FROM files"))
+    check(roots == [str(home.resolve())] and files == ["lease.md"],
+          f"the home folder, without Downloads or music: {files}")  # fmt: skip
+    # Naming folders instead: a typo is explained, a real folder taken.
+    term = Terminal(first_env, ["--index", str(base / "setup-index-2"), "index"])
+    term.until(lambda t: "Index your home folder" in t, 10)
+    term.type("n\r")
+    term.until(lambda t: "Which folder?" in t, 5)
+    term.type("~/Documnets\r")
+    check(term.until(lambda t: "no such folder" in t, 5) is not None, "a mistyped folder is explained")
+    term.type("~/Documents\r")
+    check(term.until(lambda t: "added ~/Documents" in t, 5) is not None, "a real one is added")
+    term.type("\r")
+    term.until(lambda t: "background" in t, 5)
+    term.type("n\r")
+    check(term.exited(300) == 0, "and indexed")
+
+
 def in_tmux():
     print("inside tmux:")
     socket = f"rummage-check-{os.getpid()}"
@@ -180,6 +232,7 @@ def in_tmux():
 
 try:
     plain_terminal()
+    first_run()
     if platform.system() != "Darwin" and not shutil.which("xdg-open"):
         no_opener()
     if shutil.which("tmux"):

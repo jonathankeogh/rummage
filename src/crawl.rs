@@ -245,7 +245,8 @@ fn music_folders() -> Vec<PathBuf> {
             folders.push(PathBuf::from(value));
         }
     }
-    folders
+    // As the walk sees them: their real paths (a home reached through a link is still the same home).
+    folders.into_iter().map(|f| f.canonicalize().unwrap_or(f)).collect()
 }
 
 /// In a music folder, or in an Apple Music or iTunes library wherever it is.

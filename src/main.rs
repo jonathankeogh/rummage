@@ -163,17 +163,29 @@ fn run() -> Result<()> {
 
 fn index_command(
     dir: &PathBuf,
-    folders: Vec<PathBuf>,
+    mut folders: Vec<PathBuf>,
     code: bool,
-    music: bool,
+    mut music: bool,
     remove: bool,
-    exclude: Vec<PathBuf>,
+    mut exclude: Vec<PathBuf>,
     reindex: bool,
     background: bool,
 ) -> Result<()> {
     // One indexing run at a time: yours, or the search service's keeping up with changes.
-    let _lock = rummage::watch::lock_index(dir, background)?;
+    let lock = rummage::watch::lock_index(dir, background)?;
     let store = if reindex { store::open_for_reindex(dir)? } else { Store::open(dir)? };
+    // The first run, in a terminal, with nothing named: ask what to index.
+    let mut install_after = false;
+    if folders.is_empty() && !remove && !background && store.roots()?.is_empty() && interactive() {
+        let Some(choice) = rummage::setup::ask()? else {
+            bail!("nothing chosen: rummage index <folder>... when ready")
+        };
+        folders = choice.roots;
+        exclude.extend(choice.excluded);
+        music |= choice.music;
+        install_after = choice.background;
+        eprintln!();
+    }
     for folder in &folders {
         if remove {
             // It may be gone already (a deleted folder, an unplugged drive): matched as written too.
@@ -391,7 +403,16 @@ fn index_command(
     if done > 0 || first_pass_over {
         eprintln!("\r\x1b[Kindexed {done} files in {}", index::duration(started));
     }
+    if install_after {
+        drop(lock);
+        rummage::watch::install(dir)?;
+    }
     Ok(())
+}
+
+/// A person at a terminal, who can be asked things.
+fn interactive() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&std::io::stderr())
 }
 
 fn search_command(
@@ -482,16 +503,34 @@ fn interface(dir: &PathBuf) -> Result<()> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         bail!("the interface needs a terminal; for scripts use `rummage search … --json`");
     }
-    rummage::download::ensure(false)?;
     match Store::open(dir) {
+        // The first run: choose folders, get the model, and let the service index them while the interface shows how
+        // far it's got.
         Ok(store) if store.roots()?.is_empty() => {
-            bail!("nothing indexed yet: rummage index <folder>... (rummage --help for more)")
+            if !interactive() {
+                bail!("nothing indexed yet: rummage index <folder>... (rummage --help for more)");
+            }
+            let Some(choice) = rummage::setup::ask()? else {
+                bail!("nothing chosen: rummage index <folder>..., or rummage again, when ready")
+            };
+            for root in &choice.roots {
+                store.add_root(root)?;
+            }
+            store.add_excluded(&choice.excluded)?;
+            if choice.music {
+                store.set_meta("music", "1")?;
+            }
+            rummage::download::ensure(true)?;
+            if choice.background {
+                rummage::watch::install(dir)?;
+            }
         }
         Ok(_) => {}
         // Made by another version: the service rebuilds it, and the interface shows how far it's got.
         Err(error) if error.is::<store::StaleIndex>() => {}
         Err(error) => return Err(error),
     }
+    rummage::download::ensure(false)?;
     rummage::tui::run(serve::ServiceBackend::connect(dir)?)
 }
 
@@ -570,6 +609,16 @@ fn index_status(dir: &PathBuf, store: &Store) -> Result<()> {
         }
         if reasons.len() > 8 {
             println!("  and {} more reasons", reasons.len() - 8);
+        }
+    }
+    for line in store.meta("unreadable")?.unwrap_or_default().lines() {
+        let (path, why) = line.split_once('\t').unwrap_or((line, "can't be read"));
+        println!("can't read {} ({why}): what's indexed from it stays as it was", tilde(std::path::Path::new(path)));
+        if cfg!(target_os = "macos") && why == "permission denied" {
+            println!(
+                "  to let the background service read it: System Settings › Privacy & Security › Files and Folders \
+                 › rummage"
+            );
         }
     }
     if let Some(n) = store.meta("cloud_only")?.and_then(|n| n.parse::<usize>().ok()).filter(|n| *n > 0) {

@@ -10,7 +10,7 @@ pub const MODEL_REVISION: &str = "bfcd298762cc34d0357ece5ebdd31791a3a374d8";
 pub const TEXT_MODEL: &str = "embeddinggemma-2-Q8_0.gguf";
 pub const MEDIA_MODEL: &str = "mmproj-embeddinggemma-2-Q8_0.gguf";
 
-fn home() -> PathBuf {
+pub fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
@@ -102,8 +102,14 @@ pub fn folders(paths: &[String]) -> String {
 
 pub fn tilde(path: &std::path::Path) -> String {
     let home = home();
-    match path.strip_prefix(&home) {
-        Ok(rest) if !home.as_os_str().is_empty() && home != PathBuf::from("/") => format!("~/{}", rest.display()),
+    if home.as_os_str().is_empty() || home == std::path::Path::new("/") {
+        return path.display().to_string();
+    }
+    // Paths in the index are real paths, and HOME may reach the home folder through a link.
+    let real = home.canonicalize().unwrap_or_else(|_| home.clone());
+    match path.strip_prefix(&home).or_else(|_| path.strip_prefix(&real)) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
         _ => path.display().to_string(),
     }
 }
