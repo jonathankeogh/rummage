@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push to the same branch cancels the run still going for an older one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: test (${{ matrix.name }})
