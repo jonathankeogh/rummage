@@ -34,6 +34,10 @@ internet). A copy already in the Hugging Face cache (`hf download`) is used as i
 
 ## Use
 
+The first time you run `rummage` (or `rummage index` with no folder), it asks what to index: your home folder, with
+its folders listed to untick what to leave out, or folders you name, each checked as you give it. Then it asks whether
+to include music and whether to keep the index up to date in the background from login, and starts.
+
 ```sh
 rummage                                  # the interface: type to search, ↑↓ to move, ⏎ to open, F1 for help
                                          #   (^v on a PDF shows the page itself, ←→ turn pages; ^s listens to a
@@ -130,10 +134,20 @@ computer: SQLite can't lock its files reliably on a network drive (NFS, SMB), an
 `cargo test --release` runs the unit tests everywhere. With the model files present it also runs
 `tests/reference_vectors.rs` (rummage's vectors must match DigUp's reference vectors, cosine ≥ 0.999) and
 `tests/end_to_end.rs` (index, re-sync, long files in two passes, the service, grep, crash recovery); without them those
-skip (CI keeps the model in GitHub's cache, so they run there). `uv run scripts/edge_cases.py` builds the files that
-once made indexing slow, stuck or wrong (a tool that hangs, a password-protected PDF, a Photos library, a file written
-every 2 s, a 40-minute recording, clips, number dumps, copies and moves) and checks each against the release build;
-`uv run scripts/edge_cases.py icloud` does the same with a test file in your iCloud Drive. `scripts/eval.py` measures ranking on DigUp's eval sets: build the text parts of its testbed
+skip (`RUMMAGE_REQUIRE_MODEL=1` makes them fail instead, as on CI). `uv run scripts/edge_cases.py` builds the files
+that once made indexing slow, stuck or wrong (a tool that hangs, a password-protected PDF, a Photos library, a file
+written every 2 s, a 40-minute recording, clips, number dumps, copies and moves, a folder that can't be read) and
+checks each against the release build; `uv run scripts/edge_cases.py icloud` does the same with a test file in your
+iCloud Drive. `uv run scripts/service_check.py` installs the background service as a login item and checks it keeps up
+with new, changed, renamed and deleted files, comes back after a crash and uninstalls cleanly (`--foreground` to try it
+without installing anything). `uv run scripts/interface_check.py` drives the interface in a terminal and inside tmux,
+and the first-run setup in a made-up home folder.
+
+CI runs all of these on every push, on Ubuntu, Ubuntu ARM64, macOS and Fedora. The release workflow (on a version tag,
+or by hand) builds macOS arm64 and Linux x86_64 and arm64 binaries, tries each on fresh machines (Ubuntu, Ubuntu ARM64,
+Fedora, Debian, macOS 14 and the latest), and puts a tag's binaries in a draft release.
+
+`scripts/eval.py` measures ranking on DigUp's eval sets: build the text parts of its testbed
 somewhere outside a code project (e.g. `~/.cache/rummage-eval`) and see the script's header. `scripts/sweep.py` runs
 every eval set with one ranking weight changed at a time (each weight can be overridden by `RUMMAGE_<NAME>`, e.g.
 `RUMMAGE_WORD_WEIGHT=1.5`).
